@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone Single-File App for GitHub & Streamlit Deployment."""
+"""NBA Prop Evaluator: Standalone Single-File App with Live Odds API & Powder Blue Theme."""
 import os
 import re
 from typing import Any, Dict, List, Tuple
@@ -170,6 +170,23 @@ STAT_COLUMN_MAP = {
     "BLOCKS": ["BLK", "BLOCKS"],
 }
 
+ODDS_API_MARKETS = {
+    "Points": "player_points",
+    "Rebounds": "player_rebounds",
+    "Assists": "player_assists",
+    "3-Pointers Made": "player_threes",
+    "Steals": "player_steals",
+    "Blocks": "player_blocks",
+}
+
+def _secret(name: str) -> str:
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return os.environ.get(name, "").strip()
+
 def parse_val(v) -> float:
     try:
         s = str(v).strip()
@@ -187,6 +204,78 @@ def _clean_name(name: str) -> str:
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
 
+# --- THE ODDS API CLIENT FUNCTIONS ---
+def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, str | None]:
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+    try:
+        resp = requests.get(url, params={"apiKey": api_key}, timeout=8)
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
+        data = resp.json()
+        rows = []
+        for ev in data:
+            home = ev.get("home_team", "")
+            away = ev.get("away_team", "")
+            commence = ev.get("commence_time", "")[:16].replace("T", " ")
+            rows.append({
+                "id": ev.get("id"),
+                "label": f"{away} @ {home} ({commence} UTC)",
+            })
+        return pd.DataFrame(rows), None
+    except Exception as e:
+        return pd.DataFrame(), f"Error fetching NBA events: {e}"
+
+def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, str | None]:
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+    try:
+        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings"}, timeout=8)
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
+        data = resp.json()
+        bookmakers = data.get("bookmakers", [])
+        if not bookmakers:
+            return pd.DataFrame(), "No DraftKings odds found for this event/market."
+        
+        markets = bookmakers[0].get("markets", [])
+        if not markets:
+            return pd.DataFrame(), "No market data available."
+
+        outcomes = markets[0].get("outcomes", [])
+        rows = []
+        for o in outcomes:
+            rows.append({
+                "Player": o.get("description"),
+                "Line": o.get("point"),
+                "Price": o.get("price"),
+                "Outcome": o.get("name"),
+            })
+        return pd.DataFrame(rows), None
+    except Exception as e:
+        return pd.DataFrame(), f"Error fetching prop board: {e}"
+
+def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
+    if board_df.empty:
+        return pd.DataFrame()
+    summary_rows = []
+    for player, group in board_df.groupby("Player"):
+        line = group["Line"].iloc[0] if "Line" in group.columns else 0.5
+        over_price = -110
+        under_price = -110
+        for _, r in group.iterrows():
+            outcome = str(r.get("Outcome", "")).lower()
+            if "over" in outcome:
+                over_price = int(r.get("Price", -110))
+            elif "under" in outcome:
+                under_price = int(r.get("Price", -110))
+        summary_rows.append({
+            "Player": player,
+            "Line": line,
+            "Over": over_price,
+            "Under": under_price,
+        })
+    return pd.DataFrame(summary_rows)
+
+# --- NBA STATS FETCHING ---
 def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, str | None]:
     if not player_name or not player_name.strip():
         return pd.DataFrame(), "Please enter a player name."
@@ -372,6 +461,57 @@ def main() -> None:
     )
 
     ss = st.session_state
+    api_key = _secret("ODDS_API_KEY")
+
+    # --- LIVE ODDS API PANEL ---
+    with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
+        if not api_key:
+            st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
+        else:
+            selected_stat_label = st.selectbox("Select Prop Market", list(ODDS_API_MARKETS.keys()), key="live_stat_market")
+            market_key = ODDS_API_MARKETS[selected_stat_label]
+
+            if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
+                events_df, err = list_nba_events(api_key)
+                if err:
+                    st.error(err)
+                else:
+                    ss["events_df"] = events_df
+
+            events_df = ss.get("events_df")
+            if events_df is not None and not events_df.empty:
+                game_idx = st.selectbox(
+                    "Step 2: Select Game",
+                    range(len(events_df)),
+                    format_func=lambda i: str(events_df.loc[i, "label"]),
+                    key="live_game_idx",
+                )
+                if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
+                    event_id = str(events_df.loc[game_idx, "id"])
+                    board_df, err = fetch_nba_prop_board(event_id, market_key, api_key)
+                    if err:
+                        st.error(err)
+                    else:
+                        ss["board_df"] = board_df
+
+            board_df = ss.get("board_df")
+            if board_df is not None and not board_df.empty:
+                summary = summarize_board(board_df)
+                st.dataframe(summary, use_container_width=True)
+                player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
+                
+                matched_row = summary[summary["Player"] == player_pick]
+                if not matched_row.empty:
+                    r = matched_row.iloc[0]
+                    if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
+                        ss["player"] = player_pick
+                        ss["stat"] = selected_stat_label
+                        ss["line"] = float(r["Line"])
+                        ss["over"] = int(r["Over"])
+                        ss["under"] = int(r["Under"])
+                        st.rerun()
+
+    # --- EVALUATION FORM ---
     if "player" not in ss:
         ss["player"] = "Jayson Tatum"
     if "stat" not in ss:
