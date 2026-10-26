@@ -1,8 +1,8 @@
-"""NBA Prop Evaluator: Standalone App with Retry Logic, Live Odds API & Powder Blue Theme."""
+"""NBA Prop Evaluator: Standalone App with Python 3.9+ Compatibility."""
 import os
 import re
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,147 +20,40 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# High-Contrast Powder Blue UI Styling
 st.markdown(
     """
     <style>
-    /* Pure White Main Background */
-    .stApp {
-        background-color: #ffffff !important;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {
-        display: none !important;
-    }
-
-    /* Powder Blue Container Boxes, Cards & Expanders */
-    .vision-card, 
-    [data-testid="stVerticalBlockBorderWrapper"], 
-    [data-testid="stExpander"], 
-    .vision-header {
-        background: #b9e6ff !important;
-        border: 2px solid #7dd3fc !important;
-        border-radius: 16px !important;
-        box-shadow: 0 4px 14px rgba(0, 117, 255, 0.08) !important;
+    .stApp { background-color: #ffffff !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] { display: none !important; }
+    .vision-card, [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stExpander"], .vision-header {
+        background: #b9e6ff !important; border: 2px solid #7dd3fc !important; border-radius: 16px !important; box-shadow: 0 4px 14px rgba(0, 117, 255, 0.08) !important;
     }
     .vision-card { padding: 20px !important; margin-bottom: 20px !important; }
-
-    /* Fix Expander Header Title Text */
-    [data-testid="stExpander"] summary, 
-    [data-testid="stExpander"] summary * {
-        color: #0f172a !important;
-        font-weight: 800 !important;
-        font-size: 16px !important;
-    }
-
-    /* Header Text Styling */
-    .vision-title {
-        color: #0369a1 !important;
-        font-size: 26px;
-        font-weight: 900;
-        margin: 0;
-    }
-
-    .vision-sub {
-        color: #0f172a !important;
-        font-size: 13px;
-        font-weight: 600;
-        margin-top: 4px;
-    }
-
-    /* Powder Blue Metric Boxes */
+    [data-testid="stExpander"] summary, [data-testid="stExpander"] summary * { color: #0f172a !important; font-weight: 800 !important; font-size: 16px !important; }
+    .vision-title { color: #0369a1 !important; font-size: 26px; font-weight: 900; margin: 0; }
+    .vision-sub { color: #0f172a !important; font-size: 13px; font-weight: 600; margin-top: 4px; }
     [data-testid="stMetric"], .metric-box {
-        background: #b9e6ff !important;
-        border: 2px solid #7dd3fc !important;
-        border-radius: 12px !important;
-        padding: 14px 18px !important;
-        text-align: center;
+        background: #b9e6ff !important; border: 2px solid #7dd3fc !important; border-radius: 12px !important; padding: 14px 18px !important; text-align: center;
     }
-    [data-testid="stMetricValue"], .metric-value {
-        color: #0369a1 !important;
-        font-size: 24px !important;
-        font-weight: 900 !important;
-    }
-    [data-testid="stMetricLabel"], .metric-label {
-        color: #0f172a !important;
-        font-size: 11px !important;
-        font-weight: 800 !important;
-        text-transform: uppercase !important;
-        letter-spacing: 0.5px !important;
-    }
-    .metric-value-green {
-        color: #15803d !important;
-        font-size: 24px !important;
-        font-weight: 900 !important;
-    }
-
-    /* Text & Label Overrides */
-    label, p, span, div[data-testid="stMarkdownContainer"] p {
-        color: #0f172a !important;
-        font-weight: 700 !important;
-    }
-
-    [data-testid="stVerticalBlockBorderWrapper"] label,
-    [data-testid="stExpander"] label,
-    [data-testid="stExpander"] p,
-    [data-testid="stExpander"] span,
-    .vision-card label,
-    [data-testid="stForm"] label {
-        color: #0f172a !important;
-        font-weight: 700 !important;
-    }
-
-    /* Input Fields & Dropdowns */
+    [data-testid="stMetricValue"], .metric-value { color: #0369a1 !important; font-size: 24px !important; font-weight: 900 !important; }
+    [data-testid="stMetricLabel"], .metric-label { color: #0f172a !important; font-size: 11px !important; font-weight: 800 !important; text-transform: uppercase !important; letter-spacing: 0.5px !important; }
+    .metric-value-green { color: #15803d !important; font-size: 24px !important; font-weight: 900 !important; }
+    label, p, span, div[data-testid="stMarkdownContainer"] p { color: #0f172a !important; font-weight: 700 !important; }
     .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
-        background-color: #0f172a !important;
-        color: #ffffff !important;
-        border-radius: 10px !important;
-        border: 2px solid #0284c7 !important;
-        font-weight: 600 !important;
+        background-color: #0f172a !important; color: #ffffff !important; border-radius: 10px !important; border: 2px solid #0284c7 !important; font-weight: 600 !important;
     }
-
-    div[data-baseweb="select"] * {
-        color: #ffffff !important;
-    }
-
-    /* Action Buttons */
+    div[data-baseweb="select"] * { color: #ffffff !important; }
     .stButton>button, [data-testid="stFormSubmitButton"]>button {
-        background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
-        color: #ffffff !important;
-        font-weight: 900 !important;
-        border-radius: 10px !important;
-        border: None !important;
-        padding: 12px 20px !important;
-        box-shadow: 0 4px 12px rgba(2, 132, 199, 0.3) !important;
-        width: 100% !important;
+        background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important; color: #ffffff !important; font-weight: 900 !important; border-radius: 10px !important; border: None !important; padding: 12px 20px !important; width: 100% !important;
     }
-    .stButton>button *, [data-testid="stFormSubmitButton"]>button * {
-        color: #ffffff !important;
-        font-weight: 900 !important;
-    }
-
-    /* Data Table Styling */
-    [data-testid="stDataFrame"] {
-        background-color: #ffffff !important;
-        border: 2px solid #7dd3fc !important;
-        border-radius: 10px !important;
-    }
+    .stButton>button *, [data-testid="stFormSubmitButton"]>button * { color: #ffffff !important; font-weight: 900 !important; }
+    [data-testid="stDataFrame"] { background-color: #ffffff !important; border: 2px solid #7dd3fc !important; border-radius: 10px !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-STATS = [
-    "Points",
-    "Rebounds",
-    "Assists",
-    "3-Pointers Made",
-    "Pts + Reb + Ast",
-    "Steals",
-    "Blocks",
-]
-
+STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made", "Pts + Reb + Ast", "Steals", "Blocks"]
 STAT_COLUMN_MAP = {
     "POINTS": ["PTS", "POINTS"],
     "REBOUNDS": ["REB", "REBOUNDS", "TRB"],
@@ -170,7 +63,6 @@ STAT_COLUMN_MAP = {
     "STEALS": ["STL", "STEALS"],
     "BLOCKS": ["BLK", "BLOCKS"],
 }
-
 ODDS_API_MARKETS = {
     "Points": "player_points",
     "Rebounds": "player_rebounds",
@@ -205,8 +97,7 @@ def _clean_name(name: str) -> str:
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
 
-# --- THE ODDS API CLIENT FUNCTIONS ---
-def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, str | None]:
+def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     try:
         resp = requests.get(url, params={"apiKey": api_key}, timeout=8)
@@ -218,15 +109,12 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, str | None]:
             home = ev.get("home_team", "")
             away = ev.get("away_team", "")
             commence = ev.get("commence_time", "")[:16].replace("T", " ")
-            rows.append({
-                "id": ev.get("id"),
-                "label": f"{away} @ {home} ({commence} UTC)",
-            })
+            rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({commence} UTC)"})
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching NBA events: {e}"
 
-def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, str | None]:
+def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     try:
         resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings"}, timeout=8)
@@ -236,20 +124,13 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         bookmakers = data.get("bookmakers", [])
         if not bookmakers:
             return pd.DataFrame(), "No DraftKings odds found for this event/market."
-        
         markets = bookmakers[0].get("markets", [])
         if not markets:
             return pd.DataFrame(), "No market data available."
-
         outcomes = markets[0].get("outcomes", [])
         rows = []
         for o in outcomes:
-            rows.append({
-                "Player": o.get("description"),
-                "Line": o.get("point"),
-                "Price": o.get("price"),
-                "Outcome": o.get("name"),
-            })
+            rows.append({"Player": o.get("description"), "Line": o.get("point"), "Price": o.get("price"), "Outcome": o.get("name")})
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching prop board: {e}"
@@ -268,22 +149,14 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
                 over_price = int(r.get("Price", -110))
             elif "under" in outcome:
                 under_price = int(r.get("Price", -110))
-        summary_rows.append({
-            "Player": player,
-            "Line": line,
-            "Over": over_price,
-            "Under": under_price,
-        })
+        summary_rows.append({"Player": player, "Line": line, "Over": over_price, "Under": under_price})
     return pd.DataFrame(summary_rows)
 
-# --- ROBUST NBA STATS FETCHING WITH RETRY LOGIC ---
-def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, str | None]:
+def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, Optional[str]]:
     if not player_name or not player_name.strip():
         return pd.DataFrame(), "Please enter a player name."
-
     raw_input = player_name.strip()
     target_clean = _clean_name(raw_input)
-
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -293,12 +166,9 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                 parts = target_clean.split()
                 last_name = parts[-1] if parts else target_clean
                 matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
-
             if not matched_players:
                 return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
-
             player_id = matched_players[0]["id"]
-            
             gamelog = playergamelog.PlayerGameLog(
                 player_id=player_id, 
                 season=season,
@@ -306,7 +176,6 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                 timeout=45
             )
             df = gamelog.get_data_frames()[0]
-
             if df is not None and not df.empty:
                 rows = []
                 for _, r in df.iterrows():
@@ -315,19 +184,14 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                     ast = parse_val(r.get("AST", 0))
                     matchup = str(r.get("MATCHUP", "OPP"))
                     g_date = str(r.get("GAME_DATE", ""))
-
                     rows.append({
-                        "POINTS": pts,
-                        "REBOUNDS": reb,
-                        "ASSISTS": ast,
+                        "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
                         "3-POINTERS MADE": parse_val(r.get("FG3M", 0)),
                         "PTS + REB + AST": pts + reb + ast,
                         "STEALS": parse_val(r.get("STL", 0)),
                         "BLOCKS": parse_val(r.get("BLK", 0)),
-                        "OPPONENT": matchup,
-                        "DATE": g_date,
+                        "OPPONENT": matchup, "DATE": g_date,
                     })
-
                 if rows:
                     df_nba = pd.DataFrame(rows)
                     return df_nba.iloc[::-1].reset_index(drop=True), None
@@ -337,7 +201,6 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                 continue
             else:
                 return pd.DataFrame(), f"NBA API Error (after {max_retries} attempts): {e}"
-
     return pd.DataFrame(), f"No active NBA game logs found for '{raw_input}'."
 
 def american_to_implied_prob(american_odds: float) -> float:
@@ -356,26 +219,16 @@ def calculate_ewma(stats: np.ndarray, decay: float = 0.8) -> float:
     weights /= weights.sum()
     return float(np.sum(stats * weights))
 
-def evaluate_nba_prop(
-    player_name: str,
-    stat_category: str,
-    line: float,
-    over_odds: float,
-    under_odds: float,
-    season: str = "2026-27",
-) -> Dict[str, Any]:
+def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float, season: str = "2026-27") -> Dict[str, Any]:
     try:
         df, err = fetch_nba_player_logs(player_name, season)
         if err or df is None or df.empty:
             return {"error": err or f"No game logs found for '{player_name}'."}
-
         df.columns = [c.upper().strip() for c in df.columns]
         stat_upper = stat_category.upper().strip()
-
         if stat_upper == "PTS + REB + AST" and "PTS+REB+AST" not in df.columns:
             if all(col in df.columns for col in ["PTS", "REB", "AST"]):
                 df["PTS+REB+AST"] = df["PTS"].astype(float) + df["REB"].astype(float) + df["AST"].astype(float)
-
         target_col = None
         if stat_upper in df.columns:
             target_col = stat_upper
@@ -385,76 +238,50 @@ def evaluate_nba_prop(
                 if col in df.columns:
                     target_col = col
                     break
-
         if not target_col or target_col not in df.columns:
             return {"error": f"Stat category '{stat_category}' not found in logs for '{player_name}'."}
-
         stats_list = []
         gamelog_details = []
-
         for _, row in df.iterrows():
             try:
                 val = float(row[target_col])
             except (ValueError, TypeError):
                 continue
-            
             opp = str(row.get("OPPONENT", "OPP"))
             gdate = str(row.get("DATE", ""))
             stats_list.append(val)
-            gamelog_details.append({
-                "stat_value": val,
-                "opponent": opp,
-                "date": gdate,
-                "x_label": f"{gdate}<br>{opp}" if gdate else opp,
-            })
-
+            gamelog_details.append({"stat_value": val, "opponent": opp, "date": gdate, "x_label": f"{gdate}<br>{opp}" if gdate else opp})
         if not stats_list:
             return {"error": f"No valid numeric data found for stat '{stat_category}'."}
-
         stats_arr = np.array(stats_list[:10])
         gamelog_details = gamelog_details[:10]
-
         real_mean = float(np.mean(stats_arr))
         real_median = float(np.median(stats_arr))
         proj_mean = calculate_ewma(stats_arr)
-
         std_dev = float(np.std(stats_arr)) if len(stats_arr) > 1 else max(1.0, proj_mean * 0.15)
         simulations = np.random.normal(proj_mean, std_dev if std_dev > 0 else 1.0, 10000)
-
         over_hits = np.sum(simulations > line)
         over_model_pct = (over_hits / 10000) * 100
         under_model_pct = 100 - over_model_pct
-
         over_market_pct = american_to_implied_prob(over_odds)
         under_market_pct = american_to_implied_prob(under_odds)
-
         over_win_pct = (over_model_pct * 0.5) + (over_market_pct * 0.5)
         under_win_pct = (under_model_pct * 0.5) + (under_market_pct * 0.5)
-
         over_fair_odds = int(-100 * (over_win_pct / (100 - over_win_pct))) if over_win_pct > 50 else int(100 * ((100 - over_win_pct) / over_win_pct))
         under_fair_odds = int(-100 * (under_win_pct / (100 - under_win_pct))) if under_win_pct > 50 else int(100 * ((100 - under_win_pct) / under_win_pct))
-
         is_over = over_win_pct > under_win_pct
         best_side = f"Over {line}" if is_over else f"Under {line}"
         edge_vs_market = (over_win_pct - over_market_pct) if is_over else (under_win_pct - under_market_pct)
-        
         chosen_odds = over_odds if is_over else under_odds
         chosen_win_pct = over_win_pct if is_over else under_win_pct
-        
         if chosen_odds < 0:
             ev_pct = (chosen_win_pct * (100 / abs(chosen_odds))) - (100 - chosen_win_pct)
         else:
             ev_pct = (chosen_win_pct * (chosen_odds / 100)) - (100 - chosen_win_pct)
-
         return {
-            "player_name": player_name,
-            "projection_mean": real_mean,
-            "projection_median": real_median,
-            "best_side": best_side,
-            "fair_odds": over_fair_odds if is_over else under_fair_odds,
-            "edge_vs_market": edge_vs_market,
-            "ev_pct": ev_pct,
-            "gamelog_details": gamelog_details,
+            "player_name": player_name, "projection_mean": real_mean, "projection_median": real_median,
+            "best_side": best_side, "fair_odds": over_fair_odds if is_over else under_fair_odds,
+            "edge_vs_market": edge_vs_market, "ev_pct": ev_pct, "gamelog_details": gamelog_details,
         }
     except Exception as e:
         return {"error": f"Evaluation error: {e}"}
@@ -469,33 +296,24 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
-
     ss = st.session_state
     api_key = _secret("ODDS_API_KEY")
 
-    # --- LIVE ODDS API PANEL ---
     with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
         if not api_key:
             st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
         else:
             selected_stat_label = st.selectbox("Select Prop Market", list(ODDS_API_MARKETS.keys()), key="live_stat_market")
             market_key = ODDS_API_MARKETS[selected_stat_label]
-
             if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
                 events_df, err = list_nba_events(api_key)
                 if err:
                     st.error(err)
                 else:
                     ss["events_df"] = events_df
-
             events_df = ss.get("events_df")
             if events_df is not None and not events_df.empty:
-                game_idx = st.selectbox(
-                    "Step 2: Select Game",
-                    range(len(events_df)),
-                    format_func=lambda i: str(events_df.loc[i, "label"]),
-                    key="live_game_idx",
-                )
+                game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
                 if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
                     event_id = str(events_df.loc[game_idx, "id"])
                     board_df, err = fetch_nba_prop_board(event_id, market_key, api_key)
@@ -503,13 +321,11 @@ def main() -> None:
                         st.error(err)
                     else:
                         ss["board_df"] = board_df
-
             board_df = ss.get("board_df")
             if board_df is not None and not board_df.empty:
                 summary = summarize_board(board_df)
                 st.dataframe(summary, use_container_width=True)
                 player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
-                
                 matched_row = summary[summary["Player"] == player_pick]
                 if not matched_row.empty:
                     r = matched_row.iloc[0]
@@ -521,7 +337,6 @@ def main() -> None:
                         ss["under"] = int(r["Under"])
                         st.rerun()
 
-    # --- EVALUATION FORM ---
     if "player" not in ss:
         ss["player"] = "Jayson Tatum"
     if "stat" not in ss:
@@ -538,11 +353,9 @@ def main() -> None:
         player_name = c1.text_input("Player Name", value=ss["player"])
         stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
         line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
-
         c4, c5 = st.columns(2)
         over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
         under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
-
         submitted = st.form_submit_button("⚡ Evaluate Prop")
 
     if submitted:
@@ -551,20 +364,11 @@ def main() -> None:
         ss["line"] = line_val
         ss["over"] = over_odds
         ss["under"] = under_odds
-
-        res = evaluate_nba_prop(
-            player_name=player_name,
-            stat_category=stat_category,
-            line=line_val,
-            over_odds=over_odds,
-            under_odds=under_odds,
-        )
-
+        res = evaluate_nba_prop(player_name=player_name, stat_category=stat_category, line=line_val, over_odds=over_odds, under_odds=under_odds)
         if "error" in res:
             st.error(res["error"])
         else:
             st.markdown(f"## {res['player_name']} | {stat_category}")
-            
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.markdown(f'<div class="metric-box"><div class="metric-label">MEAN</div><div class="metric-value">{res["projection_mean"]:.2f}</div></div>', unsafe_allow_html=True)
             m2.markdown(f'<div class="metric-box"><div class="metric-label">MEDIAN</div><div class="metric-value">{res["projection_median"]:.2f}</div></div>', unsafe_allow_html=True)
@@ -572,38 +376,23 @@ def main() -> None:
             m4.markdown(f'<div class="metric-box"><div class="metric-label">FAIR ODDS</div><div class="metric-value">{res["fair_odds"]:+d}</div></div>', unsafe_allow_html=True)
             m5.markdown(f'<div class="metric-box"><div class="metric-label">EDGE VS MKT</div><div class="metric-value-green">+{res["edge_vs_market"]:.1f}%</div></div>', unsafe_allow_html=True)
             m6.markdown(f'<div class="metric-box"><div class="metric-label">EV</div><div class="metric-value-green">+{res["ev_pct"]:.1f}%</div></div>', unsafe_allow_html=True)
-
             st.markdown("---")
             st.markdown("### 📊 Game Log Performance")
-
             gamelog_data = res.get("gamelog_details", [])
             if gamelog_data:
                 df_chart = pd.DataFrame(gamelog_data)
                 colors = ["#22c55e" if v > line_val else "#ef4444" for v in df_chart["stat_value"]]
-
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
-                    x=df_chart["x_label"],
-                    y=df_chart["stat_value"],
+                    x=df_chart["x_label"], y=df_chart["stat_value"],
                     text=[f"{v:.1f}" if v % 1 != 0 else f"{int(v)}" for v in df_chart["stat_value"]],
-                    textposition="outside",
-                    textfont=dict(color="#0f172a", size=12, family="sans-serif"),
+                    textposition="outside", textfont=dict(color="#0f172a", size=12, family="sans-serif"),
                     marker_color=colors,
                 ))
-                fig.add_shape(
-                    type="line",
-                    x0=-0.5,
-                    x1=len(df_chart) - 0.5,
-                    y0=line_val,
-                    y1=line_val,
-                    line=dict(color="#2563eb", width=2, dash="dash"),
-                )
+                fig.add_shape(type="line", x0=-0.5, x1=len(df_chart) - 0.5, y0=line_val, y1=line_val, line=dict(color="#2563eb", width=2, dash="dash"))
                 fig.update_layout(
-                    paper_bgcolor="#ffffff",
-                    plot_bgcolor="#ffffff",
-                    font=dict(color="#0f172a"),
-                    height=380,
-                    margin=dict(l=20, r=20, t=30, b=40),
+                    paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font=dict(color="#0f172a"),
+                    height=380, margin=dict(l=20, r=20, t=30, b=40),
                     xaxis=dict(showgrid=False, tickfont=dict(color="#0f172a")),
                     yaxis=dict(showgrid=True, gridcolor="#e2e8f0", tickfont=dict(color="#0f172a")),
                 )
