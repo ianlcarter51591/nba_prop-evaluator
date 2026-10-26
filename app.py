@@ -1,6 +1,7 @@
-"""NBA Prop Evaluator: Standalone Single-File App with Live Odds API & Powder Blue Theme."""
+"""NBA Prop Evaluator: Standalone App with Retry Logic, Live Odds API & Powder Blue Theme."""
 import os
 import re
+import time
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -275,7 +276,7 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(summary_rows)
 
-# --- NBA STATS FETCHING ---
+# --- ROBUST NBA STATS FETCHING WITH RETRY LOGIC ---
 def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, str | None]:
     if not player_name or not player_name.strip():
         return pd.DataFrame(), "Please enter a player name."
@@ -283,50 +284,59 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
     raw_input = player_name.strip()
     target_clean = _clean_name(raw_input)
 
-    try:
-        matched_players = nba_players.find_players_by_full_name(raw_input)
-        if not matched_players:
-            all_p = nba_players.get_players()
-            parts = target_clean.split()
-            last_name = parts[-1] if parts else target_clean
-            matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            matched_players = nba_players.find_players_by_full_name(raw_input)
+            if not matched_players:
+                all_p = nba_players.get_players()
+                parts = target_clean.split()
+                last_name = parts[-1] if parts else target_clean
+                matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
 
-        if not matched_players:
-            return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
+            if not matched_players:
+                return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
 
-        player_id = matched_players[0]["id"]
-        gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season)
-        df = gamelog.get_data_frames()[0]
+            player_id = matched_players[0]["id"]
+            
+            gamelog = playergamelog.PlayerGameLog(
+                player_id=player_id, 
+                season=season,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': 'https://www.nba.com/'},
+                timeout=45
+            )
+            df = gamelog.get_data_frames()[0]
 
-        if df is None or df.empty:
-            return pd.DataFrame(), f"No game logs found for '{raw_input}' in season {season}."
+            if df is not None and not df.empty:
+                rows = []
+                for _, r in df.iterrows():
+                    pts = parse_val(r.get("PTS", 0))
+                    reb = parse_val(r.get("REB", 0))
+                    ast = parse_val(r.get("AST", 0))
+                    matchup = str(r.get("MATCHUP", "OPP"))
+                    g_date = str(r.get("GAME_DATE", ""))
 
-        rows = []
-        for _, r in df.iterrows():
-            pts = parse_val(r.get("PTS", 0))
-            reb = parse_val(r.get("REB", 0))
-            ast = parse_val(r.get("AST", 0))
-            matchup = str(r.get("MATCHUP", "OPP"))
-            g_date = str(r.get("GAME_DATE", ""))
+                    rows.append({
+                        "POINTS": pts,
+                        "REBOUNDS": reb,
+                        "ASSISTS": ast,
+                        "3-POINTERS MADE": parse_val(r.get("FG3M", 0)),
+                        "PTS + REB + AST": pts + reb + ast,
+                        "STEALS": parse_val(r.get("STL", 0)),
+                        "BLOCKS": parse_val(r.get("BLK", 0)),
+                        "OPPONENT": matchup,
+                        "DATE": g_date,
+                    })
 
-            rows.append({
-                "POINTS": pts,
-                "REBOUNDS": reb,
-                "ASSISTS": ast,
-                "3-POINTERS MADE": parse_val(r.get("FG3M", 0)),
-                "PTS + REB + AST": pts + reb + ast,
-                "STEALS": parse_val(r.get("STL", 0)),
-                "BLOCKS": parse_val(r.get("BLK", 0)),
-                "OPPONENT": matchup,
-                "DATE": g_date,
-            })
-
-        if rows:
-            df_nba = pd.DataFrame(rows)
-            return df_nba.iloc[::-1].reset_index(drop=True), None
-
-    except Exception as e:
-        return pd.DataFrame(), f"NBA API Error: {e}"
+                if rows:
+                    df_nba = pd.DataFrame(rows)
+                    return df_nba.iloc[::-1].reset_index(drop=True), None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+                continue
+            else:
+                return pd.DataFrame(), f"NBA API Error (after {max_retries} attempts): {e}"
 
     return pd.DataFrame(), f"No active NBA game logs found for '{raw_input}'."
 
