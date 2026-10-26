@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+plotly
+nba_api
+requests
