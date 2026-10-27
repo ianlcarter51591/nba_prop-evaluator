@@ -1,4 +1,5 @@
 """NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
+import json
 import os
 import re
 import uuid
@@ -87,6 +88,15 @@ B2B_OPP_BOOST: Dict[str, float] = {
     "POINTS": 0.015, "PTS + REB + AST": 0.010, "REBOUNDS": 0.005, "ASSISTS": 0.005,
     "3-POINTERS MADE": 0.005, "STEALS": 0.0, "BLOCKS": 0.0,
 }
+# Assumed effect on the PLAYER's own stat on the second night of his own back-to-back (negative = fatigue).
+# Defaults until you run the Backtest tab and apply calibrated values.
+B2B_OWN_EFFECT: Dict[str, float] = {
+    "POINTS": -0.02, "PTS + REB + AST": -0.015, "REBOUNDS": -0.01, "ASSISTS": -0.01,
+    "3-POINTERS MADE": -0.015, "STEALS": 0.0, "BLOCKS": 0.0,
+}
+BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
+BT_TAU = 0.02                      # prior sd (2%) for shrinking backtested effects toward zero
+EFFECTS_PATH = "b2b_effects.json"
 N_PRIOR = 8.0          # pseudo-games of weight given to last season's rates
 WINDOW = 10            # recent games used for the current-season estimate
 DECAY = 0.8            # EWMA decay per game of age
@@ -303,7 +313,8 @@ def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
                         "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "PTS + REB + AST": pts + reb + ast,
                         "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
                         "MINUTES": parse_val(rec.get("MIN")),
-                        "OPPONENT": f"{sep} {opp}", "DATE": str(info.get("gameDate", ""))[:10],
+                        "OPPONENT": f"{sep} {opp}",
+                        "DATE": (lambda d: d.isoformat() if d else str(info.get("gameDate", ""))[:10])(_to_et_date(info.get("gameDate", ""))),
                     })
         if rows:
             break
@@ -458,9 +469,10 @@ def b2b_status(game_dates: List[date], game_day: date) -> str:
     return "both" if yesterday and tomorrow else "second" if yesterday else "first" if tomorrow else "none"
 
 
-def b2b_multiplier(status: str, stat_col: str) -> float:
+def b2b_multiplier(status: str, stat_col: str, boosts: Optional[Dict[str, float]] = None) -> float:
     """Projection multiplier: only an opponent on the second night (played yesterday) is treated as fatigued."""
-    return 1.0 + B2B_OPP_BOOST.get(stat_col, 0.0) if status in ("second", "both") else 1.0
+    b = B2B_OPP_BOOST if boosts is None else boosts
+    return 1.0 + b.get(stat_col, 0.0) if status in ("second", "both") else 1.0
 
 
 def opp_multiplier(team: str, stat_col: str, scoring: pd.DataFrame) -> Tuple[float, str]:
@@ -478,6 +490,173 @@ def opp_multiplier(team: str, stat_col: str, scoring: pd.DataFrame) -> Tuple[flo
     shrink = row["GAMES"] / (row["GAMES"] + 10.0)
     mult = float(np.clip(1.0 + k * shrink * (factor - 1.0), 0.9, 1.1))
     return mult, f"{team}: pts-allowed idx {def_f:.2f}, pace idx {pace_f:.2f} ({int(row['GAMES'])} g) -> x{mult:.3f}"
+
+
+# --------------------------------------------------------------------------------------
+# Back-to-back: own-team detection + historical backtest (calibrates both effects)
+# --------------------------------------------------------------------------------------
+TEAM_ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{tid}/roster"
+
+
+def own_b2b_status(prev_date: Optional[date], game_day: date) -> str:
+    """'second' if the player's previous game was yesterday, 'rested' otherwise, 'unknown' without history."""
+    if prev_date is None:
+        return "unknown"
+    return "second" if (game_day - prev_date).days == 1 else "rested"
+
+
+def own_b2b_multiplier(status: str, stat_col: str, effects: Optional[Dict[str, float]] = None) -> float:
+    """Projection multiplier 1 + effect (effects are negative = fatigue) for a player on the second night."""
+    eff = B2B_OWN_EFFECT if effects is None else effects
+    return 1.0 + eff.get(stat_col, 0.0) if status == "second" else 1.0
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_team_abbr_meta() -> List[Tuple[str, str, str]]:
+    """[(espn_team_id, display_name, abbreviation)] for all NBA teams."""
+    resp = requests.get(TEAM_LIST_URL, headers=ESPN_HEADERS, timeout=12)
+    resp.raise_for_status()
+    teams = resp.json()["sports"][0]["leagues"][0]["teams"]
+    return [(str(t["team"]["id"]), str(t["team"]["displayName"]), str(t["team"].get("abbreviation", ""))) for t in teams]
+
+
+def _roster(tid: str) -> List[Tuple[str, str]]:
+    """[(athlete_id, name)] from a team's ESPN roster (order as listed)."""
+    resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=12)
+    resp.raise_for_status()
+    found: Dict[str, str] = {}
+    for d in _walk_json(resp.json()):
+        m = re.search(r"~a:(\d+)", str(d.get("uid", "")))
+        name = d.get("fullName") or d.get("displayName")
+        if m and name and ("jersey" in d or "position" in d):
+            found[m.group(1)] = str(name)
+    return list(found.items())
+
+
+def _schedule_dates(tid: str, season: int) -> List[date]:
+    """ET dates of a team's regular-season games in an ESPN season (ending year)."""
+    resp = requests.get(TEAM_SCHEDULE_URL.format(tid=tid), params={"seasontype": 2, "season": season}, headers=ESPN_HEADERS, timeout=12)
+    resp.raise_for_status()
+    found = {_to_et_date(str(ev.get("date", ""))) for ev in resp.json().get("events", [])}
+    return sorted(d for d in found if d is not None)
+
+
+def build_backtest_frame(player_logs: Dict[Tuple[str, int], pd.DataFrame], sched: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-game frame with OWN_B2B / OPP_B2B / HOME flags and R_<stat> = stat / player-season mean.
+    Keeps rotation players only (avg MIN >= 20, >= 40 games in a season). `sched` has ABBR, DATE (ISO strings).
+    """
+    frames = [df.assign(PID=pid, SEASON=season) for (pid, season), df in player_logs.items()
+              if df is not None and not df.empty and (df["MINUTES"] > 0).any()]
+    if not frames:
+        return pd.DataFrame()
+    d = pd.concat(frames, ignore_index=True)
+    d = d[d["MINUTES"] > 0].copy()
+    d["DT"] = pd.to_datetime(d["DATE"], errors="coerce")
+    d = d.dropna(subset=["DT"]).sort_values(["PID", "DT"]).reset_index(drop=True)
+    g = d.groupby(["PID", "SEASON"])
+    d["OWN_B2B"] = ((d["DT"] - g["DT"].shift(1)).dt.days == 1).astype(float)
+    d["HOME"] = d["OPPONENT"].str.startswith("vs").astype(float)
+    d["OPP"] = d["OPPONENT"].str.split().str[-1]
+    d = d[(g["MINUTES"].transform("mean") >= 20) & (g["MINUTES"].transform("size") >= 40)].copy()
+    d = d[d["OPP"].isin(sched["ABBR"].unique())].copy()
+    prev_day = (d["DT"] - pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")
+    d["OPP_B2B"] = pd.MultiIndex.from_arrays([d["OPP"], prev_day]).isin(pd.MultiIndex.from_frame(sched[["ABBR", "DATE"]])).astype(float)
+    g = d.groupby(["PID", "SEASON"])
+    ratios = (d[BT_STATS] / g[BT_STATS].transform("mean")).replace([np.inf, -np.inf], np.nan)
+    ratios.columns = [f"R_{c}" for c in BT_STATS]
+    return pd.concat([d[["PID", "SEASON", "DATE", "OWN_B2B", "OPP_B2B", "HOME"]], ratios], axis=1)
+
+
+def _ols_cluster(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """OLS with cluster-robust (CR1) standard errors; returns (beta, se)."""
+    xtx_inv = np.linalg.inv(X.T @ X)
+    beta = xtx_inv @ (X.T @ y)
+    e = y - X @ beta
+    scores = pd.DataFrame(X * e[:, None]).groupby(groups).sum().to_numpy()
+    n_g, n, k = scores.shape[0], len(y), X.shape[1]
+    v = xtx_inv @ (scores.T @ scores) @ xtx_inv * (n_g / max(n_g - 1, 1)) * ((n - 1) / max(n - k, 1))
+    return beta, np.sqrt(np.clip(np.diag(v), 0.0, None))
+
+
+def estimate_b2b_effects(frame: pd.DataFrame, tau: float = BT_TAU) -> pd.DataFrame:
+    """
+    Within-player effects (as % of the player's own season average):
+        R_stat = a + b_own*OWN_B2B + b_opp*OPP_B2B + b_home*HOME + e,  clustered by player.
+    SHRUNK = b * tau^2 / (tau^2 + se^2): empirical-Bayes pull toward 0 with prior sd tau (default 2%).
+    """
+    rows: List[Dict[str, Any]] = []
+    for c in BT_STATS:
+        sub = frame[["PID", "OWN_B2B", "OPP_B2B", "HOME", f"R_{c}"]].dropna()
+        if len(sub) < 100 or sub["OWN_B2B"].sum() < 10 or sub["OPP_B2B"].sum() < 10:
+            continue
+        X = np.column_stack([np.ones(len(sub)), sub["OWN_B2B"], sub["OPP_B2B"], sub["HOME"]])
+        beta, se = _ols_cluster(X, sub[f"R_{c}"].to_numpy(float), sub["PID"].to_numpy())
+        shrink = tau ** 2 / (tau ** 2 + se ** 2)
+        rows.append({
+            "STAT": c, "OWN_B2B_%": beta[1] * 100, "OWN_SE": se[1] * 100, "OWN_SHRUNK_%": beta[1] * shrink[1] * 100,
+            "OPP_B2B_%": beta[2] * 100, "OPP_SE": se[2] * 100, "OPP_SHRUNK_%": beta[2] * shrink[2] * 100,
+            "HOME_%": beta[3] * 100, "N": len(sub), "N_OWN_B2B": int(sub["OWN_B2B"].sum()), "N_OPP_B2B": int(sub["OPP_B2B"].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def effects_from_table(table: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """Shrunk effects (fractions) per projectable stat, ready to pass to evaluate_nba_prop."""
+    t = table[table["STAT"].isin(B2B_OPP_BOOST.keys())].set_index("STAT")
+    return {"own": (t["OWN_SHRUNK_%"] / 100.0).to_dict(), "opp": (t["OPP_SHRUNK_%"] / 100.0).to_dict()}
+
+
+def load_effects_file() -> Optional[Dict[str, Dict[str, float]]]:
+    """Saved backtested effects (best effort; ephemeral on Streamlit Cloud)."""
+    try:
+        if os.path.exists(EFFECTS_PATH):
+            with open(EFFECTS_PATH) as fh:
+                return json.load(fh)
+    except Exception:
+        pass
+    return None
+
+
+def save_effects_file(effects: Optional[Dict[str, Dict[str, float]]]) -> None:
+    """Persist (or clear) the backtested effects."""
+    try:
+        if effects is None:
+            if os.path.exists(EFFECTS_PATH):
+                os.remove(EFFECTS_PATH)
+        else:
+            with open(EFFECTS_PATH, "w") as fh:
+                json.dump(effects, fh)
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataFrame:
+    """Download rosters, game logs and team schedules from ESPN and build the backtest frame (cached 24h)."""
+    meta = load_team_abbr_meta()
+
+    def safe(fn: Any, *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rosters = list(ex.map(lambda m: safe(_roster, m[0]) or [], meta))
+        players = [p for r in rosters for p in r[:n_per_team]]
+        log_jobs = [(pid, s) for pid, _ in players for s in seasons]
+        logs = list(ex.map(lambda j: safe(_espn_fetch_logs, j[0], j[1]), log_jobs))
+        sched_jobs = [(m[0], m[2], s) for m in meta for s in seasons]
+        sdates = list(ex.map(lambda j: safe(_schedule_dates, j[0], j[2]) or [], sched_jobs))
+    player_logs = {job: df for job, df in zip(log_jobs, logs) if df is not None and not df.empty}
+    sched = pd.DataFrame([(j[1], d.isoformat()) for j, ds in zip(sched_jobs, sdates) for d in ds], columns=["ABBR", "DATE"])
+    if sched.empty or not player_logs:
+        raise ValueError("ESPN returned no usable logs/schedules")
+    frame = build_backtest_frame(player_logs, sched)
+    if frame.empty:
+        raise ValueError("no rotation-player games after filtering")
+    return frame
 
 
 # --------------------------------------------------------------------------------------
@@ -579,7 +758,8 @@ def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
 
 
 def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
-                      opponent: Optional[str] = None, game_date: Optional[date] = None) -> Dict[str, Any]:
+                      opponent: Optional[str] = None, game_date: Optional[date] = None,
+                      b2b_effects: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
     """Full evaluation: projection -> simulation -> devigged edge, EV, Kelly, hit rates."""
     try:
         for o in (over_odds, under_odds):
@@ -607,14 +787,19 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         if opponent:
             try:
                 b2b_state = b2b_status(load_team_game_dates(opponent), game_day)
-                b2b_mult = b2b_multiplier(b2b_state, stat_col)
+                b2b_mult = b2b_multiplier(b2b_state, stat_col, (b2b_effects or {}).get("opp"))
             except Exception as e:
                 b2b_note = f"Back-to-back check unavailable ({e}); no adjustment applied."
         else:
-            b2b_note = "No opponent selected: back-to-back check skipped."
+            b2b_note = "No opponent selected: opponent back-to-back check skipped."
+        day_iso = game_day.isoformat()
+        before = played[played["DATE"] < day_iso]
+        prev_date = _iso_to_date(before["DATE"].iloc[-1]) if len(before) else None
+        own_state = own_b2b_status(prev_date, game_day)
+        own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
         proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
-                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult)
+                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult)
         sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
@@ -647,10 +832,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             warnings.append(opp_note)
         if b2b_note:
             warnings.append(b2b_note)
-        try:
-            days_rest: Optional[int] = (date.today() - date.fromisoformat(str(logs["DATE"].iloc[-1]))).days
-        except Exception:
-            days_rest = None
+        days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
         return {
             "player_name": player_name, "mean": float(np.mean(sims)), "median": float(np.median(sims)),
             "verdict": "PLAY" if ev > 0 else "PASS", "best_side": side_txt, "ev_pct": ev * 100.0,
@@ -660,6 +842,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "hit10": int(np.sum(vals > line)), "n10": len(vals),
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
+            "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
+            "b2b_calibrated": bool(b2b_effects),
             "b2b": {"status": b2b_state, "mult": b2b_mult, "opponent": opponent or "", "game_date": game_day.isoformat()},
             "gamelog_details": [
                 {"stat_value": float(v), "season": s, "x_label": f"{d}<br>{o}"}
@@ -675,7 +859,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
 # --------------------------------------------------------------------------------------
 LOG_PATH = "bet_log.csv"
 LOG_COLS: List[str] = [
-    "ID", "TS", "GAME_DATE", "PLAYER", "STAT", "SIDE", "LINE", "ODDS", "STAKE", "OPPONENT", "OPP_B2B",
+    "ID", "TS", "GAME_DATE", "PLAYER", "STAT", "SIDE", "LINE", "ODDS", "STAKE", "OPPONENT", "OPP_B2B", "OWN_B2B",
     "P_MODEL", "P_MARKET", "EDGE_PP", "EV_PCT", "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER",
     "LINE_MOVE", "CLV_PP", "RESULT", "ACTUAL", "PROFIT",
 ]
@@ -768,7 +952,8 @@ def make_bet_row(res: Dict[str, Any], ctx: Dict[str, Any], side: str, stake: flo
         "ID": uuid.uuid4().hex[:8], "TS": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
         "GAME_DATE": game_date.isoformat(), "PLAYER": ctx["player"], "STAT": ctx["stat"], "SIDE": side,
         "LINE": float(ctx["line"]), "ODDS": s["odds"], "STAKE": float(stake), "OPPONENT": ctx.get("opponent") or "",
-        "OPP_B2B": res.get("b2b", {}).get("status", ""), "P_MODEL": s["p_model"], "P_MARKET": s["p_market"], "EDGE_PP": s["edge_pp"], "EV_PCT": s["ev_pct"],
+        "OPP_B2B": res.get("b2b", {}).get("status", ""),
+        "OWN_B2B": res.get("own_b2b", {}).get("status", ""), "P_MODEL": s["p_model"], "P_MARKET": s["p_market"], "EDGE_PP": s["edge_pp"], "EV_PCT": s["ev_pct"],
         "RESULT": "Pending",
     }
 
@@ -924,6 +1109,11 @@ def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
 
 def render_b2b_alert(res: Dict[str, Any]) -> None:
     """Prominent back-to-back banner for the opponent."""
+    own = res.get("own_b2b") or {}
+    if own.get("status") == "second":
+        src = "backtested" if own.get("calibrated") else "default assumption: calibrate in the Backtest tab"
+        st.warning(f"🛌 **{res['player_name']} is on the SECOND night of a back-to-back** (played yesterday). "
+                   f"Projection adjusted x{own['mult']:.3f} ({src}).")
     b = res.get("b2b") or {}
     team, status, mult = b.get("opponent", ""), b.get("status", "unknown"), b.get("mult", 1.0)
     if status == "second":
@@ -957,7 +1147,7 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     _metric(d[4], "MODEL vs MARKET", f"{res['p_model']:.1f}% / {res['p_market']:.1f}%")
     _metric(d[5], "¼ KELLY", f"{res['kelly_pct']:.1f}% BR")
     if res["days_rest"] is not None:
-        st.caption(f"Days since last logged game: {res['days_rest']}")
+        st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
     for w in res["warnings"]:
         st.caption(f"⚠️ {w}")
     st.markdown("---")
@@ -1079,6 +1269,60 @@ def render_bet_log() -> None:
     st.dataframe(calib, use_container_width=True, hide_index=True)
 
 
+def render_backtest() -> None:
+    """Backtest tab: estimate own/opponent back-to-back effects from historical ESPN logs and apply them."""
+    ss = st.session_state
+    st.markdown(
+        "Estimates how much a player's stat changes when **he** is on the second night of a back-to-back and when "
+        "**the opponent** is, using within-player regressions (each game as a % of that player's own season average, "
+        "controlling for home/away, standard errors clustered by player). Results are shrunk toward 0 before use."
+    )
+    c1, c2, c3 = st.columns(3)
+    n_per_team = c1.slider("Players per team (roster order)", 3, 12, 8)
+    seasons = c2.multiselect("Seasons (ESPN ending year)", [2026, 2025, 2024], default=[2026, 2025])
+    c3.write("")
+    if c3.button("🔬 Run backtest", key="run_bt") and seasons:
+        with st.spinner("Downloading rosters, logs and schedules from ESPN (first run takes a minute or two)…"):
+            try:
+                frame = load_backtest_dataset(int(n_per_team), tuple(sorted(seasons)))
+                ss["bt_table"] = estimate_b2b_effects(frame)
+                ss["bt_meta"] = {"games": len(frame), "players": int(frame["PID"].nunique()), "own": int(frame["OWN_B2B"].sum()),
+                                 "opp": int(frame["OPP_B2B"].sum())}
+            except Exception as e:
+                ss["bt_table"] = None
+                st.error(f"Backtest failed: {e}")
+    table = ss.get("bt_table")
+    if table is not None and not table.empty:
+        meta = ss["bt_meta"]
+        st.caption(f"{meta['games']:,} player-games · {meta['players']} players · {meta['own']:,} own-B2B games · {meta['opp']:,} opponent-B2B games")
+        show = table.round(2)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("Effects are % of the player's own average (negative OWN = fatigue; positive OPP = tired opponent helps). "
+                   "|effect| < 2 × SE is not distinguishable from zero. SHRUNK columns are what the model uses.")
+        a, b = st.columns(2)
+        if a.button("✅ Apply to model", key="apply_bt"):
+            ss["b2b_effects"] = effects_from_table(table)
+            save_effects_file(ss["b2b_effects"])
+            st.toast("Backtested back-to-back effects applied")
+        if b.button("↩️ Reset to defaults", key="reset_bt"):
+            ss["b2b_effects"] = None
+            save_effects_file(None)
+            st.toast("Back to default assumptions")
+    elif table is not None:
+        st.warning("Not enough back-to-back games in the sample. Try more players per team or more seasons.")
+    active = ss.get("b2b_effects")
+    st.markdown("**Active parameters**" + (" (backtested)" if active else " (default assumptions)"))
+    own, opp = (active or {}).get("own", B2B_OWN_EFFECT), (active or {}).get("opp", B2B_OPP_BOOST)
+    st.dataframe(pd.DataFrame({"STAT": list(B2B_OPP_BOOST.keys()),
+                               "OWN_B2B_%": [own.get(k, 0.0) * 100 for k in B2B_OPP_BOOST],
+                               "OPP_B2B_%": [opp.get(k, 0.0) * 100 for k in B2B_OPP_BOOST]}).round(2),
+                 use_container_width=True, hide_index=True)
+    if active:
+        st.caption("To make these permanent, paste into the constants at the top of the file:")
+        st.code(f"B2B_OWN_EFFECT = {json.dumps({k: round(v, 4) for k, v in active['own'].items()})}\n"
+                f"B2B_OPP_BOOST = {json.dumps({k: round(v, 4) for k, v in active['opp'].items()})}", language="python")
+
+
 def main() -> None:
     """Streamlit entry point."""
     st.markdown(
@@ -1095,10 +1339,12 @@ def main() -> None:
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
                          ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et())):
         ss.setdefault(key, default)
+    if "b2b_effects" not in ss:
+        ss["b2b_effects"] = load_effects_file()
     if "bet_log" not in ss:
         ss["bet_log"] = read_log_file()
 
-    tab_eval, tab_log = st.tabs(["⚡ Evaluate", "📒 Bet Log"])
+    tab_eval, tab_log, tab_bt = st.tabs(["⚡ Evaluate", "📒 Bet Log", "🔬 B2B Backtest"])
     with tab_eval:
         with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
             if not api_key:
@@ -1154,7 +1400,7 @@ def main() -> None:
         if submitted:
             ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent, game_date=game_day)
             res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds,
-                                    None if opponent == "None" else opponent, game_day)
+                                    None if opponent == "None" else opponent, game_day, ss.get("b2b_effects"))
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
             else:
@@ -1181,6 +1427,8 @@ def main() -> None:
             )
     with tab_log:
         render_bet_log()
+    with tab_bt:
+        render_backtest()
 
 
 if __name__ == "__main__":
