@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Fixed Populate & Cloud Fallback."""
+"""NBA Prop Evaluator: Standalone App with Decimal-to-American Odds Conversion & Cloud Fallback."""
 import os
 import re
 import time
@@ -97,6 +97,18 @@ def _clean_name(name: str) -> str:
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
 
+def decimal_to_american(price_val) -> int:
+    """Convert Odds API decimal price (e.g. 1.91) to American odds (e.g. -110)."""
+    try:
+        d = float(price_val)
+        if d >= 2.0:
+            return int(round((d - 1.0) * 100))
+        elif d > 1.0:
+            return int(round(-100 / (d - 1.0)))
+        return -110
+    except Exception:
+        return -110
+
 def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     try:
@@ -117,7 +129,7 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
 def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     try:
-        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings"}, timeout=8)
+        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "decimal"}, timeout=8)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
         data = resp.json()
@@ -130,15 +142,12 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         outcomes = markets[0].get("outcomes", [])
         rows = []
         for o in outcomes:
-            price_val = o.get("price", -110)
-            try:
-                price_val = int(price_val)
-            except Exception:
-                price_val = -110
+            raw_price = o.get("price", 1.91)
+            american_price = decimal_to_american(raw_price)
             rows.append({
                 "Player": o.get("description"), 
                 "Line": o.get("point", 0.5), 
-                "Price": price_val, 
+                "Price": american_price, 
                 "Outcome": o.get("name")
             })
         return pd.DataFrame(rows), None
@@ -155,11 +164,7 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         under_price = -110
         for _, r in group.iterrows():
             outcome = str(r.get("Outcome", "")).lower()
-            p = r.get("Price", -110)
-            try:
-                p_int = int(p)
-            except Exception:
-                p_int = -110
+            p_int = int(r.get("Price", -110))
             if "over" in outcome:
                 over_price = p_int
             elif "under" in outcome:
@@ -396,7 +401,6 @@ def main() -> None:
                 if not matched_row.empty:
                     r = matched_row.iloc[0]
                     if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
-                        # Instantly update session state and widget keys so Streamlit reruns with populated values
                         ss["player"] = player_pick
                         ss["stat"] = selected_stat_label
                         ss["line"] = float(r["Line"])
