@@ -1,9 +1,10 @@
 """NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
 import os
 import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -11,6 +12,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
 
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
@@ -560,6 +566,13 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         p_cond = p_w / decided
         dv_side = dv_over if is_over else dv_under
 
+        sides = {}
+        for nm, pw_, pl_, od_, dv_, ev_ in (("Over", p_over, p_under, over_odds, dv_over, ev_over),
+                                            ("Under", p_under, p_over, under_odds, dv_under, ev_under)):
+            pc = pw_ / decided
+            sides[nm] = {"odds": float(od_), "p_model": pc * 100.0, "p_market": dv_ * 100.0,
+                         "edge_pp": (pc - dv_) * 100.0, "ev_pct": ev_ * 100.0}
+
         recent = played.tail(WINDOW)
         vals = recent[stat_col].to_numpy(float)
         warnings: List[str] = []
@@ -581,7 +594,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "proj_minutes": proj.minutes, "opp_mult": proj.opp_mult, "raw_avg": float(np.mean(vals)) if len(vals) else 0.0,
             "hit10": int(np.sum(vals > line)), "n10": len(vals),
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
-            "days_rest": days_rest, "warnings": warnings, "mu": proj.mu,
+            "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
             "gamelog_details": [
                 {"stat_value": float(v), "season": s, "x_label": f"{d}<br>{o}"}
                 for v, s, d, o in zip(vals, recent["SEASON"], recent["DATE"], recent["OPPONENT"])
@@ -589,6 +602,201 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         }
     except Exception as e:
         return {"error": f"Evaluation error: {e}"}
+
+
+# --------------------------------------------------------------------------------------
+# Bet log + closing line value
+# --------------------------------------------------------------------------------------
+LOG_PATH = "bet_log.csv"
+LOG_COLS: List[str] = [
+    "ID", "TS", "GAME_DATE", "PLAYER", "STAT", "SIDE", "LINE", "ODDS", "STAKE", "OPPONENT",
+    "P_MODEL", "P_MARKET", "EDGE_PP", "EV_PCT", "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER",
+    "LINE_MOVE", "CLV_PP", "RESULT", "ACTUAL", "PROFIT",
+]
+NUM_COLS: List[str] = [
+    "LINE", "ODDS", "STAKE", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_PCT", "CLOSE_LINE", "CLOSE_OVER",
+    "CLOSE_UNDER", "LINE_MOVE", "CLV_PP", "ACTUAL", "PROFIT",
+]
+EDITABLE_COLS: List[str] = ["STAKE", "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER", "RESULT", "ACTUAL"]
+RESULT_OPTIONS: List[str] = ["Pending", "Win", "Loss", "Push"]
+
+
+def _today_et() -> date:
+    """Today's date in US Eastern time (falls back to UTC)."""
+    try:
+        return datetime.now(ZoneInfo("America/New_York")).date()
+    except Exception:
+        return datetime.now(timezone.utc).date()
+
+
+def _implied_vec(odds: np.ndarray) -> np.ndarray:
+    """Vectorized American odds -> implied probability (NaN-safe)."""
+    o = np.asarray(odds, dtype=float)
+    return np.where(o < 0, -o / (-o + 100.0), 100.0 / (o + 100.0))
+
+
+def recompute_derived(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Derived columns.
+    LINE_MOVE = (close_line - bet_line) * (+1 Over / -1 Under): positive = line moved your way.
+    CLV_PP    = devigged closing prob of your side - devigged prob at bet time (same line only).
+    PROFIT    = stake * payout (Win), -stake (Loss), 0 (Push), NaN (Pending).
+    """
+    df = df.copy()
+    is_over = df["SIDE"].eq("Over").to_numpy()
+    df["LINE_MOVE"] = (df["CLOSE_LINE"] - df["LINE"]) * np.where(is_over, 1.0, -1.0)
+    co, cu = df["CLOSE_OVER"].to_numpy(float), df["CLOSE_UNDER"].to_numpy(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        valid = (np.abs(co) >= 100) & (np.abs(cu) >= 100) & (df["CLOSE_LINE"] == df["LINE"]).to_numpy()
+        io_, iu_ = _implied_vec(co), _implied_vec(cu)
+        q_close = np.where(is_over, io_, iu_) / (io_ + iu_)
+        df["CLV_PP"] = np.where(valid, q_close * 100.0 - df["P_MARKET"].to_numpy(float), np.nan)
+        odds, stake = df["ODDS"].to_numpy(float), df["STAKE"].to_numpy(float)
+        b = np.where(odds < 0, 100.0 / np.abs(odds), odds / 100.0)
+        res = df["RESULT"]
+        df["PROFIT"] = np.select([res.eq("Win"), res.eq("Loss"), res.eq("Push")], [stake * b, -stake, 0.0], default=np.nan)
+    return df
+
+
+def normalize_log(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce any frame (CSV import, editor output) into the canonical log schema."""
+    df = df.copy()
+    for c in LOG_COLS:
+        if c not in df.columns:
+            df[c] = np.nan if c in NUM_COLS else ""
+    df = df[LOG_COLS]
+    for c in NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for c in [c for c in LOG_COLS if c not in NUM_COLS]:
+        df[c] = df[c].fillna("").astype(str)
+    df["RESULT"] = np.where(df["RESULT"].isin(RESULT_OPTIONS), df["RESULT"], "Pending")
+    df = df[df["PLAYER"].str.strip() != ""].copy()
+    missing = df["ID"].str.strip() == ""
+    df.loc[missing, "ID"] = [uuid.uuid4().hex[:8] for _ in range(int(missing.sum()))]
+    df = df.drop_duplicates("ID", keep="last").reset_index(drop=True)
+    return recompute_derived(df)
+
+
+def read_log_file() -> pd.DataFrame:
+    """Load the on-disk log if present (best effort; ephemeral on Streamlit Cloud)."""
+    try:
+        if os.path.exists(LOG_PATH):
+            return normalize_log(pd.read_csv(LOG_PATH, dtype=str))
+    except Exception:
+        pass
+    return normalize_log(pd.DataFrame(columns=LOG_COLS))
+
+
+def save_log_file(df: pd.DataFrame) -> None:
+    """Persist the log to disk (best effort)."""
+    try:
+        df.to_csv(LOG_PATH, index=False)
+    except Exception:
+        pass
+
+
+def make_bet_row(res: Dict[str, Any], ctx: Dict[str, Any], side: str, stake: float, game_date: date) -> Dict[str, Any]:
+    """One log row from an evaluation result, for the chosen side."""
+    s = res["sides"][side]
+    return {
+        "ID": uuid.uuid4().hex[:8], "TS": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "GAME_DATE": game_date.isoformat(), "PLAYER": ctx["player"], "STAT": ctx["stat"], "SIDE": side,
+        "LINE": float(ctx["line"]), "ODDS": s["odds"], "STAKE": float(stake), "OPPONENT": ctx.get("opponent") or "",
+        "P_MODEL": s["p_model"], "P_MARKET": s["p_market"], "EDGE_PP": s["edge_pp"], "EV_PCT": s["ev_pct"],
+        "RESULT": "Pending",
+    }
+
+
+def add_bet(log: pd.DataFrame, row: Dict[str, Any]) -> Tuple[pd.DataFrame, bool]:
+    """Append a bet unless the same player/stat/side/line/date is already logged."""
+    dup = ((log["PLAYER"] == row["PLAYER"]) & (log["STAT"] == row["STAT"]) & (log["SIDE"] == row["SIDE"])
+           & (log["LINE"] == row["LINE"]) & (log["GAME_DATE"] == row["GAME_DATE"])).any()
+    if dup:
+        return log, False
+    return normalize_log(pd.concat([log, pd.DataFrame([row])], ignore_index=True)), True
+
+
+def apply_board_as_closing(log: pd.DataFrame, board_summary: pd.DataFrame, stat_label: str) -> Tuple[pd.DataFrame, int]:
+    """Fill closing line/odds on pending bets from a freshly fetched board (same stat market)."""
+    if board_summary.empty:
+        return log, 0
+    summ = board_summary.set_index("Player")
+    mask = (log["RESULT"] == "Pending") & (log["STAT"] == stat_label) & log["PLAYER"].isin(summ.index)
+    if not mask.any():
+        return log, 0
+    log = log.copy()
+    for col, src in (("CLOSE_LINE", "Line"), ("CLOSE_OVER", "Over"), ("CLOSE_UNDER", "Under")):
+        log.loc[mask, col] = log.loc[mask, "PLAYER"].map(summ[src]).astype(float)
+    return recompute_derived(log), int(mask.sum())
+
+
+def auto_grade(log: pd.DataFrame) -> Tuple[pd.DataFrame, int, List[str]]:
+    """Grade pending bets whose game date has passed using ESPN logs (UTC date match, +1 day tolerance)."""
+    log = log.copy()
+    notes: List[str] = []
+    graded = 0
+    today = _today_et().isoformat()
+    for idx in log.index[(log["RESULT"] == "Pending") & (log["GAME_DATE"] <= today)]:
+        row = log.loc[idx]
+        col = STAT_COL.get(row["STAT"])
+        try:
+            gd = str(row["GAME_DATE"])
+            nd = (date.fromisoformat(gd) + timedelta(days=1)).isoformat()
+            logs, err = fetch_player_logs(row["PLAYER"])
+            if err or col is None:
+                notes.append(f"{row['PLAYER']}: {err or 'unknown stat'}")
+                continue
+            hit = logs[logs["DATE"] == gd]
+            if hit.empty:
+                hit = logs[logs["DATE"] == nd]
+            if hit.empty:
+                continue  # not played / not in logs yet (or DNP: void it manually by deleting the row)
+            actual = float(hit.iloc[0][col])
+            line = float(row["LINE"])
+            if actual == line:
+                result = "Push"
+            elif (actual > line) == (row["SIDE"] == "Over"):
+                result = "Win"
+            else:
+                result = "Loss"
+            log.at[idx, "ACTUAL"], log.at[idx, "RESULT"] = actual, result
+            graded += 1
+        except Exception as e:
+            notes.append(f"{row['PLAYER']}: {e}")
+    return recompute_derived(log), graded, notes
+
+
+def summarize_log(log: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFrame, pd.DataFrame]:
+    """Headline stats, per-stat table, and model-calibration table."""
+    wl = log[log["RESULT"].isin(["Win", "Loss"])]
+    won = wl["RESULT"].eq("Win").to_numpy(float)
+    staked = float(wl["STAKE"].sum())
+    clv = log["CLV_PP"].dropna()
+    pm, pk = wl["P_MODEL"].to_numpy(float) / 100.0, wl["P_MARKET"].to_numpy(float) / 100.0
+    stats: Dict[str, float] = {
+        "bets": float(len(log)), "graded": float(log["RESULT"].isin(RESULT_OPTIONS[1:]).sum()),
+        "win_pct": float(won.mean() * 100.0) if len(wl) else float("nan"),
+        "units": float(log["PROFIT"].sum()),
+        "roi": float(log["PROFIT"].sum() / staked * 100.0) if staked > 0 else float("nan"),
+        "avg_clv": float(clv.mean()) if len(clv) else float("nan"), "pos_clv": float((clv > 0).mean() * 100.0) if len(clv) else float("nan"),
+        "n_clv": float(len(clv)),
+        "brier_model": float(np.mean((pm - won) ** 2)) if len(wl) else float("nan"),
+        "brier_market": float(np.mean((pk - won) ** 2)) if len(wl) else float("nan"),
+    }
+    tmp = log.assign(_staked=np.where(log["RESULT"].isin(["Win", "Loss"]), log["STAKE"], 0.0))
+    by_stat = tmp.groupby("STAT").agg(BETS=("ID", "count"), UNITS=("PROFIT", "sum"), STAKED=("_staked", "sum"),
+                                      AVG_EDGE_PP=("EDGE_PP", "mean"), AVG_CLV_PP=("CLV_PP", "mean"))
+    by_stat["ROI_%"] = np.where(by_stat["STAKED"] > 0, by_stat["UNITS"] / by_stat["STAKED"].replace(0, np.nan) * 100.0, np.nan)
+    by_stat = by_stat.drop(columns="STAKED").round(2).reset_index()
+    if len(wl):
+        bins = pd.cut(wl["P_MODEL"], [0, 45, 50, 55, 60, 65, 101], right=False)
+        calib = wl.assign(_bin=bins, _w=won * 100.0).groupby("_bin", observed=True).agg(
+            BETS=("ID", "count"), AVG_MODEL_PCT=("P_MODEL", "mean"), ACTUAL_WIN_PCT=("_w", "mean")).round(1).reset_index()
+        calib["_bin"] = calib["_bin"].astype(str)
+        calib = calib.rename(columns={"_bin": "MODEL_PROB_BUCKET"})
+    else:
+        calib = pd.DataFrame(columns=["MODEL_PROB_BUCKET", "BETS", "AVG_MODEL_PCT", "ACTUAL_WIN_PCT"])
+    return stats, by_stat, calib
 
 
 # --------------------------------------------------------------------------------------
@@ -604,6 +812,16 @@ def _metric(col: Any, label: str, value: str, tone: str = "neutral") -> None:
     )
 
 
+def _fmt(x: float, spec: str = ".1f", suffix: str = "") -> str:
+    """Format a number, or an em dash for NaN."""
+    return "—" if x is None or not np.isfinite(x) else f"{x:{spec}}{suffix}"
+
+
+def _tone(x: float) -> str:
+    """Metric tone from sign (NaN -> neutral)."""
+    return "neutral" if x is None or not np.isfinite(x) else ("good" if x > 0 else "bad")
+
+
 def _opp_options(game_teams: List[str]) -> List[str]:
     """Opponent dropdown: None, the selected game's two teams first, then everyone else."""
     try:
@@ -614,17 +832,40 @@ def _opp_options(game_teams: List[str]) -> List[str]:
     return ["None"] + gt + sorted(n for n in names if n not in gt)
 
 
-def render_results(res: Dict[str, Any], stat_category: str, line_val: float) -> None:
-    """Metric cards, notes, and the game-log chart."""
-    tone = lambda x: "good" if x > 0 else "bad"
+def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """'Log this bet' controls under the results."""
+    ss = st.session_state
+    if ss.get("_log_uid") != res["uid"]:
+        ss["log_side"] = "Over" if res["best_side"].startswith("Over") else "Under"
+        ss["_log_uid"] = res["uid"]
+    st.markdown("### 📝 Log this bet")
+    c1, c2, c3, c4 = st.columns(4)
+    side = c1.selectbox("Side", ["Over", "Under"], key="log_side")
+    stake = c2.number_input("Stake (units)", min_value=0.01, value=1.0, step=0.25, key="log_stake")
+    gdate = c3.date_input("Game date (ET)", value=_today_et(), key="log_gdate")
+    c4.write("")
+    if c4.button("Log bet", key="log_btn"):
+        row = make_bet_row(res, ctx, side, stake, gdate)
+        ss["bet_log"], added = add_bet(ss["bet_log"], row)
+        if added:
+            save_log_file(ss["bet_log"])
+            ss["editor_ver"] += 1
+            st.toast(f"Logged {side} {ctx['line']:g} — {ctx['player']}")
+        else:
+            st.warning("That exact bet (player, stat, side, line, date) is already in your log.")
+
+
+def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """Metric cards, notes, chart, and the log form."""
+    stat_category, line_val = ctx["stat"], ctx["line"]
     st.markdown(f"## {res['player_name']} | {stat_category}")
     c = st.columns(6)
     _metric(c[0], "MEAN", f"{res['mean']:.2f}")
     _metric(c[1], "MEDIAN", f"{res['median']:.1f}")
-    _metric(c[2], "BEST SIDE" if res["verdict"] == "PLAY" else "LEAN (PASS)", res["best_side"], tone(res["ev_pct"]))
+    _metric(c[2], "BEST SIDE" if res["verdict"] == "PLAY" else "LEAN (PASS)", res["best_side"], _tone(res["ev_pct"]))
     _metric(c[3], "FAIR ODDS", f"{res['fair_odds']:+d}")
-    _metric(c[4], "EDGE VS DEVIG", f"{res['edge_pp']:+.1f} pp", tone(res["edge_pp"]))
-    _metric(c[5], "EV", f"{res['ev_pct']:+.1f}%", tone(res["ev_pct"]))
+    _metric(c[4], "EDGE VS DEVIG", f"{res['edge_pp']:+.1f} pp", _tone(res["edge_pp"]))
+    _metric(c[5], "EV", f"{res['ev_pct']:+.1f}%", _tone(res["ev_pct"]))
     st.write("")
     d = st.columns(6)
     _metric(d[0], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
@@ -637,6 +878,8 @@ def render_results(res: Dict[str, Any], stat_category: str, line_val: float) -> 
         st.caption(f"Days since last logged game: {res['days_rest']}")
     for w in res["warnings"]:
         st.caption(f"⚠️ {w}")
+    st.markdown("---")
+    render_log_form(res, ctx)
     st.markdown("---")
     st.markdown("### 📊 Game Log Performance")
     st.caption("Last 10 games (faded bars = last season). Dashed blue = line, dotted orange = model projection.")
@@ -662,6 +905,98 @@ def render_results(res: Dict[str, Any], stat_category: str, line_val: float) -> 
     st.plotly_chart(fig, use_container_width=True)
 
 
+def render_bet_log() -> None:
+    """Bet Log tab: editable table, auto-grading, closing-line capture, performance + CLV summary."""
+    ss = st.session_state
+    st.caption("On Streamlit Cloud the server disk resets on reboot/redeploy — download your CSV regularly and re-import it here.")
+    a, b, c = st.columns(3)
+    if a.button("🏁 Auto-grade finished games", key="grade_btn"):
+        ss["bet_log"], n, notes = auto_grade(ss["bet_log"])
+        save_log_file(ss["bet_log"])
+        ss["editor_ver"] += 1
+        ss["grade_notes"] = notes[:5]
+        st.toast(f"Graded {n} bet(s)")
+        st.rerun()
+    board = ss.get("board_df")
+    if b.button("📸 Use current board as closing lines", key="close_btn"):
+        if board is None or board.empty or not ss.get("board_stat"):
+            st.warning("Fetch a prop board first (Evaluate tab, Step 3) — ideally right before tip-off.")
+        else:
+            ss["bet_log"], n = apply_board_as_closing(ss["bet_log"], summarize_board(board), ss["board_stat"])
+            save_log_file(ss["bet_log"])
+            ss["editor_ver"] += 1
+            st.toast(f"Closing lines applied to {n} pending bet(s) ({ss['board_stat']} market)")
+            st.rerun()
+    c.download_button("⬇️ Download log (CSV)", data=ss["bet_log"].to_csv(index=False).encode("utf-8"),
+                      file_name="bet_log.csv", mime="text/csv", key="dl_log")
+    for note in ss.pop("grade_notes", []):
+        st.warning(note)
+    up = st.file_uploader("Import a saved bet log (CSV)", type="csv", key="log_upload")
+    if up is not None:
+        uid = getattr(up, "file_id", f"{up.name}-{up.size}")
+        if ss.get("_up_id") != uid:
+            try:
+                merged = pd.concat([ss["bet_log"], normalize_log(pd.read_csv(up, dtype=str))], ignore_index=True)
+                ss["bet_log"] = normalize_log(merged)
+                ss["_up_id"] = uid
+                save_log_file(ss["bet_log"])
+                ss["editor_ver"] += 1
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not import that file: {e}")
+
+    log: pd.DataFrame = ss["bet_log"]
+    if log.empty:
+        st.info("No bets logged yet. Evaluate a prop, then use “Log this bet”.")
+        return
+    cols = [c for c in LOG_COLS if c != "ID"] + ["ID"]
+    key = f"bet_editor_{ss['editor_ver']}"
+    fmt = lambda label: st.column_config.NumberColumn(label, format="%.1f")
+    edited = st.data_editor(
+        log[cols], key=key, num_rows="dynamic", hide_index=True, use_container_width=True,
+        disabled=[c for c in cols if c not in EDITABLE_COLS],
+        column_config={
+            "ID": None, "TS": None,
+            "RESULT": st.column_config.SelectboxColumn("RESULT", options=RESULT_OPTIONS, required=True),
+            "P_MODEL": fmt("P_MODEL %"), "P_MARKET": fmt("P_MKT %"), "EDGE_PP": fmt("EDGE pp"), "EV_PCT": fmt("EV %"),
+            "LINE_MOVE": fmt("LINE MOVE"), "CLV_PP": fmt("CLV pp"), "PROFIT": st.column_config.NumberColumn("PROFIT (u)", format="%.2f"),
+        },
+    )
+    state = ss.get(key) or {}
+    if state.get("edited_rows") or state.get("added_rows") or state.get("deleted_rows"):
+        ss["bet_log"] = normalize_log(edited)
+        save_log_file(ss["bet_log"])
+        ss["editor_ver"] += 1
+        st.rerun()
+
+    stats, by_stat, calib = summarize_log(ss["bet_log"])
+    st.markdown("### 📈 Performance")
+    m = st.columns(6)
+    _metric(m[0], "BETS / GRADED", f"{int(stats['bets'])} / {int(stats['graded'])}")
+    _metric(m[1], "WIN %", _fmt(stats["win_pct"], ".1f", "%"))
+    _metric(m[2], "UNITS", _fmt(stats["units"], "+.2f"), _tone(stats["units"]))
+    _metric(m[3], "ROI", _fmt(stats["roi"], "+.1f", "%"), _tone(stats["roi"]))
+    _metric(m[4], "AVG CLV", _fmt(stats["avg_clv"], "+.2f", " pp"), _tone(stats["avg_clv"]))
+    _metric(m[5], "+CLV RATE", _fmt(stats["pos_clv"], ".0f", "%"))
+    st.caption(
+        f"CLV is measured on {int(stats['n_clv'])} bet(s) with closing odds at the same line. "
+        f"Brier (lower is better): model {_fmt(stats['brier_model'], '.4f')} vs market {_fmt(stats['brier_market'], '.4f')}. "
+        "Treat everything as noise until you have 50+ graded bets; CLV converges much faster than win/loss."
+    )
+    graded = ss["bet_log"][ss["bet_log"]["RESULT"].isin(["Win", "Loss", "Push"])].sort_values("TS")
+    if len(graded) >= 2:
+        fig = go.Figure(go.Scatter(x=list(range(1, len(graded) + 1)), y=graded["PROFIT"].cumsum(), mode="lines+markers",
+                                   line=dict(color="#0369a1", width=3)))
+        fig.update_layout(paper_bgcolor="#ffffff", plot_bgcolor="#ffffff", font=dict(color="#0f172a"), height=300,
+                          margin=dict(l=20, r=20, t=30, b=40), title="Cumulative units",
+                          xaxis=dict(title="Graded bet #", gridcolor="#e2e8f0"), yaxis=dict(gridcolor="#e2e8f0"))
+        st.plotly_chart(fig, use_container_width=True)
+    st.markdown("**By stat category**")
+    st.dataframe(by_stat, use_container_width=True, hide_index=True)
+    st.markdown("**Calibration (graded bets)**")
+    st.dataframe(calib, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     """Streamlit entry point."""
     st.markdown(
@@ -676,74 +1011,90 @@ def main() -> None:
     ss = st.session_state
     api_key = _secret("ODDS_API_KEY")
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
-                         ("under", -110), ("opp", "None"), ("board_teams", [])):
+                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0)):
         ss.setdefault(key, default)
+    if "bet_log" not in ss:
+        ss["bet_log"] = read_log_file()
 
-    with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
-        if not api_key:
-            st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
-        else:
-            selected_stat_label = st.selectbox("Select Prop Market", list(ODDS_API_MARKETS.keys()), key="live_stat_market")
-            market_key = ODDS_API_MARKETS[selected_stat_label]
-            if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
-                events_df, err = list_nba_events(api_key)
-                if err:
-                    st.error(err)
-                else:
-                    ss["events_df"] = events_df
-            events_df = ss.get("events_df")
-            if events_df is not None and not events_df.empty:
-                game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
-                if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
-                    board_df, err = fetch_nba_prop_board(str(events_df.loc[game_idx, "id"]), market_key, api_key)
+    tab_eval, tab_log = st.tabs(["⚡ Evaluate", "📒 Bet Log"])
+    with tab_eval:
+        with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
+            if not api_key:
+                st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
+            else:
+                selected_stat_label = st.selectbox("Select Prop Market", list(ODDS_API_MARKETS.keys()), key="live_stat_market")
+                market_key = ODDS_API_MARKETS[selected_stat_label]
+                if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
+                    events_df, err = list_nba_events(api_key)
                     if err:
                         st.error(err)
                     else:
-                        ss["board_df"] = board_df
-                        ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
-            board_df = ss.get("board_df")
-            if board_df is not None and not board_df.empty:
-                summary = summarize_board(board_df)
-                st.dataframe(summary, use_container_width=True)
-                player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
-                matched_row = summary[summary["Player"] == player_pick]
-                if not matched_row.empty:
-                    r = matched_row.iloc[0]
-                    if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
-                        ss.update(player=player_pick, stat=selected_stat_label, line=float(r["Line"]),
-                                  over=int(r["Over"]), under=int(r["Under"]), opp="None")
-                        st.rerun()
+                        ss["events_df"] = events_df
+                events_df = ss.get("events_df")
+                if events_df is not None and not events_df.empty:
+                    game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
+                    if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
+                        board_df, err = fetch_nba_prop_board(str(events_df.loc[game_idx, "id"]), market_key, api_key)
+                        if err:
+                            st.error(err)
+                        else:
+                            ss["board_df"] = board_df
+                            ss["board_stat"] = selected_stat_label
+                            ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
+                board_df = ss.get("board_df")
+                if board_df is not None and not board_df.empty:
+                    summary = summarize_board(board_df)
+                    st.dataframe(summary, use_container_width=True)
+                    player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
+                    matched_row = summary[summary["Player"] == player_pick]
+                    if not matched_row.empty:
+                        r = matched_row.iloc[0]
+                        if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
+                            ss.update(player=player_pick, stat=ss.get("board_stat", selected_stat_label), line=float(r["Line"]),
+                                      over=int(r["Over"]), under=int(r["Under"]), opp="None")
+                            st.rerun()
 
-    opp_opts = _opp_options(ss["board_teams"])
-    with st.form("nba_form"):
-        c1, c2, c3 = st.columns([2, 1, 1])
-        player_name = c1.text_input("Player Name", value=ss["player"])
-        stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
-        line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
-        c4, c5, c6 = st.columns(3)
-        over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
-        under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
-        opponent = c6.selectbox("Opponent (optional)", opp_opts, index=opp_opts.index(ss["opp"]) if ss["opp"] in opp_opts else 0)
-        submitted = st.form_submit_button("⚡ Evaluate Prop")
+        opp_opts = _opp_options(ss["board_teams"])
+        with st.form("nba_form"):
+            c1, c2, c3 = st.columns([2, 1, 1])
+            player_name = c1.text_input("Player Name", value=ss["player"])
+            stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
+            line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
+            c4, c5, c6 = st.columns(3)
+            over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
+            under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
+            opponent = c6.selectbox("Opponent (optional)", opp_opts, index=opp_opts.index(ss["opp"]) if ss["opp"] in opp_opts else 0)
+            submitted = st.form_submit_button("⚡ Evaluate Prop")
 
-    if submitted:
-        ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent)
-        res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds, None if opponent == "None" else opponent)
-        if "error" in res:
-            st.error(res["error"])
-        else:
-            render_results(res, stat_category, line_val)
+        if submitted:
+            ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent)
+            res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds, None if opponent == "None" else opponent)
+            if "error" in res:
+                ss["last_res"], ss["last_err"] = None, res["error"]
+            else:
+                res["uid"] = uuid.uuid4().hex
+                ss["last_res"], ss["last_err"] = res, None
+                ss["last_ctx"] = {"player": player_name, "stat": stat_category, "line": float(line_val),
+                                  "opponent": None if opponent == "None" else opponent}
+        if ss.get("last_err"):
+            st.error(ss["last_err"])
+        elif ss.get("last_res"):
+            render_results(ss["last_res"], ss["last_ctx"])
 
-    with st.expander("ℹ️ How the model works"):
-        st.markdown(
-            "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
-            "(last 10, EWMA decay 0.8) are blended with last season's rates using ~8 pseudo-games of prior weight.\n"
-            "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
-            "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
-            "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
-            "- **Opponent**: points-allowed (points, PRA) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
-            "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0."
-        )
+        with st.expander("ℹ️ How the model works"):
+            st.markdown(
+                "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
+                "(last 10, EWMA decay 0.8) are blended with last season's rates using ~8 pseudo-games of prior weight.\n"
+                "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
+                "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
+                "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
+                "- **Opponent**: points-allowed (points, PRA) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
+                "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
+                "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
+                "If the line moved, LINE MOVE shows how far (positive = in your favor)."
+            )
+    with tab_log:
+        render_bet_log()
 
 
 if __name__ == "__main__":
