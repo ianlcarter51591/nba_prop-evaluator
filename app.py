@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
+"""NBA Prop Evaluator: Standalone App with Robust Cloud Compatibility & Odds Parsing."""
 import os
 import re
 import time
@@ -184,10 +184,19 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
             if not matched_players:
                 return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
             player_id = matched_players[0]["id"]
+            
+            # Use custom headers and session config to bypass potential Cloud/Datacenter blocks
             gamelog = playergamelog.PlayerGameLog(
                 player_id=player_id, 
                 season=season,
-                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': 'https://www.nba.com/'},
+                headers={
+                    'Host': 'stats.nba.com',
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Referer': 'https://www.nba.com/',
+                    'Connection': 'keep-alive'
+                },
                 timeout=45
             )
             df = gamelog.get_data_frames()[0]
@@ -215,7 +224,7 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                 time.sleep(2)
                 continue
             else:
-                return pd.DataFrame(), f"NBA API Error (after {max_retries} attempts): {e}"
+                return pd.DataFrame(), f"NBA API Error on Cloud/Local (after {max_retries} attempts): {e}"
     return pd.DataFrame(), f"No active NBA game logs found for '{raw_input}'."
 
 def american_to_implied_prob(american_odds: float) -> float:
@@ -363,15 +372,17 @@ def main() -> None:
     if "under" not in ss:
         ss["under"] = -110
 
-    with st.form("nba_form"):
-        c1, c2, c3 = st.columns([2, 1, 1])
-        player_name = c1.text_input("Player Name", value=ss["player"])
-        stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
-        line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
-        c4, c5 = st.columns(2)
-        over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
-        under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
-        submitted = st.form_submit_button("⚡ Evaluate Prop")
+    # Using direct input widgets outside st.form to guarantee real-time session state synchronization
+    c1, c2, c3 = st.columns([2, 1, 1])
+    player_name = c1.text_input("Player Name", value=ss["player"], key="input_player_name")
+    stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0, key="input_stat_category")
+    line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]), key="input_line_val")
+    
+    c4, c5 = st.columns(2)
+    over_odds = c4.number_input("Over Odds", value=int(ss["over"]), key="input_over_odds")
+    under_odds = c5.number_input("Under Odds", value=int(ss["under"]), key="input_under_odds")
+    
+    submitted = st.button("⚡ Evaluate Prop", key="evaluate_prop_btn")
 
     if submitted:
         ss["player"] = player_name
