@@ -1,6 +1,6 @@
-nba_api>=1.4.1
 streamlit
-pandas
 numpy
+pandas
 plotly
 requests
+nba_api
