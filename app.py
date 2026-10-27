@@ -117,7 +117,7 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
 def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     try:
-        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings"}, timeout=8)
+        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "american"}, timeout=8)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
         data = resp.json()
@@ -132,7 +132,7 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         for o in outcomes:
             price_val = o.get("price", -110)
             try:
-                price_val = int(price_val)
+                price_val = int(round(float(price_val)))
             except Exception:
                 price_val = -110
             rows.append({
