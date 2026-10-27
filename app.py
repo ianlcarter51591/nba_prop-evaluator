@@ -81,6 +81,12 @@ STAT_OPP: Dict[str, Tuple[float, str]] = {
 CURRENT_SEASON_START = "2026-10-01"   # logs dated on/after this are "current season"
 PRIOR_ESPN_SEASON = 2026              # ESPN season param = ending year (2025-26)
 CURRENT_NBA_SEASON, PRIOR_NBA_SEASON = "2026-27", "2025-26"
+# Assumed lift to the PLAYER's projection when the opponent is on the 2nd night of a back-to-back.
+# League-wide effects are small and noisy: these are tunable assumptions, not fitted values.
+B2B_OPP_BOOST: Dict[str, float] = {
+    "POINTS": 0.015, "PTS + REB + AST": 0.010, "REBOUNDS": 0.005, "ASSISTS": 0.005,
+    "3-POINTERS MADE": 0.005, "STEALS": 0.0, "BLOCKS": 0.0,
+}
 N_PRIOR = 8.0          # pseudo-games of weight given to last season's rates
 WINDOW = 10            # recent games used for the current-season estimate
 DECAY = 0.8            # EWMA decay per game of age
@@ -112,6 +118,26 @@ def parse_val(v: Any) -> float:
         return 0.0
 
 
+def _to_et_date(iso: str) -> Optional[date]:
+    """Parse an ISO timestamp (e.g. '2026-10-28T02:00Z') into its US Eastern calendar date."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        tz = ZoneInfo("America/New_York") if ZoneInfo else timezone(timedelta(hours=-5))
+        return dt.astimezone(tz).date()
+    except Exception:
+        return None
+
+
+def _iso_to_date(s: Any) -> Optional[date]:
+    """'YYYY-MM-DD' -> date, or None if blank/invalid."""
+    try:
+        return date.fromisoformat(str(s))
+    except ValueError:
+        return None
+
+
 def _clean_name(name: str) -> str:
     """Normalize a player name for matching (case, punctuation, suffixes)."""
     s = re.sub(r"[^\w\s]", "", str(name).lower())
@@ -133,7 +159,9 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
         for ev in resp.json():
             home, away = ev.get("home_team", ""), ev.get("away_team", "")
             commence = ev.get("commence_time", "")[:16].replace("T", " ")
-            rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({commence} UTC)", "home": home, "away": away})
+            et = _to_et_date(ev.get("commence_time", ""))
+            rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({commence} UTC)", "home": home, "away": away,
+                         "game_date": et.isoformat() if et else ""})
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching NBA events: {e}"
@@ -410,6 +438,31 @@ def load_team_scoring() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_team_game_dates(team: str) -> List[date]:
+    """ET dates of every scheduled regular-season game for a team. Raises on failure."""
+    tid = next((i for i, n in load_team_meta() if n == team), None)
+    if tid is None:
+        raise ValueError(f"unknown team '{team}'")
+    resp = requests.get(TEAM_SCHEDULE_URL.format(tid=tid), params={"seasontype": 2}, headers=ESPN_HEADERS, timeout=12)
+    resp.raise_for_status()
+    found = {_to_et_date(str(ev.get("date", ""))) for ev in resp.json().get("events", [])}
+    return sorted(d for d in found if d is not None)
+
+
+def b2b_status(game_dates: List[date], game_day: date) -> str:
+    """'second' (played yesterday), 'first' (plays tomorrow), 'both' (3-in-3 middle game) or 'none'."""
+    days = set(game_dates)
+    yesterday = (game_day - timedelta(days=1)) in days
+    tomorrow = (game_day + timedelta(days=1)) in days
+    return "both" if yesterday and tomorrow else "second" if yesterday else "first" if tomorrow else "none"
+
+
+def b2b_multiplier(status: str, stat_col: str) -> float:
+    """Projection multiplier: only an opponent on the second night (played yesterday) is treated as fatigued."""
+    return 1.0 + B2B_OPP_BOOST.get(stat_col, 0.0) if status in ("second", "both") else 1.0
+
+
 def opp_multiplier(team: str, stat_col: str, scoring: pd.DataFrame) -> Tuple[float, str]:
     """Shrunk opponent multiplier: 1 + k * n/(n+10) * (factor - 1), clipped to [0.9, 1.1]."""
     if team not in scoring.index or scoring.loc[team, "GAMES"] <= 0:
@@ -526,7 +579,7 @@ def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
 
 
 def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
-                      opponent: Optional[str] = None) -> Dict[str, Any]:
+                      opponent: Optional[str] = None, game_date: Optional[date] = None) -> Dict[str, Any]:
     """Full evaluation: projection -> simulation -> devigged edge, EV, Kelly, hit rates."""
     try:
         for o in (over_odds, under_odds):
@@ -549,9 +602,19 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                 opp_mult, opp_note = opp_multiplier(opponent, stat_col, load_team_scoring())
             except Exception as e:
                 opp_note = f"Opponent data unavailable ({e}); no adjustment applied."
+        b2b_state, b2b_mult, b2b_note = "unknown", 1.0, None
+        game_day = game_date or _today_et()
+        if opponent:
+            try:
+                b2b_state = b2b_status(load_team_game_dates(opponent), game_day)
+                b2b_mult = b2b_multiplier(b2b_state, stat_col)
+            except Exception as e:
+                b2b_note = f"Back-to-back check unavailable ({e}); no adjustment applied."
+        else:
+            b2b_note = "No opponent selected: back-to-back check skipped."
 
         proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
-                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult)
+                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult)
         sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
@@ -582,6 +645,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             warnings.append("No prior-season games found; no shrinkage applied.")
         if opp_note:
             warnings.append(opp_note)
+        if b2b_note:
+            warnings.append(b2b_note)
         try:
             days_rest: Optional[int] = (date.today() - date.fromisoformat(str(logs["DATE"].iloc[-1]))).days
         except Exception:
@@ -595,6 +660,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "hit10": int(np.sum(vals > line)), "n10": len(vals),
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
+            "b2b": {"status": b2b_state, "mult": b2b_mult, "opponent": opponent or "", "game_date": game_day.isoformat()},
             "gamelog_details": [
                 {"stat_value": float(v), "season": s, "x_label": f"{d}<br>{o}"}
                 for v, s, d, o in zip(vals, recent["SEASON"], recent["DATE"], recent["OPPONENT"])
@@ -609,7 +675,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
 # --------------------------------------------------------------------------------------
 LOG_PATH = "bet_log.csv"
 LOG_COLS: List[str] = [
-    "ID", "TS", "GAME_DATE", "PLAYER", "STAT", "SIDE", "LINE", "ODDS", "STAKE", "OPPONENT",
+    "ID", "TS", "GAME_DATE", "PLAYER", "STAT", "SIDE", "LINE", "ODDS", "STAKE", "OPPONENT", "OPP_B2B",
     "P_MODEL", "P_MARKET", "EDGE_PP", "EV_PCT", "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER",
     "LINE_MOVE", "CLV_PP", "RESULT", "ACTUAL", "PROFIT",
 ]
@@ -702,7 +768,7 @@ def make_bet_row(res: Dict[str, Any], ctx: Dict[str, Any], side: str, stake: flo
         "ID": uuid.uuid4().hex[:8], "TS": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
         "GAME_DATE": game_date.isoformat(), "PLAYER": ctx["player"], "STAT": ctx["stat"], "SIDE": side,
         "LINE": float(ctx["line"]), "ODDS": s["odds"], "STAKE": float(stake), "OPPONENT": ctx.get("opponent") or "",
-        "P_MODEL": s["p_model"], "P_MARKET": s["p_market"], "EDGE_PP": s["edge_pp"], "EV_PCT": s["ev_pct"],
+        "OPP_B2B": res.get("b2b", {}).get("status", ""), "P_MODEL": s["p_model"], "P_MARKET": s["p_market"], "EDGE_PP": s["edge_pp"], "EV_PCT": s["ev_pct"],
         "RESULT": "Pending",
     }
 
@@ -837,6 +903,7 @@ def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     ss = st.session_state
     if ss.get("_log_uid") != res["uid"]:
         ss["log_side"] = "Over" if res["best_side"].startswith("Over") else "Under"
+        ss["log_gdate"] = ctx.get("game_date") or _today_et()
         ss["_log_uid"] = res["uid"]
     st.markdown("### 📝 Log this bet")
     c1, c2, c3, c4 = st.columns(4)
@@ -855,10 +922,25 @@ def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
             st.warning("That exact bet (player, stat, side, line, date) is already in your log.")
 
 
+def render_b2b_alert(res: Dict[str, Any]) -> None:
+    """Prominent back-to-back banner for the opponent."""
+    b = res.get("b2b") or {}
+    team, status, mult = b.get("opponent", ""), b.get("status", "unknown"), b.get("mult", 1.0)
+    if status == "second":
+        st.warning(f"🚨 **{team} is on the SECOND night of a back-to-back** (played yesterday). Projection adjusted x{mult:.3f}.")
+    elif status == "both":
+        st.warning(f"🚨 **{team} is on the second night of a back-to-back AND plays again tomorrow** (3-in-3 stretch). Projection adjusted x{mult:.3f}.")
+    elif status == "first":
+        st.info(f"⏭️ **{team} plays again tomorrow** (first game of a back-to-back). Informational only, no adjustment applied.")
+    elif status == "none":
+        st.caption(f"✅ {team} is rested: no game yesterday or tomorrow.")
+
+
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     """Metric cards, notes, chart, and the log form."""
     stat_category, line_val = ctx["stat"], ctx["line"]
     st.markdown(f"## {res['player_name']} | {stat_category}")
+    render_b2b_alert(res)
     c = st.columns(6)
     _metric(c[0], "MEAN", f"{res['mean']:.2f}")
     _metric(c[1], "MEDIAN", f"{res['median']:.1f}")
@@ -1011,7 +1093,7 @@ def main() -> None:
     ss = st.session_state
     api_key = _secret("ODDS_API_KEY")
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
-                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0)):
+                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et())):
         ss.setdefault(key, default)
     if "bet_log" not in ss:
         ss["bet_log"] = read_log_file()
@@ -1041,6 +1123,7 @@ def main() -> None:
                             ss["board_df"] = board_df
                             ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
+                            ss["board_date"] = _iso_to_date(events_df.loc[game_idx].get("game_date", ""))
                 board_df = ss.get("board_df")
                 if board_df is not None and not board_df.empty:
                     summary = summarize_board(board_df)
@@ -1051,7 +1134,8 @@ def main() -> None:
                         r = matched_row.iloc[0]
                         if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
                             ss.update(player=player_pick, stat=ss.get("board_stat", selected_stat_label), line=float(r["Line"]),
-                                      over=int(r["Over"]), under=int(r["Under"]), opp="None")
+                                      over=int(r["Over"]), under=int(r["Under"]), opp="None",
+                                      game_date=ss.get("board_date") or _today_et())
                             st.rerun()
 
         opp_opts = _opp_options(ss["board_teams"])
@@ -1060,22 +1144,24 @@ def main() -> None:
             player_name = c1.text_input("Player Name", value=ss["player"])
             stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
             line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
-            c4, c5, c6 = st.columns(3)
+            c4, c5, c6, c7 = st.columns(4)
             over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
             under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
             opponent = c6.selectbox("Opponent (optional)", opp_opts, index=opp_opts.index(ss["opp"]) if ss["opp"] in opp_opts else 0)
+            game_day = c7.date_input("Game date (ET)", value=ss["game_date"])
             submitted = st.form_submit_button("⚡ Evaluate Prop")
 
         if submitted:
-            ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent)
-            res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds, None if opponent == "None" else opponent)
+            ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent, game_date=game_day)
+            res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds,
+                                    None if opponent == "None" else opponent, game_day)
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
             else:
                 res["uid"] = uuid.uuid4().hex
                 ss["last_res"], ss["last_err"] = res, None
                 ss["last_ctx"] = {"player": player_name, "stat": stat_category, "line": float(line_val),
-                                  "opponent": None if opponent == "None" else opponent}
+                                  "opponent": None if opponent == "None" else opponent, "game_date": game_day}
         if ss.get("last_err"):
             st.error(ss["last_err"])
         elif ss.get("last_res"):
