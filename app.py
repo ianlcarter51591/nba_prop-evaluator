@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Robust Cloud Compatibility & Odds Parsing."""
+"""NBA Prop Evaluator: Standalone App with Dual NBA API & BallDontLie Cloud Fallback."""
 import os
 import re
 import time
@@ -167,25 +167,71 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         summary_rows.append({"Player": player, "Line": line, "Over": over_price, "Under": under_price})
     return pd.DataFrame(summary_rows)
 
+def fetch_balldonelie_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Fallback cloud-friendly API using BallDontLie free public endpoint."""
+    try:
+        search_url = f"https://api.balldontlie.io/v1/players?search={player_name}"
+        headers = {"Authorization": ""}  # Public tier or free
+        resp = requests.get(search_url, headers=headers, timeout=6)
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"BallDontLie search error: {resp.status_code}"
+        p_data = resp.json().get("data", [])
+        if not p_data:
+            return pd.DataFrame(), f"Player '{player_name}' not found on BallDontLie."
+        pid = p_data[0]["id"]
+        
+        # Fetch stats for recent games (2025/2026 season)
+        stats_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={pid}&seasons[]=2025&per_page=25"
+        s_resp = requests.get(stats_url, headers=headers, timeout=8)
+        if s_resp.status_code != 200:
+            return pd.DataFrame(), f"BallDontLie stats error: {s_resp.status_code}"
+        stats_data = s_resp.json().get("data", [])
+        if not stats_data:
+            return pd.DataFrame(), "No recent game logs found on BallDontLie."
+        
+        rows = []
+        for g in stats_data:
+            pts = parse_val(g.get("pts", 0))
+            reb = parse_val(g.get("reb", 0))
+            ast = parse_val(g.get("ast", 0))
+            stl = parse_val(g.get("stl", 0))
+            blk = parse_val(g.get("blk", 0))
+            fg3m = parse_val(g.get("fg3m", 0))
+            game_info = g.get("game", {})
+            g_date = str(game_info.get("date", ""))[:10]
+            home_team = game_info.get("home_team", {}).get("abbreviation", "HOME")
+            visitor_team = game_info.get("visitor_team", {}).get("abbreviation", "AWAY")
+            team = g.get("team", {}).get("abbreviation", "")
+            opp = visitor_team if team == home_team else home_team
+            rows.append({
+                "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
+                "3-POINTERS MADE": fg3m, "PTS + REB + AST": pts + reb + ast,
+                "STEALS": stl, "BLOCKS": blk,
+                "OPPONENT": f"vs {opp}" if team == home_team else f"@ {opp}", "DATE": g_date
+            })
+        if rows:
+            df = pd.DataFrame(rows)
+            return df.reset_index(drop=True), None
+        return pd.DataFrame(), "Empty stats array."
+    except Exception as e:
+        return pd.DataFrame(), f"Cloud fallback error: {e}"
+
 def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, Optional[str]]:
     if not player_name or not player_name.strip():
         return pd.DataFrame(), "Please enter a player name."
     raw_input = player_name.strip()
     target_clean = _clean_name(raw_input)
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            matched_players = nba_players.find_players_by_full_name(raw_input)
-            if not matched_players:
-                all_p = nba_players.get_players()
-                parts = target_clean.split()
-                last_name = parts[-1] if parts else target_clean
-                matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
-            if not matched_players:
-                return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
+    
+    # 1. Try nba_api first (works locally)
+    try:
+        matched_players = nba_players.find_players_by_full_name(raw_input)
+        if not matched_players:
+            all_p = nba_players.get_players()
+            parts = target_clean.split()
+            last_name = parts[-1] if parts else target_clean
+            matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
+        if matched_players:
             player_id = matched_players[0]["id"]
-            
-            # Use custom headers and session config to bypass potential Cloud/Datacenter blocks
             gamelog = playergamelog.PlayerGameLog(
                 player_id=player_id, 
                 season=season,
@@ -197,7 +243,7 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                     'Referer': 'https://www.nba.com/',
                     'Connection': 'keep-alive'
                 },
-                timeout=45
+                timeout=15
             )
             df = gamelog.get_data_frames()[0]
             if df is not None and not df.empty:
@@ -219,13 +265,15 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                 if rows:
                     df_nba = pd.DataFrame(rows)
                     return df_nba.iloc[::-1].reset_index(drop=True), None
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2)
-                continue
-            else:
-                return pd.DataFrame(), f"NBA API Error on Cloud/Local (after {max_retries} attempts): {e}"
-    return pd.DataFrame(), f"No active NBA game logs found for '{raw_input}'."
+    except Exception:
+        pass  # Cloud blocked or timeout -> proceed to fallback
+
+    # 2. Fallback to BallDontLie API (works on Streamlit Cloud)
+    df_cloud, err_cloud = fetch_balldonelie_logs(raw_input)
+    if not df_cloud.empty:
+        return df_cloud, None
+
+    return pd.DataFrame(), f"Could not fetch game logs for '{raw_input}' (Cloud blocked stats.nba.com and fallback failed: {err_cloud})."
 
 def american_to_implied_prob(american_odds: float) -> float:
     try:
@@ -372,7 +420,6 @@ def main() -> None:
     if "under" not in ss:
         ss["under"] = -110
 
-    # Using direct input widgets outside st.form to guarantee real-time session state synchronization
     c1, c2, c3 = st.columns([2, 1, 1])
     player_name = c1.text_input("Player Name", value=ss["player"], key="input_player_name")
     stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0, key="input_stat_category")
