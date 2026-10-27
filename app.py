@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Dual NBA API & BallDontLie Cloud Fallback."""
+"""NBA Prop Evaluator: Standalone App with Fixed Populate & Cloud Fallback."""
 import os
 import re
 import time
@@ -168,10 +168,9 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(summary_rows)
 
 def fetch_balldonelie_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    """Fallback cloud-friendly API using BallDontLie free public endpoint."""
     try:
         search_url = f"https://api.balldontlie.io/v1/players?search={player_name}"
-        headers = {"Authorization": ""}  # Public tier or free
+        headers = {}
         resp = requests.get(search_url, headers=headers, timeout=6)
         if resp.status_code != 200:
             return pd.DataFrame(), f"BallDontLie search error: {resp.status_code}"
@@ -179,8 +178,6 @@ def fetch_balldonelie_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str
         if not p_data:
             return pd.DataFrame(), f"Player '{player_name}' not found on BallDontLie."
         pid = p_data[0]["id"]
-        
-        # Fetch stats for recent games (2025/2026 season)
         stats_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={pid}&seasons[]=2025&per_page=25"
         s_resp = requests.get(stats_url, headers=headers, timeout=8)
         if s_resp.status_code != 200:
@@ -188,7 +185,6 @@ def fetch_balldonelie_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str
         stats_data = s_resp.json().get("data", [])
         if not stats_data:
             return pd.DataFrame(), "No recent game logs found on BallDontLie."
-        
         rows = []
         for g in stats_data:
             pts = parse_val(g.get("pts", 0))
@@ -222,7 +218,6 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
     raw_input = player_name.strip()
     target_clean = _clean_name(raw_input)
     
-    # 1. Try nba_api first (works locally)
     try:
         matched_players = nba_players.find_players_by_full_name(raw_input)
         if not matched_players:
@@ -266,9 +261,8 @@ def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd
                     df_nba = pd.DataFrame(rows)
                     return df_nba.iloc[::-1].reset_index(drop=True), None
     except Exception:
-        pass  # Cloud blocked or timeout -> proceed to fallback
+        pass
 
-    # 2. Fallback to BallDontLie API (works on Streamlit Cloud)
     df_cloud, err_cloud = fetch_balldonelie_logs(raw_input)
     if not df_cloud.empty:
         return df_cloud, None
@@ -402,11 +396,17 @@ def main() -> None:
                 if not matched_row.empty:
                     r = matched_row.iloc[0]
                     if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
+                        # Instantly update session state and widget keys so Streamlit reruns with populated values
                         ss["player"] = player_pick
                         ss["stat"] = selected_stat_label
                         ss["line"] = float(r["Line"])
                         ss["over"] = int(r["Over"])
                         ss["under"] = int(r["Under"])
+                        st.session_state["input_player_name"] = player_pick
+                        st.session_state["input_stat_category"] = selected_stat_label
+                        st.session_state["input_line_val"] = float(r["Line"])
+                        st.session_state["input_over_odds"] = int(r["Over"])
+                        st.session_state["input_under_odds"] = int(r["Under"])
                         st.rerun()
 
     if "player" not in ss:
