@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Python 3.9+ Compatibility."""
+"""NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
 import os
 import re
 import time
@@ -40,9 +40,9 @@ st.markdown(
     .metric-value-green { color: #15803d !important; font-size: 24px !important; font-weight: 900 !important; }
     label, p, span, div[data-testid="stMarkdownContainer"] p { color: #0f172a !important; font-weight: 700 !important; }
     .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
-        background-color: #0f172a !important; color: #ffffff !important; border-radius: 10px !important; border: 2px solid #0284c7 !important; font-weight: 600 !important;
+        background-color: #ffffff !important; color: #0f172a !important; border-radius: 10px !important; border: 2px solid #0284c7 !important; font-weight: 700 !important;
     }
-    div[data-baseweb="select"] * { color: #ffffff !important; }
+    div[data-baseweb="select"] * { color: #0f172a !important; }
     .stButton>button, [data-testid="stFormSubmitButton"]>button {
         background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important; color: #ffffff !important; font-weight: 900 !important; border-radius: 10px !important; border: None !important; padding: 12px 20px !important; width: 100% !important;
     }
@@ -130,7 +130,17 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         outcomes = markets[0].get("outcomes", [])
         rows = []
         for o in outcomes:
-            rows.append({"Player": o.get("description"), "Line": o.get("point"), "Price": o.get("price"), "Outcome": o.get("name")})
+            price_val = o.get("price", -110)
+            try:
+                price_val = int(price_val)
+            except Exception:
+                price_val = -110
+            rows.append({
+                "Player": o.get("description"), 
+                "Line": o.get("point", 0.5), 
+                "Price": price_val, 
+                "Outcome": o.get("name")
+            })
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching prop board: {e}"
@@ -145,10 +155,15 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         under_price = -110
         for _, r in group.iterrows():
             outcome = str(r.get("Outcome", "")).lower()
+            p = r.get("Price", -110)
+            try:
+                p_int = int(p)
+            except Exception:
+                p_int = -110
             if "over" in outcome:
-                over_price = int(r.get("Price", -110))
+                over_price = p_int
             elif "under" in outcome:
-                under_price = int(r.get("Price", -110))
+                under_price = p_int
         summary_rows.append({"Player": player, "Line": line, "Over": over_price, "Under": under_price})
     return pd.DataFrame(summary_rows)
 
