@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with Decimal-to-American Odds Conversion & Cloud Fallback."""
+"""NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
 import os
 import re
 import time
@@ -97,18 +97,6 @@ def _clean_name(name: str) -> str:
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
 
-def decimal_to_american(price_val) -> int:
-    """Convert Odds API decimal price (e.g. 1.91) to American odds (e.g. -110)."""
-    try:
-        d = float(price_val)
-        if d >= 2.0:
-            return int(round((d - 1.0) * 100))
-        elif d > 1.0:
-            return int(round(-100 / (d - 1.0)))
-        return -110
-    except Exception:
-        return -110
-
 def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     try:
@@ -129,7 +117,7 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
 def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     try:
-        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "decimal"}, timeout=8)
+        resp = requests.get(url, params={"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings"}, timeout=8)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
         data = resp.json()
@@ -142,12 +130,15 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         outcomes = markets[0].get("outcomes", [])
         rows = []
         for o in outcomes:
-            raw_price = o.get("price", 1.91)
-            american_price = decimal_to_american(raw_price)
+            price_val = o.get("price", -110)
+            try:
+                price_val = int(price_val)
+            except Exception:
+                price_val = -110
             rows.append({
                 "Player": o.get("description"), 
                 "Line": o.get("point", 0.5), 
-                "Price": american_price, 
+                "Price": price_val, 
                 "Outcome": o.get("name")
             })
         return pd.DataFrame(rows), None
@@ -164,7 +155,11 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         under_price = -110
         for _, r in group.iterrows():
             outcome = str(r.get("Outcome", "")).lower()
-            p_int = int(r.get("Price", -110))
+            p = r.get("Price", -110)
+            try:
+                p_int = int(p)
+            except Exception:
+                p_int = -110
             if "over" in outcome:
                 over_price = p_int
             elif "under" in outcome:
@@ -172,107 +167,157 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         summary_rows.append({"Player": player, "Line": line, "Over": over_price, "Under": under_price})
     return pd.DataFrame(summary_rows)
 
-def fetch_balldonelie_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    try:
-        search_url = f"https://api.balldontlie.io/v1/players?search={player_name}"
-        headers = {}
-        resp = requests.get(search_url, headers=headers, timeout=6)
-        if resp.status_code != 200:
-            return pd.DataFrame(), f"BallDontLie search error: {resp.status_code}"
-        p_data = resp.json().get("data", [])
-        if not p_data:
-            return pd.DataFrame(), f"Player '{player_name}' not found on BallDontLie."
-        pid = p_data[0]["id"]
-        stats_url = f"https://api.balldontlie.io/v1/stats?player_ids[]={pid}&seasons[]=2025&per_page=25"
-        s_resp = requests.get(stats_url, headers=headers, timeout=8)
-        if s_resp.status_code != 200:
-            return pd.DataFrame(), f"BallDontLie stats error: {s_resp.status_code}"
-        stats_data = s_resp.json().get("data", [])
-        if not stats_data:
-            return pd.DataFrame(), "No recent game logs found on BallDontLie."
-        rows = []
-        for g in stats_data:
-            pts = parse_val(g.get("pts", 0))
-            reb = parse_val(g.get("reb", 0))
-            ast = parse_val(g.get("ast", 0))
-            stl = parse_val(g.get("stl", 0))
-            blk = parse_val(g.get("blk", 0))
-            fg3m = parse_val(g.get("fg3m", 0))
-            game_info = g.get("game", {})
-            g_date = str(game_info.get("date", ""))[:10]
-            home_team = game_info.get("home_team", {}).get("abbreviation", "HOME")
-            visitor_team = game_info.get("visitor_team", {}).get("abbreviation", "AWAY")
-            team = g.get("team", {}).get("abbreviation", "")
-            opp = visitor_team if team == home_team else home_team
-            rows.append({
-                "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
-                "3-POINTERS MADE": fg3m, "PTS + REB + AST": pts + reb + ast,
-                "STEALS": stl, "BLOCKS": blk,
-                "OPPONENT": f"vs {opp}" if team == home_team else f"@ {opp}", "DATE": g_date
-            })
+ESPN_HEADERS: Dict[str, str] = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+}
+ESPN_SEARCH_URLS: List[str] = [
+    "https://site.web.api.espn.com/apis/common/v3/search",
+    "https://site.web.api.espn.com/apis/search/v2",
+]
+ESPN_GAMELOG_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{pid}/gamelog"
+
+
+def _walk_json(obj: Any):
+    """Yield every dict nested anywhere inside a JSON-like object."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_json(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_json(v)
+
+
+def _espn_find_player_id(name: str) -> Optional[str]:
+    """Resolve a player name to an ESPN athlete id (keyless, cloud-friendly)."""
+    target = _clean_name(name)
+    candidates: List[Tuple[str, str]] = []
+    for url in ESPN_SEARCH_URLS:
+        try:
+            resp = requests.get(
+                url,
+                params={"query": name, "limit": 10, "type": "player", "sport": "basketball", "league": "nba"},
+                headers=ESPN_HEADERS,
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            for d in _walk_json(resp.json()):
+                uid = str(d.get("uid", ""))
+                label = d.get("displayName") or d.get("fullName") or d.get("name")
+                is_player = str(d.get("type", "")).lower() == "player" or "~a:" in uid
+                is_nba = "l:46" in uid or str(d.get("league", "")).lower() == "nba" or str(d.get("defaultLeagueSlug", "")).lower() == "nba"
+                if not (label and is_player and is_nba):
+                    continue
+                m = re.search(r"~a:(\d+)", uid)
+                pid = str(d.get("id") or (m.group(1) if m else ""))
+                if pid.isdigit():
+                    candidates.append((pid, str(label)))
+        except Exception:
+            continue
+        if candidates:
+            break
+    for pid, label in candidates:
+        if _clean_name(label) == target:
+            return pid
+    return candidates[0][0] if candidates else None
+
+
+def _split_made(v: Any) -> float:
+    """Parse ESPN 'made-attempted' strings like '3-8' into made (3.0)."""
+    s = str(v).strip()
+    return parse_val(s.split("-")[0]) if "-" in s else parse_val(s)
+
+
+def _espn_fetch_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Fetch current-season regular-season game logs from ESPN (oldest -> newest)."""
+    pid = _espn_find_player_id(player_name)
+    if not pid:
+        return pd.DataFrame(), f"ESPN: no NBA player found for '{player_name}'."
+    resp = requests.get(ESPN_GAMELOG_URL.format(pid=pid), headers=ESPN_HEADERS, timeout=12)
+    if resp.status_code != 200:
+        return pd.DataFrame(), f"ESPN gamelog HTTP {resp.status_code}."
+    data = resp.json()
+    labels = [str(x).upper() for x in data.get("labels", [])]
+    meta = data.get("events", {}) or {}
+    rows: List[Dict[str, Any]] = []
+    for require_regular in (True, False):
+        for stype in data.get("seasonTypes", []):
+            if require_regular and "regular" not in str(stype.get("displayName", "")).lower():
+                continue
+            for cat in stype.get("categories", []):
+                for ev in cat.get("events", []):
+                    stats = ev.get("stats", [])
+                    if len(stats) != len(labels):
+                        continue
+                    rec = dict(zip(labels, stats))
+                    info = meta.get(str(ev.get("eventId")), {}) or {}
+                    opp = (info.get("opponent") or {}).get("abbreviation", "OPP")
+                    sep = "vs." if str(info.get("atVs", "vs")).lower() == "vs" else "@"
+                    pts, reb, ast = parse_val(rec.get("PTS")), parse_val(rec.get("REB")), parse_val(rec.get("AST"))
+                    rows.append({
+                        "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
+                        "3-POINTERS MADE": _split_made(rec.get("3PT", 0)),
+                        "PTS + REB + AST": pts + reb + ast,
+                        "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
+                        "OPPONENT": f"{sep} {opp}", "DATE": str(info.get("gameDate", ""))[:10],
+                    })
         if rows:
-            df = pd.DataFrame(rows)
-            return df.reset_index(drop=True), None
-        return pd.DataFrame(), "Empty stats array."
-    except Exception as e:
-        return pd.DataFrame(), f"Cloud fallback error: {e}"
+            break
+    if not rows:
+        return pd.DataFrame(), "ESPN returned no games for this season yet."
+    return pd.DataFrame(rows).sort_values("DATE").reset_index(drop=True), None
+
+
+def _nba_api_fetch_logs(raw_input: str, season: str) -> Tuple[pd.DataFrame, Optional[str]]:
+    """Fallback: stats.nba.com via nba_api (works locally, usually blocked on cloud IPs)."""
+    matched = nba_players.find_players_by_full_name(raw_input)
+    if not matched:
+        return pd.DataFrame(), f"No NBA player found matching '{raw_input}'."
+    gamelog = playergamelog.PlayerGameLog(
+        player_id=matched[0]["id"], season=season,
+        headers={"User-Agent": ESPN_HEADERS["User-Agent"], "Referer": "https://www.nba.com/"},
+        timeout=10,
+    )
+    df = gamelog.get_data_frames()[0]
+    if df is None or df.empty:
+        return pd.DataFrame(), "nba_api returned no games."
+    rows = []
+    for _, r in df.iterrows():
+        pts, reb, ast = parse_val(r.get("PTS", 0)), parse_val(r.get("REB", 0)), parse_val(r.get("AST", 0))
+        rows.append({
+            "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
+            "3-POINTERS MADE": parse_val(r.get("FG3M", 0)),
+            "PTS + REB + AST": pts + reb + ast,
+            "STEALS": parse_val(r.get("STL", 0)), "BLOCKS": parse_val(r.get("BLK", 0)),
+            "OPPONENT": str(r.get("MATCHUP", "OPP")), "DATE": str(r.get("GAME_DATE", "")),
+        })
+    return pd.DataFrame(rows).iloc[::-1].reset_index(drop=True), None
+
 
 def fetch_nba_player_logs(player_name: str, season: str = "2026-27") -> Tuple[pd.DataFrame, Optional[str]]:
+    """Game logs (oldest -> newest). ESPN first (cloud-safe), nba_api as fallback."""
     if not player_name or not player_name.strip():
         return pd.DataFrame(), "Please enter a player name."
     raw_input = player_name.strip()
-    target_clean = _clean_name(raw_input)
-    
+    errors: List[str] = []
     try:
-        matched_players = nba_players.find_players_by_full_name(raw_input)
-        if not matched_players:
-            all_p = nba_players.get_players()
-            parts = target_clean.split()
-            last_name = parts[-1] if parts else target_clean
-            matched_players = [p for p in all_p if last_name in p["full_name"].lower()]
-        if matched_players:
-            player_id = matched_players[0]["id"]
-            gamelog = playergamelog.PlayerGameLog(
-                player_id=player_id, 
-                season=season,
-                headers={
-                    'Host': 'stats.nba.com',
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Referer': 'https://www.nba.com/',
-                    'Connection': 'keep-alive'
-                },
-                timeout=15
-            )
-            df = gamelog.get_data_frames()[0]
-            if df is not None and not df.empty:
-                rows = []
-                for _, r in df.iterrows():
-                    pts = parse_val(r.get("PTS", 0))
-                    reb = parse_val(r.get("REB", 0))
-                    ast = parse_val(r.get("AST", 0))
-                    matchup = str(r.get("MATCHUP", "OPP"))
-                    g_date = str(r.get("GAME_DATE", ""))
-                    rows.append({
-                        "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
-                        "3-POINTERS MADE": parse_val(r.get("FG3M", 0)),
-                        "PTS + REB + AST": pts + reb + ast,
-                        "STEALS": parse_val(r.get("STL", 0)),
-                        "BLOCKS": parse_val(r.get("BLK", 0)),
-                        "OPPONENT": matchup, "DATE": g_date,
-                    })
-                if rows:
-                    df_nba = pd.DataFrame(rows)
-                    return df_nba.iloc[::-1].reset_index(drop=True), None
-    except Exception:
-        pass
+        df, err = _espn_fetch_logs(raw_input)
+        if err is None and not df.empty:
+            return df, None
+        errors.append(str(err))
+    except Exception as e:
+        errors.append(f"ESPN error: {e}")
+    try:
+        df, err = _nba_api_fetch_logs(raw_input, season)
+        if err is None and not df.empty:
+            return df, None
+        errors.append(str(err))
+    except Exception as e:
+        errors.append(f"nba_api error: {e}")
+    return pd.DataFrame(), f"Could not fetch game logs for '{raw_input}'. " + " | ".join(errors)
 
-    df_cloud, err_cloud = fetch_balldonelie_logs(raw_input)
-    if not df_cloud.empty:
-        return df_cloud, None
-
-    return pd.DataFrame(), f"Could not fetch game logs for '{raw_input}' (Cloud blocked stats.nba.com and fallback failed: {err_cloud})."
 
 def american_to_implied_prob(american_odds: float) -> float:
     try:
@@ -324,8 +369,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             gamelog_details.append({"stat_value": val, "opponent": opp, "date": gdate, "x_label": f"{gdate}<br>{opp}" if gdate else opp})
         if not stats_list:
             return {"error": f"No valid numeric data found for stat '{stat_category}'."}
-        stats_arr = np.array(stats_list[:10])
-        gamelog_details = gamelog_details[:10]
+        stats_arr = np.array(stats_list[-10:])
+        gamelog_details = gamelog_details[-10:]
         real_mean = float(np.mean(stats_arr))
         real_median = float(np.median(stats_arr))
         proj_mean = calculate_ewma(stats_arr)
@@ -406,11 +451,6 @@ def main() -> None:
                         ss["line"] = float(r["Line"])
                         ss["over"] = int(r["Over"])
                         ss["under"] = int(r["Under"])
-                        st.session_state["input_player_name"] = player_pick
-                        st.session_state["input_stat_category"] = selected_stat_label
-                        st.session_state["input_line_val"] = float(r["Line"])
-                        st.session_state["input_over_odds"] = int(r["Over"])
-                        st.session_state["input_under_odds"] = int(r["Under"])
                         st.rerun()
 
     if "player" not in ss:
@@ -424,16 +464,15 @@ def main() -> None:
     if "under" not in ss:
         ss["under"] = -110
 
-    c1, c2, c3 = st.columns([2, 1, 1])
-    player_name = c1.text_input("Player Name", value=ss["player"], key="input_player_name")
-    stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0, key="input_stat_category")
-    line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]), key="input_line_val")
-    
-    c4, c5 = st.columns(2)
-    over_odds = c4.number_input("Over Odds", value=int(ss["over"]), key="input_over_odds")
-    under_odds = c5.number_input("Under Odds", value=int(ss["under"]), key="input_under_odds")
-    
-    submitted = st.button("⚡ Evaluate Prop", key="evaluate_prop_btn")
+    with st.form("nba_form"):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        player_name = c1.text_input("Player Name", value=ss["player"])
+        stat_category = c2.selectbox("Stat Category", STATS, index=STATS.index(ss["stat"]) if ss["stat"] in STATS else 0)
+        line_val = c3.number_input("Line", step=0.5, value=float(ss["line"]))
+        c4, c5 = st.columns(2)
+        over_odds = c4.number_input("Over Odds", value=int(ss["over"]))
+        under_odds = c5.number_input("Under Odds", value=int(ss["under"]))
+        submitted = st.form_submit_button("⚡ Evaluate Prop")
 
     if submitted:
         ss["player"] = player_name
@@ -451,8 +490,8 @@ def main() -> None:
             m2.markdown(f'<div class="metric-box"><div class="metric-label">MEDIAN</div><div class="metric-value">{res["projection_median"]:.2f}</div></div>', unsafe_allow_html=True)
             m3.markdown(f'<div class="metric-box"><div class="metric-label">BEST SIDE</div><div class="metric-value">{res["best_side"]}</div></div>', unsafe_allow_html=True)
             m4.markdown(f'<div class="metric-box"><div class="metric-label">FAIR ODDS</div><div class="metric-value">{res["fair_odds"]:+d}</div></div>', unsafe_allow_html=True)
-            m5.markdown(f'<div class="metric-box"><div class="metric-label">EDGE VS MKT</div><div class="metric-value-green">+{res["edge_vs_market"]:.1f}%</div></div>', unsafe_allow_html=True)
-            m6.markdown(f'<div class="metric-box"><div class="metric-label">EV</div><div class="metric-value-green">+{res["ev_pct"]:.1f}%</div></div>', unsafe_allow_html=True)
+            m5.markdown(f'<div class="metric-box"><div class="metric-label">EDGE VS MKT</div><div class="metric-value-green">{res["edge_vs_market"]:+.1f}%</div></div>', unsafe_allow_html=True)
+            m6.markdown(f'<div class="metric-box"><div class="metric-label">EV</div><div class="metric-value-green">{res["ev_pct"]:+.1f}%</div></div>', unsafe_allow_html=True)
             st.markdown("---")
             st.markdown("### 📊 Game Log Performance")
             gamelog_data = res.get("gamelog_details", [])
