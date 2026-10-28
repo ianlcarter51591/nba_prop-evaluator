@@ -93,7 +93,13 @@ B2B_OWN_EFFECT: Dict[str, float] = {
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
 BT_TAU = 0.02
 EFFECTS_PATH = "b2b_effects.json"
-N_PRIOR = 8.0
+# Last-season weight, in pseudo-games. Per-minute production is stable year to year (high weight); minutes and roles
+# change more (lower weight). Defaults are informed assumptions: run the Backtest tab to estimate them from data.
+N_PRIOR_RATE = 12.0
+N_PRIOR_MIN = 6.0
+PRIOR_GRID: List[float] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 80]
+EARLY_GAMES = 15
+PRIOR_PATH = "prior_weights.json"
 WINDOW = 10
 DECAY = 0.8
 N_SIMS = 50_000
@@ -533,7 +539,8 @@ def build_backtest_frame(player_logs: Dict[Tuple[str, int], pd.DataFrame], sched
     g = d.groupby(["PID", "SEASON"])
     ratios = (d[BT_STATS] / g[BT_STATS].transform("mean")).replace([np.inf, -np.inf], np.nan)
     ratios.columns = [f"R_{c}" for c in BT_STATS]
-    return pd.concat([d[["PID", "SEASON", "DATE", "OWN_B2B", "OPP_B2B", "HOME"]], ratios], axis=1)
+    raw = d[BT_STATS].add_prefix("X_")
+    return pd.concat([d[["PID", "SEASON", "DATE", "OWN_B2B", "OPP_B2B", "HOME"]], ratios, raw], axis=1)
 
 
 def _ols_cluster(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -566,6 +573,111 @@ def estimate_b2b_effects(frame: pd.DataFrame, tau: float = BT_TAU) -> pd.DataFra
 def effects_from_table(table: pd.DataFrame) -> Dict[str, Dict[str, float]]:
     t = table[table["STAT"].isin(B2B_OPP_BOOST.keys())].set_index("STAT")
     return {"own": (t["OWN_SHRUNK_%"] / 100.0).to_dict(), "opp": (t["OPP_SHRUNK_%"] / 100.0).to_dict()}
+
+
+def _early_season_arrays(frame: pd.DataFrame, stat_col: str) -> Optional[Tuple[np.ndarray, ...]]:
+    """Player-seasons with a prior season: first EARLY_GAMES games as padded (P, G) arrays plus prior-season summaries."""
+    f = frame[["PID", "SEASON", f"X_{stat_col}", "X_MINUTES"]].rename(columns={f"X_{stat_col}": "X", "X_MINUTES": "M"}).copy()
+    g = f.groupby(["PID", "SEASON"])
+    f["G"], f["REV"] = g.cumcount(), g.cumcount(ascending=False)
+    prior = pd.DataFrame({"X_SUM": g["X"].sum(), "M_SUM": g["M"].sum(), "X_MEAN": g["X"].mean()})
+    prior["M20"] = f[f["REV"] < 20].groupby(["PID", "SEASON"])["M"].mean()
+    prior = prior.reset_index()
+    prior["SEASON"] = prior["SEASON"] + 1                      # last season's summary, keyed to the season it predicts
+    cur = f[f["G"] < EARLY_GAMES].merge(prior, on=["PID", "SEASON"], how="inner")
+    cur = cur[(cur["X_MEAN"] > 0) & (cur["M20"] > 0) & (cur["M_SUM"] > 0)]
+    if cur["PID"].nunique() < 15:
+        return None
+    xs = cur.pivot(index=["PID", "SEASON"], columns="G", values="X").reindex(columns=range(EARLY_GAMES))
+    ms = cur.pivot(index=["PID", "SEASON"], columns="G", values="M").reindex(columns=range(EARLY_GAMES))
+    pri = cur.drop_duplicates(["PID", "SEASON"]).set_index(["PID", "SEASON"]).loc[xs.index]
+    return (xs.to_numpy(float), ms.to_numpy(float), (pri["X_SUM"] / pri["M_SUM"]).to_numpy(float),
+            pri["M20"].to_numpy(float), pri["X_MEAN"].to_numpy(float))
+
+
+def _prior_loss_curves(X: np.ndarray, M: np.ndarray, rate0: np.ndarray, min0: np.ndarray, pm: np.ndarray,
+                       grid: List[float]) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Out-of-sample squared error of the model's one-game-ahead prediction for each prior weight n0 on the grid.
+    rate_hat = (n*EWMA_rate + n0*last_season_rate)/(n + n0) scored as (stat - rate_hat*minutes)/last_season_mean;
+    min_hat is the same blend for minutes scored as (minutes - min_hat)/last_season_minutes.
+    """
+    n0 = np.asarray(grid, float)[:, None]
+    rate_sse, min_sse, cnt = np.zeros(len(grid)), np.zeros(len(grid)), 0
+    for g in range(X.shape[1]):
+        ok = ~np.isnan(X[:, g]) & ~np.isnan(M[:, g])
+        if not ok.any():
+            continue
+        k = min(g, WINDOW)
+        if k > 0:
+            w = DECAY ** np.arange(k)[::-1]
+            xp, mp = X[ok, g - k:g], M[ok, g - k:g]
+            cur_rate, cur_min = (xp * w).sum(1) / (mp * w).sum(1), (mp * w).sum(1) / w.sum()
+        else:
+            cur_rate = cur_min = np.zeros(int(ok.sum()))
+        denom = float(k) + n0
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rate_hat = np.where(denom > 0, (k * cur_rate[None, :] + n0 * rate0[ok][None, :]) / denom, rate0[ok][None, :])
+            min_hat = np.where(denom > 0, (k * cur_min[None, :] + n0 * min0[ok][None, :]) / denom, min0[ok][None, :])
+        rate_sse += (((X[ok, g][None, :] - rate_hat * M[ok, g][None, :]) / pm[ok][None, :]) ** 2).sum(1)
+        min_sse += (((M[ok, g][None, :] - min_hat) / min0[ok][None, :]) ** 2).sum(1)
+        cnt += int(ok.sum())
+    return rate_sse / max(cnt, 1), min_sse / max(cnt, 1), cnt
+
+
+def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = None) -> pd.DataFrame:
+    """
+    Data-driven last-season weight: for the first EARLY_GAMES games of each season, find the n0 that minimizes
+    one-game-ahead prediction error (per stat for the per-minute rate, plus minutes). N0_RANGE = every grid value
+    within 1% of the best loss (how flat the optimum is).
+    """
+    grid = list(PRIOR_GRID if grid is None else grid)
+    rows: List[Dict[str, Any]] = []
+    min_curve: Optional[np.ndarray] = None
+    for stat in BT_STATS[:-1]:
+        arrays = _early_season_arrays(frame, stat) if f"X_{stat}" in frame.columns else None
+        if arrays is None:
+            continue
+        r_curve, m_curve, cnt = _prior_loss_curves(*arrays, grid)
+        if min_curve is None:
+            min_curve, min_cnt = m_curve, cnt
+        rows.append({"STAT": stat, "TARGET": "per-minute rate", "curve": r_curve, "N": cnt, "default": N_PRIOR_RATE})
+    if min_curve is not None:
+        rows.append({"STAT": "MINUTES", "TARGET": "minutes", "curve": min_curve, "N": min_cnt, "default": N_PRIOR_MIN})
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        c = r["curve"]
+        best = int(np.argmin(c))
+        near = [grid[i] for i in range(len(grid)) if c[i] <= c[best] * 1.01]
+        base = float(np.interp(r["default"], grid, c))
+        out.append({"STAT": r["STAT"], "TARGET": r["TARGET"], "N0_BEST": float(grid[best]), "N0_RANGE": f"{min(near):g}-{max(near):g}",
+                    "LOSS_BEST": float(c[best]), "LOSS_AT_DEFAULT": base, "GAIN_VS_DEFAULT_%": (base - float(c[best])) / base * 100.0,
+                    "PLAYER_GAMES": r["N"]})
+    return pd.DataFrame(out)
+
+
+def load_prior_file() -> Optional[Dict[str, float]]:
+    """Saved last-season weights (best effort; ephemeral on Streamlit Cloud)."""
+    try:
+        if os.path.exists(PRIOR_PATH):
+            with open(PRIOR_PATH) as fh:
+                return json.load(fh)
+    except Exception:
+        pass
+    return None
+
+
+def save_prior_file(weights: Optional[Dict[str, float]]) -> None:
+    """Persist (or clear) the last-season weights."""
+    try:
+        if weights is None:
+            if os.path.exists(PRIOR_PATH):
+                os.remove(PRIOR_PATH)
+        else:
+            with open(PRIOR_PATH, "w") as fh:
+                json.dump(weights, fh)
+    except Exception:
+        pass
 
 
 def load_effects_file() -> Optional[Dict[str, Dict[str, float]]]:
@@ -628,6 +740,8 @@ class Projection:
     n_current: int
     n_prior: int
     opp_mult: float
+    share_rate: float = 0.0     # fraction of the per-minute-rate estimate that comes from last season
+    share_min: float = 0.0      # fraction of the minutes estimate that comes from last season
 
 
 def ewma_weights(n: int, decay: float = DECAY) -> np.ndarray:
@@ -641,28 +755,40 @@ def _cv(x: np.ndarray) -> Optional[float]:
     return float(np.std(x, ddof=1) / np.mean(x))
 
 
-def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, opp_mult: float = 1.0) -> Projection:
+def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, opp_mult: float = 1.0,
+                     n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN) -> Projection:
+    """
+    rate    = (n*EWMA_rate + n0_rate*last_season_rate) / (n + n0_rate)
+    minutes = (n*EWMA_min  + n0_min *last_season_min ) / (n + n0_min)
+    mu      = rate * minutes * opp_mult;  spread = pooled CV * mu, widened for estimation uncertainty.
+    """
     n = len(cur_x)
-    n0 = N_PRIOR if len(pri_x) > 0 else 0.0
-    if n == 0 and n0 == 0:
+    has_prior = len(pri_x) > 0
+    if n == 0 and not has_prior:
         raise ValueError("No usable games (current or prior season).")
+    r0 = float(n0_rate) if has_prior else 0.0
+    m0 = float(n0_min) if has_prior else 0.0
+    if n == 0:                                   # nothing but last season to go on
+        r0, m0 = max(r0, 1.0), max(m0, 1.0)
     pairs_rate: List[Tuple[float, float]] = []
     pairs_min: List[Tuple[float, float]] = []
     if n > 0:
         w = ewma_weights(n)
         pairs_rate.append((float(n), float(np.sum(w * cur_x) / np.sum(w * cur_m))))
         pairs_min.append((float(n), float(np.sum(w * cur_m))))
-    if n0 > 0:
-        pairs_rate.append((n0, float(np.sum(pri_x) / np.sum(pri_m))))
-        pairs_min.append((n0, float(np.mean(pri_m[-20:]))))
+    if r0 > 0:
+        pairs_rate.append((r0, float(np.sum(pri_x) / np.sum(pri_m))))
+    if m0 > 0:
+        pairs_min.append((m0, float(np.mean(pri_m[-20:]))))
     blend = lambda pairs: sum(w * v for w, v in pairs) / sum(w for w, _ in pairs)
     rate, minutes = blend(pairs_rate), blend(pairs_min)
     mu = max(rate * minutes * opp_mult, 0.05)
-    cvs = [(w, c) for w, c in ((float(n), _cv(cur_x)), (n0, _cv(pri_x[-40:]))) if c is not None and w > 0]
+    cvs = [(w, c) for w, c in ((float(n), _cv(cur_x)), (r0, _cv(pri_x[-40:]))) if c is not None and w > 0]
     cv = sum(w * c for w, c in cvs) / sum(w for w, _ in cvs) if cvs else DEFAULT_CV
     cv = max(cv, 0.15)
-    sigma = max(0.5, cv * mu) * float(np.sqrt(1.0 + 1.0 / (n + n0)))
-    return Projection(mu=mu, sigma=sigma, minutes=minutes, n_current=n, n_prior=len(pri_x), opp_mult=opp_mult)
+    sigma = max(0.5, cv * mu) * float(np.sqrt(1.0 + 1.0 / (n + r0)))
+    return Projection(mu=mu, sigma=sigma, minutes=minutes, n_current=n, n_prior=len(pri_x), opp_mult=opp_mult,
+                      share_rate=r0 / (n + r0) if n + r0 > 0 else 0.0, share_min=m0 / (n + m0) if n + m0 > 0 else 0.0)
 
 
 def simulate(mu: float, sigma: float, count_stat: bool, n_sims: int = N_SIMS, seed: int = 42) -> np.ndarray:
@@ -706,11 +832,11 @@ def run_automated_context_filters(proj_minutes: float, raw_avg: float, b2b_statu
     Automated pre-flight checks:
     1. Secure Volume & Usage: Checked automatically if projected minutes >= 28.0 or raw average output is robust.
     2. Clean Schedule Spot: Checked automatically if the team is NOT on the second night of a back-to-back.
-    3. Sharp Line Movement / Stability: Validated automatically based on projection stability.
+    3. Rotation Minutes: checked automatically as projected minutes >= 24 (this does not measure sportsbook line movement).
     """
     secure_volume = bool(proj_minutes >= 28.0 or raw_avg >= 15.0)
     clean_schedule = bool(b2b_status_str not in ("second", "both"))
-    sharp_movement = bool(proj_minutes >= 24.0)  # Stable rotation indicator
+    sharp_movement = bool(proj_minutes >= 24.0)  # NOTE: a rotation-minutes check; it does not look at line movement
     
     return {
         "secure_volume": secure_volume,
@@ -722,7 +848,8 @@ def run_automated_context_filters(proj_minutes: float, raw_avg: float, b2b_statu
 
 def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
                       opponent: Optional[str] = None, game_date: Optional[date] = None,
-                      b2b_effects: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
+                      b2b_effects: Optional[Dict[str, Dict[str, float]]] = None,
+                      prior_weights: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
     try:
         for o in (over_odds, under_odds):
             if abs(float(o)) < 100:
@@ -761,7 +888,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
         proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
-                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult)
+                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult,
+                                *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)))
         sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
@@ -783,6 +911,11 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             sides[nm] = {"odds": float(od_), "p_model": pc * 100.0, "p_market": dv_ * 100.0,
                          "edge_pp": (pc - dv_) * 100.0, "ev_pct": ev_ * 100.0}
 
+        cur_vals = played[played["SEASON"] == "current"][stat_col].to_numpy(float)
+        this_season = {"n": len(cur_vals), "avg": float(np.mean(cur_vals)) if len(cur_vals) else None,
+                       "median": float(np.median(cur_vals)) if len(cur_vals) else None,
+                       "over": int(np.sum(cur_vals > line)), "under": int(np.sum(cur_vals < line)),
+                       "push": int(np.sum(cur_vals == line))}
         recent = played.tail(WINDOW)
         vals = recent[stat_col].to_numpy(float)
         raw_avg = float(np.mean(vals)) if len(vals) else 0.0
@@ -792,7 +925,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
 
         warnings: List[str] = []
         if proj.n_current < 8:
-            warnings.append(f"Small sample: {proj.n_current} games this season; projection leans on last season ({proj.n_prior} games).")
+            warnings.append(f"Small sample: {proj.n_current} games this season; last season ({proj.n_prior} games) carries "
+                            f"{proj.share_rate:.0%} of the per-minute rate and {proj.share_min:.0%} of minutes (see Model settings).")
         if proj.n_prior == 0:
             warnings.append("No prior-season games found; no shrinkage applied.")
         if opp_note:
@@ -809,7 +943,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "hit10": int(np.sum(vals > line)), "n10": len(vals),
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
-            "context_checks": context_checks,
+            "context_checks": context_checks, "this_season": this_season,
+            "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
             "b2b": {"status": b2b_state, "mult": b2b_mult, "opponent": opponent or "", "game_date": game_day.isoformat()},
@@ -1080,15 +1215,15 @@ def render_automated_checks(res: Dict[str, Any]) -> None:
     v3 = checks.get("sharp_movement", True)
     
     with st.expander("🔍 Step 3: Automated Contextual Reality Check (Pre-Flight Filter)", expanded=True):
-        st.markdown("Automated evaluation filters running against player volume, schedule fatigue, and market stability:")
+        st.markdown("Automated filters running against player volume, schedule fatigue, and rotation minutes:")
         c1, c2, c3 = st.columns(3)
         with c1:
             st.checkbox("1. Secure Volume & Usage", value=v1, disabled=True, help="Automatically verified via projected minutes and raw average volume.")
         with c2:
             st.checkbox("2. Clean Schedule Spot", value=v2, disabled=True, help="Automatically verified via team back-to-back status.")
         with c3:
-            st.checkbox("3. Sharp Line Movement", value=v3, disabled=True, help="Automatically verified via rotation stability metrics.")
-        st.caption("💡 *Note: High-volume players insulate you from single-game variance, while back-to-backs lean toward Unders due to tired legs.*")
+            st.checkbox("3. Rotation Minutes (≥ 24 proj)", value=v3, disabled=True, help="Verified via projected minutes of at least 24. This does not measure sportsbook line movement.")
+        st.caption("💡 *Note: High-volume players are less exposed to single-game variance. Back-to-back effects are estimated in the B2B Backtest tab.*")
 
 
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
@@ -1110,6 +1245,16 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     _metric(d[3], "OPP ADJ", f"x{res['opp_mult']:.3f}")
     _metric(d[4], "MODEL vs MARKET", f"{res['p_model']:.1f}% / {res['p_market']:.1f}%")
     _metric(d[5], "¼ KELLY", f"{res['kelly_pct']:.1f}% BR")
+    st.write("")
+    ts = res["this_season"]
+    e = st.columns(4)
+    pct = lambda k: f"{ts[k]}/{ts['n']} · {ts[k] / ts['n'] * 100:.0f}%" if ts["n"] else "—"
+    _metric(e[0], "THIS SEASON AVG / MEDIAN", f"{ts['avg']:.1f} / {ts['median']:.1f}" if ts["n"] else "—")
+    _metric(e[1], "THIS SEASON OVER HIT", pct("over"))
+    _metric(e[2], "THIS SEASON UNDER HIT", pct("under"))
+    _metric(e[3], "LAST-SEASON WEIGHT", f"{res['prior_share']['rate']:.0%} rate · {res['prior_share']['minutes']:.0%} min")
+    if ts["n"] and ts["push"]:
+        st.caption(f"{ts['push']} of {ts['n']} games this season landed exactly on the line (pushes).")
     if res["days_rest"] is not None:
         st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
     for w in res["warnings"]:
@@ -1243,7 +1388,7 @@ def render_backtest() -> None:
     )
     c1, c2, c3 = st.columns(3)
     n_per_team = c1.slider("Players per team (roster order)", 3, 12, 8)
-    seasons = c2.multiselect("Seasons (ESPN ending year)", [2026, 2025, 2024], default=[2026, 2025])
+    seasons = c2.multiselect("Seasons (ESPN ending year)", [2026, 2025, 2024], default=[2026, 2025, 2024])
     c3.write("")
     if c3.button("🔬 Run backtest", key="run_bt") and seasons:
         with st.spinner("Downloading rosters, logs and schedules from ESPN (first run takes a minute or two)…"):
@@ -1274,6 +1419,34 @@ def render_backtest() -> None:
             st.toast("Back to default assumptions")
     elif table is not None:
         st.warning("Not enough back-to-back games in the sample. Try more players per team or more seasons.")
+    st.markdown("---")
+    st.markdown("### ⚖️ Last-season weight calibration")
+    st.markdown(
+        "For the first 15 games of each season, finds the last-season weight (in pseudo-games) that predicts the next game best, "
+        "separately for each stat's per-minute rate and for minutes. Needs at least two completed seasons in the selection above "
+        "(e.g. 2025 and 2024)."
+    )
+    if st.button("⚖️ Calibrate last-season weight", key="run_pw") and seasons:
+        with st.spinner("Loading logs (cached after the first run) and scoring predictions…"):
+            try:
+                ss["pw_table"] = estimate_prior_weights(load_backtest_dataset(int(n_per_team), tuple(sorted(seasons))))
+            except Exception as e:
+                ss["pw_table"] = None
+                st.error(f"Calibration failed: {e}")
+    pw = ss.get("pw_table")
+    if pw is not None and not pw.empty:
+        st.dataframe(pw.round(4), use_container_width=True, hide_index=True)
+        st.caption("N0_BEST = best last-season weight on the grid; N0_RANGE = every weight within 1% of the best loss (a wide range means the "
+                   "choice barely matters). LOSS is squared error relative to last season's average; GAIN_VS_DEFAULT compares to your current setting.")
+        rate_rows, min_rows = pw[pw["TARGET"] == "per-minute rate"], pw[pw["TARGET"] == "minutes"]
+        if not rate_rows.empty and not min_rows.empty:
+            rate_pick, min_pick = int(round(float(rate_rows["N0_BEST"].median()))), int(round(float(min_rows["N0_BEST"].iloc[0])))
+            if st.button(f"✅ Apply: rate {rate_pick} / minutes {min_pick} pseudo-games", key="apply_pw"):
+                ss["pw_pending"] = (rate_pick, min_pick)
+                save_prior_file({"rate": rate_pick, "minutes": min_pick})
+                st.rerun()
+    elif pw is not None:
+        st.warning("Not enough player-seasons with a prior season. Select at least two completed seasons (e.g. 2025 and 2024) and more players per team.")
     active = ss.get("b2b_effects")
     st.markdown("**Active parameters**" + (" (backtested)" if active else " (default assumptions)"))
     own, opp = (active or {}).get("own", B2B_OWN_EFFECT), (active or {}).get("opp", B2B_OPP_BOOST)
@@ -1304,6 +1477,11 @@ def main() -> None:
         ss.setdefault(key, default)
     if "b2b_effects" not in ss:
         ss["b2b_effects"] = load_effects_file()
+    if "n0_rate" not in ss:
+        saved = load_prior_file() or {}
+        ss["n0_rate"], ss["n0_min"] = int(saved.get("rate", N_PRIOR_RATE)), int(saved.get("minutes", N_PRIOR_MIN))
+    if ss.get("pw_pending"):                       # applied from the backtest tab; must be set before the sliders exist
+        ss["n0_rate"], ss["n0_min"] = ss.pop("pw_pending")
     if "bet_log" not in ss:
         ss["bet_log"] = read_log_file()
 
@@ -1347,6 +1525,13 @@ def main() -> None:
                                       game_date=ss.get("board_date") or _today_et())
                             st.rerun()
 
+        with st.expander("⚙️ Model settings: how much weight does last season get?", expanded=False):
+            s1, s2 = st.columns(2)
+            s1.slider("Per-minute rate: last-season weight (pseudo-games)", 0, 40, key="n0_rate")
+            s2.slider("Minutes: last-season weight (pseudo-games)", 0, 40, key="n0_min")
+            st.caption("Weight w means last season counts like w extra games next to this season's n games, so its share is w / (n + w). "
+                       "0 = trust this season only. Rates are stable year to year (higher weight); minutes and roles change more (lower). "
+                       "Press Evaluate to apply. Use the B2B Backtest tab to estimate these from data.")
         opp_opts = _opp_options(ss["board_teams"])
         with st.form("nba_form"):
             c1, c2, c3 = st.columns([2, 1, 1])
@@ -1363,7 +1548,8 @@ def main() -> None:
         if submitted:
             ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent, game_date=game_day)
             res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds,
-                                    None if opponent == "None" else opponent, game_day, ss.get("b2b_effects"))
+                                    None if opponent == "None" else opponent, game_day, ss.get("b2b_effects"),
+                                    (float(ss["n0_rate"]), float(ss["n0_min"])))
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
             else:
@@ -1379,7 +1565,7 @@ def main() -> None:
         with st.expander("ℹ️ How the model works"):
             st.markdown(
                 "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
-                "(last 10, EWMA decay 0.8) are blended with last season's rates using ~8 pseudo-games of prior weight.\n"
+                "(last 10, EWMA decay 0.8) are blended with last season's rates; the last-season weights (per-minute rate and minutes) are set in Model settings.\n"
                 "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
                 "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
                 "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
