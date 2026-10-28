@@ -73,33 +73,28 @@ ODDS_API_MARKETS: Dict[str, str] = {
     "Steals": "player_steals", "Blocks": "player_blocks",
 }
 CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
-# stat -> (weight k, which opponent factor): "def" = points allowed vs league, "pace" = total points vs league
 STAT_OPP: Dict[str, Tuple[float, str]] = {
     "POINTS": (0.5, "def"), "PTS + REB + AST": (0.3, "def"), "REBOUNDS": (0.3, "pace"),
     "ASSISTS": (0.3, "pace"), "3-POINTERS MADE": (0.3, "pace"), "STEALS": (0.3, "pace"), "BLOCKS": (0.3, "pace"),
 }
 
-CURRENT_SEASON_START = "2026-10-01"   # logs dated on/after this are "current season"
-PRIOR_ESPN_SEASON = 2026              # ESPN season param = ending year (2025-26)
+CURRENT_SEASON_START = "2026-10-01"
+PRIOR_ESPN_SEASON = 2026
 CURRENT_NBA_SEASON, PRIOR_NBA_SEASON = "2026-27", "2025-26"
-# Assumed lift to the PLAYER's projection when the opponent is on the 2nd night of a back-to-back.
-# League-wide effects are small and noisy: these are tunable assumptions, not fitted values.
 B2B_OPP_BOOST: Dict[str, float] = {
     "POINTS": 0.015, "PTS + REB + AST": 0.010, "REBOUNDS": 0.005, "ASSISTS": 0.005,
     "3-POINTERS MADE": 0.005, "STEALS": 0.0, "BLOCKS": 0.0,
 }
-# Assumed effect on the PLAYER's own stat on the second night of his own back-to-back (negative = fatigue).
-# Defaults until you run the Backtest tab and apply calibrated values.
 B2B_OWN_EFFECT: Dict[str, float] = {
     "POINTS": -0.02, "PTS + REB + AST": -0.015, "REBOUNDS": -0.01, "ASSISTS": -0.01,
     "3-POINTERS MADE": -0.015, "STEALS": 0.0, "BLOCKS": 0.0,
 }
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
-BT_TAU = 0.02                      # prior sd (2%) for shrinking backtested effects toward zero
+BT_TAU = 0.02
 EFFECTS_PATH = "b2b_effects.json"
-N_PRIOR = 8.0          # pseudo-games of weight given to last season's rates
-WINDOW = 10            # recent games used for the current-season estimate
-DECAY = 0.8            # EWMA decay per game of age
+N_PRIOR = 8.0
+WINDOW = 10
+DECAY = 0.8
 N_SIMS = 50_000
 DEFAULT_CV = 0.35
 KELLY_FRACTION, KELLY_CAP = 0.25, 0.05
@@ -389,7 +384,7 @@ def fetch_player_logs(player_name: str) -> Tuple[pd.DataFrame, Optional[str]]:
 
 
 # --------------------------------------------------------------------------------------
-# Opponent environment (points allowed + scoring pace, from ESPN team schedules)
+# Opponent environment
 # --------------------------------------------------------------------------------------
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_team_meta() -> List[Tuple[str, str]]:
@@ -493,7 +488,7 @@ def opp_multiplier(team: str, stat_col: str, scoring: pd.DataFrame) -> Tuple[flo
 
 
 # --------------------------------------------------------------------------------------
-# Back-to-back: own-team detection + historical backtest (calibrates both effects)
+# Back-to-back: own-team detection + historical backtest
 # --------------------------------------------------------------------------------------
 TEAM_ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{tid}/roster"
 
@@ -542,10 +537,7 @@ def _schedule_dates(tid: str, season: int) -> List[date]:
 
 
 def build_backtest_frame(player_logs: Dict[Tuple[str, int], pd.DataFrame], sched: pd.DataFrame) -> pd.DataFrame:
-    """
-    Per-game frame with OWN_B2B / OPP_B2B / HOME flags and R_<stat> = stat / player-season mean.
-    Keeps rotation players only (avg MIN >= 20, >= 40 games in a season). `sched` has ABBR, DATE (ISO strings).
-    """
+    """Per-game frame with OWN_B2B / OPP_B2B / HOME flags and R_<stat> = stat / player-season mean."""
     frames = [df.assign(PID=pid, SEASON=season) for (pid, season), df in player_logs.items()
               if df is not None and not df.empty and (df["MINUTES"] > 0).any()]
     if not frames:
@@ -580,11 +572,7 @@ def _ols_cluster(X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> Tuple[np.n
 
 
 def estimate_b2b_effects(frame: pd.DataFrame, tau: float = BT_TAU) -> pd.DataFrame:
-    """
-    Within-player effects (as % of the player's own season average):
-        R_stat = a + b_own*OWN_B2B + b_opp*OPP_B2B + b_home*HOME + e,  clustered by player.
-    SHRUNK = b * tau^2 / (tau^2 + se^2): empirical-Bayes pull toward 0 with prior sd tau (default 2%).
-    """
+    """Within-player effects with empirical-Bayes shrink toward 0."""
     rows: List[Dict[str, Any]] = []
     for c in BT_STATS:
         sub = frame[["PID", "OWN_B2B", "OPP_B2B", "HOME", f"R_{c}"]].dropna()
@@ -602,13 +590,13 @@ def estimate_b2b_effects(frame: pd.DataFrame, tau: float = BT_TAU) -> pd.DataFra
 
 
 def effects_from_table(table: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    """Shrunk effects (fractions) per projectable stat, ready to pass to evaluate_nba_prop."""
+    """Shrunk effects per projectable stat."""
     t = table[table["STAT"].isin(B2B_OPP_BOOST.keys())].set_index("STAT")
     return {"own": (t["OWN_SHRUNK_%"] / 100.0).to_dict(), "opp": (t["OPP_SHRUNK_%"] / 100.0).to_dict()}
 
 
 def load_effects_file() -> Optional[Dict[str, Dict[str, float]]]:
-    """Saved backtested effects (best effort; ephemeral on Streamlit Cloud)."""
+    """Saved backtested effects."""
     try:
         if os.path.exists(EFFECTS_PATH):
             with open(EFFECTS_PATH) as fh:
@@ -619,7 +607,7 @@ def load_effects_file() -> Optional[Dict[str, Dict[str, float]]]:
 
 
 def save_effects_file(effects: Optional[Dict[str, Dict[str, float]]]) -> None:
-    """Persist (or clear) the backtested effects."""
+    """Persist backtested effects."""
     try:
         if effects is None:
             if os.path.exists(EFFECTS_PATH):
@@ -633,7 +621,7 @@ def save_effects_file(effects: Optional[Dict[str, Dict[str, float]]]) -> None:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataFrame:
-    """Download rosters, game logs and team schedules from ESPN and build the backtest frame (cached 24h)."""
+    """Download rosters, game logs and schedules from ESPN and build the backtest frame."""
     meta = load_team_abbr_meta()
 
     def safe(fn: Any, *args: Any) -> Any:
@@ -674,7 +662,7 @@ class Projection:
 
 
 def ewma_weights(n: int, decay: float = DECAY) -> np.ndarray:
-    """Normalized weights for n games ordered oldest -> newest (newest heaviest)."""
+    """Normalized weights for n games ordered oldest -> newest."""
     w = decay ** np.arange(n)[::-1]
     return w / w.sum()
 
@@ -687,11 +675,7 @@ def _cv(x: np.ndarray) -> Optional[float]:
 
 
 def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, opp_mult: float = 1.0) -> Projection:
-    """
-    mu = shrunk(rate/min) * shrunk(minutes) * opp_mult, where
-    shrunk(v) = (n*v_cur + n0*v_prior)/(n + n0), v_cur = EWMA over last WINDOW games.
-    sigma = pooled CV * mu, inflated by (1 + 1/(n+n0)) for parameter uncertainty.
-    """
+    """Posterior expectation and standard deviation for the matchup."""
     n = len(cur_x)
     n0 = N_PRIOR if len(pri_x) > 0 else 0.0
     if n == 0 and n0 == 0:
@@ -710,13 +694,13 @@ def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pr
     mu = max(rate * minutes * opp_mult, 0.05)
     cvs = [(w, c) for w, c in ((float(n), _cv(cur_x)), (n0, _cv(pri_x[-40:]))) if c is not None and w > 0]
     cv = sum(w * c for w, c in cvs) / sum(w for w, _ in cvs) if cvs else DEFAULT_CV
-    cv = max(cv, 0.15)  # floor: prop stats are never this stable; avoids overconfidence on tiny/flat samples
+    cv = max(cv, 0.15)
     sigma = max(0.5, cv * mu) * float(np.sqrt(1.0 + 1.0 / (n + n0)))
     return Projection(mu=mu, sigma=sigma, minutes=minutes, n_current=n, n_prior=len(pri_x), opp_mult=opp_mult)
 
 
 def simulate(mu: float, sigma: float, count_stat: bool, n_sims: int = N_SIMS, seed: int = 42) -> np.ndarray:
-    """Vectorized draws: Normal (rounded, >=0) for points/PRA; NegBin (Poisson if under-dispersed) for counts."""
+    """Vectorized draws."""
     rng = np.random.default_rng(seed)
     var = sigma ** 2
     if count_stat:
@@ -727,7 +711,7 @@ def simulate(mu: float, sigma: float, count_stat: bool, n_sims: int = N_SIMS, se
 
 
 def implied_prob(odds: float) -> float:
-    """American odds -> implied probability (with vig)."""
+    """American odds -> implied probability."""
     o = float(odds)
     return -o / (-o + 100.0) if o < 0 else 100.0 / (o + 100.0)
 
@@ -745,13 +729,13 @@ def devig(over_odds: float, under_odds: float) -> Tuple[float, float]:
 
 
 def prob_to_american(p: float) -> int:
-    """Probability -> American odds (clipped to [1%, 99%])."""
+    """Probability -> American odds."""
     p = float(np.clip(p, 0.01, 0.99))
     return int(round(-100.0 * p / (1.0 - p))) if p >= 0.5 else int(round(100.0 * (1.0 - p) / p))
 
 
 def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
-    """Fractional Kelly stake (share of bankroll), capped; 0 when EV <= 0."""
+    """Fractional Kelly stake."""
     b = payout(odds)
     full = (b * p_win - p_lose) / b
     return float(np.clip(full * KELLY_FRACTION, 0.0, KELLY_CAP))
@@ -760,7 +744,7 @@ def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
 def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
                       opponent: Optional[str] = None, game_date: Optional[date] = None,
                       b2b_effects: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, Any]:
-    """Full evaluation: projection -> simulation -> devigged edge, EV, Kelly, hit rates."""
+    """Full evaluation pipeline."""
     try:
         for o in (over_odds, under_odds):
             if abs(float(o)) < 100:
@@ -855,7 +839,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
 
 
 # --------------------------------------------------------------------------------------
-# Bet log + closing line value
+# Bet log & CLV
 # --------------------------------------------------------------------------------------
 LOG_PATH = "bet_log.csv"
 LOG_COLS: List[str] = [
@@ -872,7 +856,7 @@ RESULT_OPTIONS: List[str] = ["Pending", "Win", "Loss", "Push"]
 
 
 def _today_et() -> date:
-    """Today's date in US Eastern time (falls back to UTC)."""
+    """Today's date in US Eastern time."""
     try:
         return datetime.now(ZoneInfo("America/New_York")).date()
     except Exception:
@@ -880,18 +864,13 @@ def _today_et() -> date:
 
 
 def _implied_vec(odds: np.ndarray) -> np.ndarray:
-    """Vectorized American odds -> implied probability (NaN-safe)."""
+    """Vectorized American odds -> implied probability."""
     o = np.asarray(odds, dtype=float)
     return np.where(o < 0, -o / (-o + 100.0), 100.0 / (o + 100.0))
 
 
 def recompute_derived(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Derived columns.
-    LINE_MOVE = (close_line - bet_line) * (+1 Over / -1 Under): positive = line moved your way.
-    CLV_PP    = devigged closing prob of your side - devigged prob at bet time (same line only).
-    PROFIT    = stake * payout (Win), -stake (Loss), 0 (Push), NaN (Pending).
-    """
+    """Derived columns."""
     df = df.copy()
     is_over = df["SIDE"].eq("Over").to_numpy()
     df["LINE_MOVE"] = (df["CLOSE_LINE"] - df["LINE"]) * np.where(is_over, 1.0, -1.0)
@@ -909,7 +888,7 @@ def recompute_derived(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_log(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce any frame (CSV import, editor output) into the canonical log schema."""
+    """Normalize log schema."""
     df = df.copy()
     for c in LOG_COLS:
         if c not in df.columns:
@@ -928,7 +907,7 @@ def normalize_log(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def read_log_file() -> pd.DataFrame:
-    """Load the on-disk log if present (best effort; ephemeral on Streamlit Cloud)."""
+    """Load the on-disk log."""
     try:
         if os.path.exists(LOG_PATH):
             return normalize_log(pd.read_csv(LOG_PATH, dtype=str))
@@ -938,7 +917,7 @@ def read_log_file() -> pd.DataFrame:
 
 
 def save_log_file(df: pd.DataFrame) -> None:
-    """Persist the log to disk (best effort)."""
+    """Persist the log to disk."""
     try:
         df.to_csv(LOG_PATH, index=False)
     except Exception:
@@ -946,7 +925,7 @@ def save_log_file(df: pd.DataFrame) -> None:
 
 
 def make_bet_row(res: Dict[str, Any], ctx: Dict[str, Any], side: str, stake: float, game_date: date) -> Dict[str, Any]:
-    """One log row from an evaluation result, for the chosen side."""
+    """Create a bet log row."""
     s = res["sides"][side]
     return {
         "ID": uuid.uuid4().hex[:8], "TS": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
@@ -959,7 +938,7 @@ def make_bet_row(res: Dict[str, Any], ctx: Dict[str, Any], side: str, stake: flo
 
 
 def add_bet(log: pd.DataFrame, row: Dict[str, Any]) -> Tuple[pd.DataFrame, bool]:
-    """Append a bet unless the same player/stat/side/line/date is already logged."""
+    """Append a bet."""
     dup = ((log["PLAYER"] == row["PLAYER"]) & (log["STAT"] == row["STAT"]) & (log["SIDE"] == row["SIDE"])
            & (log["LINE"] == row["LINE"]) & (log["GAME_DATE"] == row["GAME_DATE"])).any()
     if dup:
@@ -968,7 +947,7 @@ def add_bet(log: pd.DataFrame, row: Dict[str, Any]) -> Tuple[pd.DataFrame, bool]
 
 
 def apply_board_as_closing(log: pd.DataFrame, board_summary: pd.DataFrame, stat_label: str) -> Tuple[pd.DataFrame, int]:
-    """Fill closing line/odds on pending bets from a freshly fetched board (same stat market)."""
+    """Capture closing lines."""
     if board_summary.empty:
         return log, 0
     summ = board_summary.set_index("Player")
@@ -982,7 +961,7 @@ def apply_board_as_closing(log: pd.DataFrame, board_summary: pd.DataFrame, stat_
 
 
 def auto_grade(log: pd.DataFrame) -> Tuple[pd.DataFrame, int, List[str]]:
-    """Grade pending bets whose game date has passed using ESPN logs (UTC date match, +1 day tolerance)."""
+    """Auto-grade pending bets."""
     log = log.copy()
     notes: List[str] = []
     graded = 0
@@ -1001,7 +980,7 @@ def auto_grade(log: pd.DataFrame) -> Tuple[pd.DataFrame, int, List[str]]:
             if hit.empty:
                 hit = logs[logs["DATE"] == nd]
             if hit.empty:
-                continue  # not played / not in logs yet (or DNP: void it manually by deleting the row)
+                continue
             actual = float(hit.iloc[0][col])
             line = float(row["LINE"])
             if actual == line:
@@ -1018,7 +997,7 @@ def auto_grade(log: pd.DataFrame) -> Tuple[pd.DataFrame, int, List[str]]:
 
 
 def summarize_log(log: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFrame, pd.DataFrame]:
-    """Headline stats, per-stat table, and model-calibration table."""
+    """Summarize bet log performance."""
     wl = log[log["RESULT"].isin(["Win", "Loss"])]
     won = wl["RESULT"].eq("Win").to_numpy(float)
     staked = float(wl["STAKE"].sum())
@@ -1051,10 +1030,10 @@ def summarize_log(log: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFrame, pd
 
 
 # --------------------------------------------------------------------------------------
-# UI
+# UI Components
 # --------------------------------------------------------------------------------------
 def _metric(col: Any, label: str, value: str, tone: str = "neutral") -> None:
-    """Render one metric card; tone in {'neutral','good','bad'}."""
+    """Render a metric card."""
     color = {"neutral": "#0369a1", "good": "#15803d", "bad": "#b91c1c"}[tone]
     col.markdown(
         f'<div class="metric-box"><div class="metric-label">{label}</div>'
@@ -1064,17 +1043,14 @@ def _metric(col: Any, label: str, value: str, tone: str = "neutral") -> None:
 
 
 def _fmt(x: float, spec: str = ".1f", suffix: str = "") -> str:
-    """Format a number, or an em dash for NaN."""
     return "—" if x is None or not np.isfinite(x) else f"{x:{spec}}{suffix}"
 
 
 def _tone(x: float) -> str:
-    """Metric tone from sign (NaN -> neutral)."""
     return "neutral" if x is None or not np.isfinite(x) else ("good" if x > 0 else "bad")
 
 
 def _opp_options(game_teams: List[str]) -> List[str]:
-    """Opponent dropdown: None, the selected game's two teams first, then everyone else."""
     try:
         names = [n for _, n in load_team_meta()]
     except Exception:
@@ -1083,8 +1059,22 @@ def _opp_options(game_teams: List[str]) -> List[str]:
     return ["None"] + gt + sorted(n for n in names if n not in gt)
 
 
+def render_contextual_reality_check() -> None:
+    """Render Step 3: Contextual Reality Check pre-flight checklist."""
+    with st.expander("🔍 Step 3: Contextual Reality Check (Pre-Flight Filter)", expanded=False):
+        st.markdown("Before locking in your bet, pass the model output through these real-world filters:")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.checkbox("1. Secure Volume & Usage", value=True, help="Does the player command high snap/touch/shot volume?")
+        with col2:
+            st.checkbox("2. Clean Schedule Spot", value=True, help="No unmanaged fatigue, rest disadvantages, or blowout risk.")
+        with col3:
+            st.checkbox("3. Sharp Line Movement", value=True, help="Line movement supports the side or aligns with sharp money.")
+        st.caption("💡 *Note: High-volume players insulate you from single-game variance, while back-to-backs lean toward Unders due to tired legs.*")
+
+
 def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
-    """'Log this bet' controls under the results."""
+    """Log form under results."""
     ss = st.session_state
     if ss.get("_log_uid") != res["uid"]:
         ss["log_side"] = "Over" if res["best_side"].startswith("Over") else "Under"
@@ -1104,11 +1094,11 @@ def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
             ss["editor_ver"] += 1
             st.toast(f"Logged {side} {ctx['line']:g} — {ctx['player']}")
         else:
-            st.warning("That exact bet (player, stat, side, line, date) is already in your log.")
+            st.warning("That exact bet is already in your log.")
 
 
 def render_b2b_alert(res: Dict[str, Any]) -> None:
-    """Prominent back-to-back banner for the opponent."""
+    """Back-to-back alert banner."""
     own = res.get("own_b2b") or {}
     if own.get("status") == "second":
         src = "backtested" if own.get("calibrated") else "default assumption: calibrate in the Backtest tab"
@@ -1127,7 +1117,7 @@ def render_b2b_alert(res: Dict[str, Any]) -> None:
 
 
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
-    """Metric cards, notes, chart, and the log form."""
+    """Metric cards, contextual checklist, game-log chart, and log form."""
     stat_category, line_val = ctx["stat"], ctx["line"]
     st.markdown(f"## {res['player_name']} | {stat_category}")
     render_b2b_alert(res)
@@ -1150,6 +1140,11 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
         st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
     for w in res["warnings"]:
         st.caption(f"⚠️ {w}")
+    st.markdown("---")
+    
+    # Contextual Reality Check Pre-Flight Checklist Added Here
+    render_contextual_reality_check()
+    
     st.markdown("---")
     render_log_form(res, ctx)
     st.markdown("---")
@@ -1178,9 +1173,9 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
 
 
 def render_bet_log() -> None:
-    """Bet Log tab: editable table, auto-grading, closing-line capture, performance + CLV summary."""
+    """Bet Log tab."""
     ss = st.session_state
-    st.caption("On Streamlit Cloud the server disk resets on reboot/redeploy — download your CSV regularly and re-import it here.")
+    st.caption("On Streamlit Cloud the server disk resets on reboot/redeploy — download your CSV regularly.")
     a, b, c = st.columns(3)
     if a.button("🏁 Auto-grade finished games", key="grade_btn"):
         ss["bet_log"], n, notes = auto_grade(ss["bet_log"])
@@ -1192,12 +1187,12 @@ def render_bet_log() -> None:
     board = ss.get("board_df")
     if b.button("📸 Use current board as closing lines", key="close_btn"):
         if board is None or board.empty or not ss.get("board_stat"):
-            st.warning("Fetch a prop board first (Evaluate tab, Step 3) — ideally right before tip-off.")
+            st.warning("Fetch a prop board first (Evaluate tab, Step 3).")
         else:
             ss["bet_log"], n = apply_board_as_closing(ss["bet_log"], summarize_board(board), ss["board_stat"])
             save_log_file(ss["bet_log"])
             ss["editor_ver"] += 1
-            st.toast(f"Closing lines applied to {n} pending bet(s) ({ss['board_stat']} market)")
+            st.toast(f"Closing lines applied to {n} pending bet(s)")
             st.rerun()
     c.download_button("⬇️ Download log (CSV)", data=ss["bet_log"].to_csv(index=False).encode("utf-8"),
                       file_name="bet_log.csv", mime="text/csv", key="dl_log")
@@ -1252,8 +1247,7 @@ def render_bet_log() -> None:
     _metric(m[5], "+CLV RATE", _fmt(stats["pos_clv"], ".0f", "%"))
     st.caption(
         f"CLV is measured on {int(stats['n_clv'])} bet(s) with closing odds at the same line. "
-        f"Brier (lower is better): model {_fmt(stats['brier_model'], '.4f')} vs market {_fmt(stats['brier_market'], '.4f')}. "
-        "Treat everything as noise until you have 50+ graded bets; CLV converges much faster than win/loss."
+        f"Brier: model {_fmt(stats['brier_model'], '.4f')} vs market {_fmt(stats['brier_market'], '.4f')}."
     )
     graded = ss["bet_log"][ss["bet_log"]["RESULT"].isin(["Win", "Loss", "Push"])].sort_values("TS")
     if len(graded) >= 2:
@@ -1270,19 +1264,18 @@ def render_bet_log() -> None:
 
 
 def render_backtest() -> None:
-    """Backtest tab: estimate own/opponent back-to-back effects from historical ESPN logs and apply them."""
+    """Backtest tab."""
     ss = st.session_state
     st.markdown(
         "Estimates how much a player's stat changes when **he** is on the second night of a back-to-back and when "
-        "**the opponent** is, using within-player regressions (each game as a % of that player's own season average, "
-        "controlling for home/away, standard errors clustered by player). Results are shrunk toward 0 before use."
+        "**the opponent** is, using within-player regressions."
     )
     c1, c2, c3 = st.columns(3)
     n_per_team = c1.slider("Players per team (roster order)", 3, 12, 8)
     seasons = c2.multiselect("Seasons (ESPN ending year)", [2026, 2025, 2024], default=[2026, 2025])
     c3.write("")
     if c3.button("🔬 Run backtest", key="run_bt") and seasons:
-        with st.spinner("Downloading rosters, logs and schedules from ESPN (first run takes a minute or two)…"):
+        with st.spinner("Downloading rosters, logs and schedules from ESPN…"):
             try:
                 frame = load_backtest_dataset(int(n_per_team), tuple(sorted(seasons)))
                 ss["bt_table"] = estimate_b2b_effects(frame)
@@ -1297,8 +1290,6 @@ def render_backtest() -> None:
         st.caption(f"{meta['games']:,} player-games · {meta['players']} players · {meta['own']:,} own-B2B games · {meta['opp']:,} opponent-B2B games")
         show = table.round(2)
         st.dataframe(show, use_container_width=True, hide_index=True)
-        st.caption("Effects are % of the player's own average (negative OWN = fatigue; positive OPP = tired opponent helps). "
-                   "|effect| < 2 × SE is not distinguishable from zero. SHRUNK columns are what the model uses.")
         a, b = st.columns(2)
         if a.button("✅ Apply to model", key="apply_bt"):
             ss["b2b_effects"] = effects_from_table(table)
@@ -1309,7 +1300,7 @@ def render_backtest() -> None:
             save_effects_file(None)
             st.toast("Back to default assumptions")
     elif table is not None:
-        st.warning("Not enough back-to-back games in the sample. Try more players per team or more seasons.")
+        st.warning("Not enough back-to-back games in the sample.")
     active = ss.get("b2b_effects")
     st.markdown("**Active parameters**" + (" (backtested)" if active else " (default assumptions)"))
     own, opp = (active or {}).get("own", B2B_OWN_EFFECT), (active or {}).get("opp", B2B_OPP_BOOST)
@@ -1317,10 +1308,6 @@ def render_backtest() -> None:
                                "OWN_B2B_%": [own.get(k, 0.0) * 100 for k in B2B_OPP_BOOST],
                                "OPP_B2B_%": [opp.get(k, 0.0) * 100 for k in B2B_OPP_BOOST]}).round(2),
                  use_container_width=True, hide_index=True)
-    if active:
-        st.caption("To make these permanent, paste into the constants at the top of the file:")
-        st.code(f"B2B_OWN_EFFECT = {json.dumps({k: round(v, 4) for k, v in active['own'].items()})}\n"
-                f"B2B_OPP_BOOST = {json.dumps({k: round(v, 4) for k, v in active['opp'].items()})}", language="python")
 
 
 def main() -> None:
@@ -1415,15 +1402,10 @@ def main() -> None:
 
         with st.expander("ℹ️ How the model works"):
             st.markdown(
-                "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
-                "(last 10, EWMA decay 0.8) are blended with last season's rates using ~8 pseudo-games of prior weight.\n"
-                "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
-                "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
-                "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
-                "- **Opponent**: points-allowed (points, PRA) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
-                "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
-                "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
-                "If the line moved, LINE MOVE shows how far (positive = in your favor)."
+                "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier.\n"
+                "- **Spread** = pooled coefficient of variation × projection.\n"
+                "- **Distribution**: Normal for points/PRA; Negative Binomial for counts. 50,000 simulated draws.\n"
+                "- **Kelly**: ¼ Kelly capped at 5% of bankroll."
             )
     with tab_log:
         render_bet_log()
