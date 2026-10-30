@@ -62,23 +62,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made", "Pts + Reb + Ast", "Pts + Ast", "Pts + Reb", "Reb + Ast", "Steals", "Blocks"]
+STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made", "Pts + Reb + Ast", "Steals", "Blocks"]
 STAT_COL: Dict[str, str] = {
     "Points": "POINTS", "Rebounds": "REBOUNDS", "Assists": "ASSISTS", "3-Pointers Made": "3-POINTERS MADE",
     "Pts + Reb + Ast": "PTS + REB + AST", "Steals": "STEALS", "Blocks": "BLOCKS",
-    "Pts + Ast": "PTS + AST", "Pts + Reb": "PTS + REB", "Reb + Ast": "REB + AST",
 }
 ODDS_API_MARKETS: Dict[str, str] = {
     "Points": "player_points", "Rebounds": "player_rebounds", "Assists": "player_assists",
     "3-Pointers Made": "player_threes", "Pts + Reb + Ast": "player_points_rebounds_assists",
     "Steals": "player_steals", "Blocks": "player_blocks",
-    "Pts + Ast": "player_points_assists", "Pts + Reb": "player_points_rebounds", "Reb + Ast": "player_rebounds_assists",
 }
-CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST", "PTS + AST", "PTS + REB", "REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
+CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
 STAT_OPP: Dict[str, Tuple[float, str]] = {
     "POINTS": (0.5, "def"), "PTS + REB + AST": (0.3, "def"), "REBOUNDS": (0.3, "pace"),
     "ASSISTS": (0.3, "pace"), "3-POINTERS MADE": (0.3, "pace"), "STEALS": (0.3, "pace"), "BLOCKS": (0.3, "pace"),
-    "PTS + AST": (0.4, "def"), "PTS + REB": (0.4, "def"), "REB + AST": (0.3, "pace"),
 }
 
 CURRENT_SEASON_START = "2026-10-01"
@@ -88,12 +85,10 @@ CURRENT_NBA_SEASON, PRIOR_NBA_SEASON = "2026-27", "2025-26"
 B2B_OPP_BOOST: Dict[str, float] = {
     "POINTS": 0.015, "PTS + REB + AST": 0.010, "REBOUNDS": 0.005, "ASSISTS": 0.005,
     "3-POINTERS MADE": 0.005, "STEALS": 0.0, "BLOCKS": 0.0,
-    "PTS + AST": 0.012, "PTS + REB": 0.012, "REB + AST": 0.005,
 }
 B2B_OWN_EFFECT: Dict[str, float] = {
     "POINTS": -0.02, "PTS + REB + AST": -0.015, "REBOUNDS": -0.01, "ASSISTS": -0.01,
     "3-POINTERS MADE": -0.015, "STEALS": 0.0, "BLOCKS": 0.0,
-    "PTS + AST": -0.018, "PTS + REB": -0.018, "REB + AST": -0.01,
 }
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
 BT_TAU = 0.02
@@ -223,54 +218,6 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-MARKET_LABEL: Dict[str, str] = {v: k for k, v in ODDS_API_MARKETS.items()}
-
-
-def fetch_nba_all_boards(event_id: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    """One request for every market (the API bills one credit per market). Long frame: Market, Player, Line, Price, Outcome."""
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
-    params = {"apiKey": api_key, "regions": "us", "markets": ",".join(ODDS_API_MARKETS.values()),
-              "bookmakers": "draftkings", "oddsFormat": "american"}
-    try:
-        resp = requests.get(url, params=params, timeout=12)
-        if resp.status_code != 200:
-            return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
-        bookmakers = resp.json().get("bookmakers", [])
-        if not bookmakers:
-            return pd.DataFrame(), "No DraftKings odds found for this event."
-        rows: List[Dict[str, Any]] = []
-        for mk in bookmakers[0].get("markets", []):
-            label = MARKET_LABEL.get(mk.get("key", ""))
-            if label is None:
-                continue
-            for o in mk.get("outcomes", []):
-                try:
-                    price = int(round(float(o.get("price", -110))))
-                except Exception:
-                    price = -110
-                rows.append({"Market": label, "Player": o.get("description"), "Line": o.get("point", 0.5),
-                             "Price": price, "Outcome": o.get("name")})
-        if not rows:
-            return pd.DataFrame(), "No market data available."
-        return pd.DataFrame(rows), None
-    except Exception as e:
-        return pd.DataFrame(), f"Error fetching prop board: {e}"
-
-
-def player_lines(all_df: pd.DataFrame, player: str) -> pd.DataFrame:
-    """Every market DraftKings offers for one player: Market, Line, Over, Under (in STATS order)."""
-    cols = ["Market", "Line", "Over", "Under"]
-    sub = all_df[all_df["Player"] == player]
-    rows: List[Dict[str, Any]] = []
-    for label in STATS:
-        grp = sub[sub["Market"] == label]
-        if grp.empty:
-            continue
-        r = summarize_board(grp).iloc[0]
-        rows.append({"Market": label, "Line": float(r["Line"]), "Over": int(r["Over"]), "Under": int(r["Under"])})
-    return pd.DataFrame(rows, columns=cols)
-
-
 # --------------------------------------------------------------------------------------
 # Game logs: ESPN first, nba_api fallback
 # --------------------------------------------------------------------------------------
@@ -359,7 +306,6 @@ def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
                     rows.append({
                         "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
                         "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "PTS + REB + AST": pts + reb + ast,
-                        "PTS + AST": pts + ast, "PTS + REB": pts + reb, "REB + AST": reb + ast,
                         "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
                         "MINUTES": parse_val(rec.get("MIN")),
                         "OPPONENT": f"{sep} {opp}",
@@ -385,7 +331,6 @@ def _nba_api_fetch_logs(raw_input: str, season: str) -> pd.DataFrame:
     return pd.DataFrame({
         "POINTS": num("PTS"), "REBOUNDS": num("REB"), "ASSISTS": num("AST"), "3-POINTERS MADE": num("FG3M"),
         "PTS + REB + AST": num("PTS") + num("REB") + num("AST"), "STEALS": num("STL"), "BLOCKS": num("BLK"),
-        "PTS + AST": num("PTS") + num("AST"), "PTS + REB": num("PTS") + num("REB"), "REB + AST": num("REB") + num("AST"),
         "MINUTES": num("MIN"), "OPPONENT": df["MATCHUP"].astype(str),
         "DATE": pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.strftime("%Y-%m-%d"),
     })
@@ -1354,18 +1299,15 @@ def render_bet_log() -> None:
         ss["grade_notes"] = notes[:5]
         st.toast(f"Graded {n} bet(s)")
         st.rerun()
-    board = ss.get("board_all")
+    board = ss.get("board_df")
     if b.button("📸 Use current board as closing lines", key="close_btn"):
-        if board is None or board.empty:
+        if board is None or board.empty or not ss.get("board_stat"):
             st.warning("Fetch a prop board first (Evaluate tab, Step 3) — ideally right before tip-off.")
         else:
-            n = 0
-            for label, grp in board.groupby("Market"):
-                ss["bet_log"], k = apply_board_as_closing(ss["bet_log"], summarize_board(grp), str(label))
-                n += k
+            ss["bet_log"], n = apply_board_as_closing(ss["bet_log"], summarize_board(board), ss["board_stat"])
             save_log_file(ss["bet_log"])
             ss["editor_ver"] += 1
-            st.toast(f"Closing lines applied to {n} pending bet(s)")
+            st.toast(f"Closing lines applied to {n} pending bet(s) ({ss['board_stat']} market)")
             st.rerun()
     c.download_button("⬇️ Download log (CSV)", data=ss["bet_log"].to_csv(index=False).encode("utf-8"),
                       file_name="bet_log.csv", mime="text/csv", key="dl_log")
@@ -1549,6 +1491,8 @@ def main() -> None:
             if not api_key:
                 st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
             else:
+                selected_stat_label = st.selectbox("Select Prop Market", list(ODDS_API_MARKETS.keys()), key="live_stat_market")
+                market_key = ODDS_API_MARKETS[selected_stat_label]
                 if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
                     events_df, err = list_nba_events(api_key)
                     if err:
@@ -1558,37 +1502,28 @@ def main() -> None:
                 events_df = ss.get("events_df")
                 if events_df is not None and not events_df.empty:
                     game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
-                    if st.button(f"Step 3: Fetch ALL Player Props for This Game ({len(ODDS_API_MARKETS)} API credits)", key="fetch_board_odds"):
-                        board_all, err = fetch_nba_all_boards(str(events_df.loc[game_idx, "id"]), api_key)
+                    if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
+                        board_df, err = fetch_nba_prop_board(str(events_df.loc[game_idx, "id"]), market_key, api_key)
                         if err:
                             st.error(err)
                         else:
-                            ss["board_all"] = board_all
+                            ss["board_df"] = board_df
+                            ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
                             ss["board_date"] = _iso_to_date(events_df.loc[game_idx].get("game_date", ""))
-                board_all = ss.get("board_all")
-                if board_all is not None and not board_all.empty:
-                    players = sorted(board_all["Player"].dropna().unique().tolist())
-                    player_pick = st.selectbox("Step 4: Choose Player to Evaluate", players, key="pick_player_dropdown")
-                    lines = player_lines(board_all, player_pick)
-                    st.markdown(f"**{player_pick}: all DraftKings lines**")
-                    head = st.columns([2, 1, 1, 1, 2])
-                    for col, title in zip(head, ["Market", "Line", "Over", "Under", ""]):
-                        col.markdown(f"**{title}**")
-                    for _, r in lines.iterrows():
-                        row_cols = st.columns([2, 1, 1, 1, 2])
-                        row_cols[0].write(r["Market"])
-                        row_cols[1].write(f"{r['Line']:g}")
-                        row_cols[2].write(f"{int(r['Over']):+d}")
-                        row_cols[3].write(f"{int(r['Under']):+d}")
-                        if row_cols[4].button("⚡ Populate", key=f"populate_{player_pick}_{r['Market']}"):
-                            ss.update(player=player_pick, stat=r["Market"], line=float(r["Line"]), over=int(r["Over"]),
-                                      under=int(r["Under"]), opp="None", game_date=ss.get("board_date") or _today_et())
+                board_df = ss.get("board_df")
+                if board_df is not None and not board_df.empty:
+                    summary = summarize_board(board_df)
+                    st.dataframe(summary, use_container_width=True)
+                    player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
+                    matched_row = summary[summary["Player"] == player_pick]
+                    if not matched_row.empty:
+                        r = matched_row.iloc[0]
+                        if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
+                            ss.update(player=player_pick, stat=ss.get("board_stat", selected_stat_label), line=float(r["Line"]),
+                                      over=int(r["Over"]), under=int(r["Under"]), opp="None",
+                                      game_date=ss.get("board_date") or _today_et())
                             st.rerun()
-                    with st.expander("📋 Full board for one market"):
-                        avail = [m for m in STATS if m in set(board_all["Market"])]
-                        mk = st.selectbox("Market", avail, key="full_board_market")
-                        st.dataframe(summarize_board(board_all[board_all["Market"] == mk]), use_container_width=True)
 
         with st.expander("⚙️ Model settings: how much weight does last season get?", expanded=False):
             s1, s2 = st.columns(2)
@@ -1632,9 +1567,9 @@ def main() -> None:
                 "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
                 "(last 10, EWMA decay 0.8) are blended with last season's rates; the last-season weights (per-minute rate and minutes) are set in Model settings.\n"
                 "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
-                "- **Distribution**: Normal for points, PRA and the points/rebounds/assists combos; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
+                "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
                 "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
-                "- **Opponent**: points-allowed (points, PRA, any combo with points) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
+                "- **Opponent**: points-allowed (points, PRA) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
                 "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
                 "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
                 "If the line moved, LINE MOVE shows how far (positive = in your favor)."
