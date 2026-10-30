@@ -62,20 +62,23 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made", "Pts + Reb + Ast", "Steals", "Blocks"]
+STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made", "Pts + Reb + Ast", "Pts + Ast", "Pts + Reb", "Reb + Ast", "Steals", "Blocks"]
 STAT_COL: Dict[str, str] = {
     "Points": "POINTS", "Rebounds": "REBOUNDS", "Assists": "ASSISTS", "3-Pointers Made": "3-POINTERS MADE",
     "Pts + Reb + Ast": "PTS + REB + AST", "Steals": "STEALS", "Blocks": "BLOCKS",
+    "Pts + Ast": "PTS + AST", "Pts + Reb": "PTS + REB", "Reb + Ast": "REB + AST",
 }
 ODDS_API_MARKETS: Dict[str, str] = {
     "Points": "player_points", "Rebounds": "player_rebounds", "Assists": "player_assists",
     "3-Pointers Made": "player_threes", "Pts + Reb + Ast": "player_points_rebounds_assists",
     "Steals": "player_steals", "Blocks": "player_blocks",
+    "Pts + Ast": "player_points_assists", "Pts + Reb": "player_points_rebounds", "Reb + Ast": "player_rebounds_assists",
 }
-CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
+CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST", "PTS + AST", "PTS + REB", "REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
 STAT_OPP: Dict[str, Tuple[float, str]] = {
     "POINTS": (0.5, "def"), "PTS + REB + AST": (0.3, "def"), "REBOUNDS": (0.3, "pace"),
     "ASSISTS": (0.3, "pace"), "3-POINTERS MADE": (0.3, "pace"), "STEALS": (0.3, "pace"), "BLOCKS": (0.3, "pace"),
+    "PTS + AST": (0.4, "def"), "PTS + REB": (0.4, "def"), "REB + AST": (0.3, "pace"),
 }
 
 CURRENT_SEASON_START = "2026-10-01"
@@ -85,10 +88,12 @@ CURRENT_NBA_SEASON, PRIOR_NBA_SEASON = "2026-27", "2025-26"
 B2B_OPP_BOOST: Dict[str, float] = {
     "POINTS": 0.015, "PTS + REB + AST": 0.010, "REBOUNDS": 0.005, "ASSISTS": 0.005,
     "3-POINTERS MADE": 0.005, "STEALS": 0.0, "BLOCKS": 0.0,
+    "PTS + AST": 0.012, "PTS + REB": 0.012, "REB + AST": 0.005,
 }
 B2B_OWN_EFFECT: Dict[str, float] = {
     "POINTS": -0.02, "PTS + REB + AST": -0.015, "REBOUNDS": -0.01, "ASSISTS": -0.01,
     "3-POINTERS MADE": -0.015, "STEALS": 0.0, "BLOCKS": 0.0,
+    "PTS + AST": -0.018, "PTS + REB": -0.018, "REB + AST": -0.01,
 }
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
 BT_TAU = 0.02
@@ -277,6 +282,20 @@ def _espn_find_player_id(name: str) -> Optional[str]:
     return candidates[0][0] if candidates else None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def player_headshot_url(name: str) -> Optional[str]:
+    """ESPN headshot URL for an NBA player (checked to exist), or None if not found."""
+    try:
+        pid = _espn_find_player_id(name)
+        if not pid:
+            return None
+        url = f"https://a.espncdn.com/i/headshots/nba/players/full/{pid}.png"
+        ok = requests.head(url, headers=ESPN_HEADERS, timeout=6, allow_redirects=True).status_code == 200
+        return url if ok else None
+    except Exception:
+        return None
+
+
 def _split_made(v: Any) -> float:
     s = str(v).strip()
     return parse_val(s.split("-")[0]) if "-" in s else parse_val(s)
@@ -306,6 +325,7 @@ def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
                     rows.append({
                         "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
                         "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "PTS + REB + AST": pts + reb + ast,
+                        "PTS + AST": pts + ast, "PTS + REB": pts + reb, "REB + AST": reb + ast,
                         "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
                         "MINUTES": parse_val(rec.get("MIN")),
                         "OPPONENT": f"{sep} {opp}",
@@ -331,6 +351,7 @@ def _nba_api_fetch_logs(raw_input: str, season: str) -> pd.DataFrame:
     return pd.DataFrame({
         "POINTS": num("PTS"), "REBOUNDS": num("REB"), "ASSISTS": num("AST"), "3-POINTERS MADE": num("FG3M"),
         "PTS + REB + AST": num("PTS") + num("REB") + num("AST"), "STEALS": num("STL"), "BLOCKS": num("BLK"),
+        "PTS + AST": num("PTS") + num("AST"), "PTS + REB": num("PTS") + num("REB"), "REB + AST": num("REB") + num("AST"),
         "MINUTES": num("MIN"), "OPPONENT": df["MATCHUP"].astype(str),
         "DATE": pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.strftime("%Y-%m-%d"),
     })
@@ -1228,7 +1249,11 @@ def render_automated_checks(res: Dict[str, Any]) -> None:
 
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     stat_category, line_val = ctx["stat"], ctx["line"]
-    st.markdown(f"## {res['player_name']} | {stat_category}")
+    photo_col, title_col = st.columns([1, 6])
+    photo = player_headshot_url(res["player_name"])
+    if photo:
+        photo_col.image(photo, width=120)
+    title_col.markdown(f"## {res['player_name']} | {stat_category}")
     render_b2b_alert(res)
     c = st.columns(6)
     _metric(c[0], "MEAN", f"{res['mean']:.2f}")
@@ -1516,6 +1541,9 @@ def main() -> None:
                     summary = summarize_board(board_df)
                     st.dataframe(summary, use_container_width=True)
                     player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
+                    pick_photo = player_headshot_url(str(player_pick))
+                    if pick_photo:
+                        st.image(pick_photo, width=110)
                     matched_row = summary[summary["Player"] == player_pick]
                     if not matched_row.empty:
                         r = matched_row.iloc[0]
@@ -1567,9 +1595,9 @@ def main() -> None:
                 "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
                 "(last 10, EWMA decay 0.8) are blended with last season's rates; the last-season weights (per-minute rate and minutes) are set in Model settings.\n"
                 "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
-                "- **Distribution**: Normal for points/PRA; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
+                "- **Distribution**: Normal for points, PRA and the points/rebounds/assists combos; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
                 "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
-                "- **Opponent**: points-allowed (points, PRA) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
+                "- **Opponent**: points-allowed (points, PRA, any combo with points) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
                 "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
                 "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
                 "If the line moved, LINE MOVE shows how far (positive = in your favor)."
