@@ -98,8 +98,6 @@ B2B_OWN_EFFECT: Dict[str, float] = {
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
 BT_TAU = 0.02
 EFFECTS_PATH = "b2b_effects.json"
-# Last-season weight, in pseudo-games. Per-minute production is stable year to year (high weight); minutes and roles
-# change more (lower weight). Defaults are informed assumptions: run the Backtest tab to estimate them from data.
 N_PRIOR_RATE = 12.0
 N_PRIOR_MIN = 6.0
 PRIOR_GRID: List[float] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 80]
@@ -113,7 +111,6 @@ KELLY_FRACTION, KELLY_CAP = 0.25, 0.05
 
 
 def _secret(name: str) -> str:
-    """Read a secret from Streamlit secrets, falling back to environment variables."""
     try:
         if name in st.secrets:
             return str(st.secrets[name]).strip()
@@ -123,7 +120,6 @@ def _secret(name: str) -> str:
 
 
 def parse_val(v: Any) -> float:
-    """Best-effort float parse (handles '-', None, '3/8', thousands separators)."""
     try:
         s = str(v).strip()
         if not s or s in ["-", "None", "null", "--"]:
@@ -136,7 +132,6 @@ def parse_val(v: Any) -> float:
 
 
 def _to_et_date(iso: str) -> Optional[date]:
-    """Parse an ISO timestamp into its US Eastern calendar date."""
     try:
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -148,7 +143,6 @@ def _to_et_date(iso: str) -> Optional[date]:
 
 
 def _iso_to_date(s: Any) -> Optional[date]:
-    """'YYYY-MM-DD' -> date, or None if blank/invalid."""
     try:
         return date.fromisoformat(str(s))
     except ValueError:
@@ -156,7 +150,6 @@ def _iso_to_date(s: Any) -> Optional[date]:
 
 
 def _clean_name(name: str) -> str:
-    """Normalize a player name for matching."""
     s = re.sub(r"[^\w\s]", "", str(name).lower())
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
@@ -605,14 +598,13 @@ def effects_from_table(table: pd.DataFrame) -> Dict[str, Dict[str, float]]:
 
 
 def _early_season_arrays(frame: pd.DataFrame, stat_col: str) -> Optional[Tuple[np.ndarray, ...]]:
-    """Player-seasons with a prior season: first EARLY_GAMES games as padded (P, G) arrays plus prior-season summaries."""
     f = frame[["PID", "SEASON", f"X_{stat_col}", "X_MINUTES"]].rename(columns={f"X_{stat_col}": "X", "X_MINUTES": "M"}).copy()
     g = f.groupby(["PID", "SEASON"])
     f["G"], f["REV"] = g.cumcount(), g.cumcount(ascending=False)
     prior = pd.DataFrame({"X_SUM": g["X"].sum(), "M_SUM": g["M"].sum(), "X_MEAN": g["X"].mean()})
     prior["M20"] = f[f["REV"] < 20].groupby(["PID", "SEASON"])["M"].mean()
     prior = prior.reset_index()
-    prior["SEASON"] = prior["SEASON"] + 1                      # last season's summary, keyed to the season it predicts
+    prior["SEASON"] = prior["SEASON"] + 1
     cur = f[f["G"] < EARLY_GAMES].merge(prior, on=["PID", "SEASON"], how="inner")
     cur = cur[(cur["X_MEAN"] > 0) & (cur["M20"] > 0) & (cur["M_SUM"] > 0)]
     if cur["PID"].nunique() < 15:
@@ -626,11 +618,6 @@ def _early_season_arrays(frame: pd.DataFrame, stat_col: str) -> Optional[Tuple[n
 
 def _prior_loss_curves(X: np.ndarray, M: np.ndarray, rate0: np.ndarray, min0: np.ndarray, pm: np.ndarray,
                        grid: List[float]) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Out-of-sample squared error of the model's one-game-ahead prediction for each prior weight n0 on the grid.
-    rate_hat = (n*EWMA_rate + n0*last_season_rate)/(n + n0) scored as (stat - rate_hat*minutes)/last_season_mean;
-    min_hat is the same blend for minutes scored as (minutes - min_hat)/last_season_minutes.
-    """
     n0 = np.asarray(grid, float)[:, None]
     rate_sse, min_sse, cnt = np.zeros(len(grid)), np.zeros(len(grid)), 0
     for g in range(X.shape[1]):
@@ -655,11 +642,6 @@ def _prior_loss_curves(X: np.ndarray, M: np.ndarray, rate0: np.ndarray, min0: np
 
 
 def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = None) -> pd.DataFrame:
-    """
-    Data-driven last-season weight: for the first EARLY_GAMES games of each season, find the n0 that minimizes
-    one-game-ahead prediction error (per stat for the per-minute rate, plus minutes). N0_RANGE = every grid value
-    within 1% of the best loss (how flat the optimum is).
-    """
     grid = list(PRIOR_GRID if grid is None else grid)
     rows: List[Dict[str, Any]] = []
     min_curve: Optional[np.ndarray] = None
@@ -686,7 +668,6 @@ def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = No
 
 
 def load_prior_file() -> Optional[Dict[str, float]]:
-    """Saved last-season weights (best effort; ephemeral on Streamlit Cloud)."""
     try:
         if os.path.exists(PRIOR_PATH):
             with open(PRIOR_PATH) as fh:
@@ -697,7 +678,6 @@ def load_prior_file() -> Optional[Dict[str, float]]:
 
 
 def save_prior_file(weights: Optional[Dict[str, float]]) -> None:
-    """Persist (or clear) the last-season weights."""
     try:
         if weights is None:
             if os.path.exists(PRIOR_PATH):
@@ -763,7 +743,7 @@ def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataF
 # --------------------------------------------------------------------------------------
 INJURY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 USAGE_STATS: List[str] = ["POINTS", "REBOUNDS", "ASSISTS", "3-POINTERS MADE", "STEALS", "BLOCKS"]
-USAGE_BASED = {"POINTS"}
+USAGE_BASED = {"POINTS"}            # absorption shares follow usage possessions; other stats follow own production
 ABSORB: Dict[str, float] = {"POINTS": 0.85, "REBOUNDS": 0.90, "ASSISTS": 0.75, "3-POINTERS MADE": 0.75,
                             "STEALS": 0.50, "BLOCKS": 0.50}
 COMBO_PARTS: Dict[str, List[str]] = {
@@ -779,17 +759,20 @@ DEFAULT_ADJ: Dict[str, Any] = {"injuries": True, "opp_stat": True, "absorb_scale
                                "manual_out": [], "manual_q": [], "manual_in": []}
 
 
-def _status_to_p_out(status: str, text: str) -> float:
+def _status_to_p_out(status: Any, text: str) -> float:
     """Probability a listed player misses the game, from the ESPN status/comment text."""
-    s, t = status.lower(), text.lower()
-    if "out" in s or "suspend" in s:
+    s = str(status).lower() if isinstance(status, str) else str(status.get("name", "") or status.get("type", "")).lower() if isinstance(status, dict) else ""
+    t = text.lower()
+    if any(k in s for k in ["out", "susp", "injured reserve", "ir"]):
         return 1.0
-    if "doubtful" in s or "doubtful" in t:
+    if any(k in s for k in ["doubtful", "doubt"]):
         return 0.85
-    if "probable" in s or "probable" in t:
+    if any(k in s for k in ["probable", "prob"]):
         return 0.10
-    if "questionable" in s or "questionable" in t or "day" in s:
+    if any(k in s for k in ["questionable", "quest", "day-to-day", "day to day"]):
         return 0.50
+    if any(k in t for k in ["out", "surg", "surgery", "miss"]):
+        return 1.0
     return 0.0
 
 
@@ -801,15 +784,23 @@ def load_injuries() -> pd.DataFrame:
         resp = requests.get(INJURY_URL, headers=ESPN_HEADERS, timeout=10)
         resp.raise_for_status()
         rows: List[Dict[str, Any]] = []
-        for team in resp.json().get("injuries", []):
+        data = resp.json()
+        teams = data.get("injuries", []) or data.get("items", []) or data.get("teams", [])
+        for team in teams:
             for inj in team.get("injuries", []):
                 ath = inj.get("athlete", {}) or {}
-                pid, name = str(ath.get("id", "")), ath.get("displayName") or ath.get("fullName")
-                if not pid or not name:
+                pid = str(ath.get("id", ""))
+                name = ath.get("displayName") or ath.get("fullName") or ath.get("name")
+                if not name:
                     continue
-                status = str(inj.get("status", ""))
-                text = f"{inj.get('shortComment', '')} {inj.get('longComment', '')}"
-                rows.append({"PID": pid, "NAME": str(name), "STATUS": status, "P_OUT": _status_to_p_out(status, text)})
+                stat_obj = inj.get("status")
+                if isinstance(stat_obj, dict):
+                    status = stat_obj.get("name") or stat_obj.get("type") or stat_obj.get("description") or "Out"
+                else:
+                    status = str(stat_obj or inj.get("type", "Out"))
+                text = f"{inj.get('shortComment', '')} {inj.get('longComment', '')} {inj.get('details', '')}"
+                p_out = _status_to_p_out(status, text)
+                rows.append({"PID": pid, "NAME": str(name), "STATUS": status, "P_OUT": p_out})
         return pd.DataFrame(rows, columns=cols)
     except Exception:
         return pd.DataFrame(columns=cols)
@@ -944,25 +935,12 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     inj = load_injuries()
     p_by_pid = dict(zip(inj["PID"], inj["P_OUT"])) if not inj.empty else {}
     s_by_pid = dict(zip(inj["PID"], inj["STATUS"])) if not inj.empty else {}
-    p_by_name = {_clean_name(row["NAME"]): row["P_OUT"] for _, row in inj.iterrows()} if not inj.empty else {}
-    s_by_name = {_clean_name(row["NAME"]): row["STATUS"] for _, row in inj.iterrows()} if not inj.empty else {}
+    p_by_name = dict(zip(inj["NAME"].map(_clean_name), inj["P_OUT"])) if not inj.empty else {}
+    s_by_name = dict(zip(inj["NAME"].map(_clean_name), inj["STATUS"])) if not inj.empty else {}
 
-    q_list = []
-    status_list = []
-    for pid_val, name_val in zip(prof["PID"], prof["NAME"]):
-        cleaned_nm = _clean_name(name_val)
-        if pid_val in p_by_pid:
-            q_list.append(float(p_by_pid[pid_val]))
-            status_list.append(str(s_by_pid.get(pid_val, "")))
-        elif cleaned_nm in p_by_name:
-            q_list.append(float(p_by_name[cleaned_nm]))
-            status_list.append(str(s_by_name.get(cleaned_nm, "")))
-        else:
-            q_list.append(0.0)
-            status_list.append("")
-    q = np.array(q_list)
-    status = status_list
-
+    q = np.array([float(p_by_pid.get(str(p), p_by_name.get(_clean_name(nm), 0.0))) for p, nm in zip(prof["PID"], prof["NAME"])])
+    status = [str(s_by_pid.get(str(p), s_by_name.get(_clean_name(nm), ""))) for p, nm in zip(prof["PID"], prof["NAME"])]
+    
     names = prof["NAME"].map(_clean_name)
     for key, val, tag in (("manual_q", 0.5, "QUESTIONABLE (manual)"), ("manual_out", 1.0, "OUT (manual)"), ("manual_in", 0.0, "ACTIVE (manual)")):
         hit = names.isin({_clean_name(x) for x in cfg.get(key, [])}).to_numpy()
@@ -1143,114 +1121,4 @@ def implied_prob(odds: float) -> float:
 
 def payout(odds: float) -> float:
     o = float(odds)
-    return 100.0 / abs(o) if o < 0 else o / 100.0
-
-
-def devig(over_odds: float, under_odds: float) -> Tuple[float, float]:
-    po, pu = implied_prob(over_odds), implied_prob(under_odds)
-    return po / (po + pu), pu / (po + pu)
-
-
-def prob_to_american(p: float) -> int:
-    p = float(np.clip(p, 0.01, 0.99))
-    return int(round(-100.0 * p / (1.0 - p))) if p >= 0.5 else int(round(100.0 * (1.0 - p) / p))
-
-
-def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
-    b = payout(odds)
-    full = (b * p_win - p_lose) / b
-    return float(np.clip(full * KELLY_FRACTION, 0.0, KELLY_CAP))
-
-
-def run_automated_context_filters(proj_minutes: float, raw_avg: float, b2b_status_str: str) -> Dict[str, Any]:
-    secure_volume = bool(proj_minutes >= 28.0 or raw_avg >= 15.0)
-    clean_schedule = bool(b2b_status_str not in ("second", "both"))
-    sharp_movement = bool(proj_minutes >= 24.0)
-    return {
-        "secure_volume": secure_volume,
-        "clean_schedule": clean_schedule,
-        "sharp_movement": sharp_movement,
-        "all_passed": secure_volume and clean_schedule and sharp_movement
-    }
-
-
-def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
-                      opponent: Optional[str] = None, game_date: Optional[date] = None,
-                      b2b_effects: Optional[Dict[str, Dict[str, float]]] = None,
-                      prior_weights: Optional[Tuple[float, float]] = None,
-                      adj_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    try:
-        cfg = {**DEFAULT_ADJ, **(adj_cfg or {})}
-        for o in (over_odds, under_odds):
-            if abs(float(o)) < 100:
-                return {"error": f"Odds {o:g} aren't valid American odds (must be <= -100 or >= +100)."}
-        stat_col = STAT_COL.get(stat_category)
-        if stat_col is None:
-            return {"error": f"Unknown stat category '{stat_category}'."}
-        logs, err = fetch_player_logs(player_name)
-        if err:
-            return {"error": err}
-        logs = logs.assign(**{stat_col: pd.to_numeric(logs[stat_col], errors="coerce")}).dropna(subset=[stat_col])
-        played = logs[logs["MINUTES"] > 0]
-        cur = played[played["SEASON"] == "current"].tail(WINDOW)
-        pri = played[played["SEASON"] == "prior"]
-
-        opp_mult, opp_note = 1.0, None
-        if opponent:
-            try:
-                opp_mult, opp_note = opp_multiplier(opponent, stat_col, load_team_scoring())
-            except Exception as e:
-                opp_note = f"Opponent data unavailable ({e}); no adjustment applied."
-        opp_detail: Optional[Dict[str, Any]] = None
-        if opponent and cfg["opp_stat"]:
-            try:
-                opp_detail = opp_stat_detail(opponent, stat_col, load_opp_allowed(), cur)
-                if opp_detail:
-                    opp_detail["mult_old"] = opp_mult
-                    opp_mult = float(np.clip(opp_mult ** (1.0 - OPP_BLEND) * opp_detail["mult"] ** OPP_BLEND, 0.88, 1.12))
-                    opp_detail["mult_final"] = opp_mult
-            except Exception as e:
-                opp_note = f"{opp_note or ''} Stat-specific matchup data unavailable ({e}).".strip()
-        b2b_state, b2b_mult, b2b_note = "unknown", 1.0, None
-        game_day = game_date or _today_et()
-        if opponent:
-            try:
-                b2b_state = b2b_status(load_team_game_dates(opponent), game_day)
-                b2b_mult = b2b_multiplier(b2b_state, stat_col, (b2b_effects or {}).get("opp"))
-            except Exception as e:
-                b2b_note = f"Back-to-back check unavailable ({e}); no adjustment applied."
-        else:
-            b2b_note = "No opponent selected: opponent back-to-back check skipped."
-        day_iso = game_day.isoformat()
-        before = played[played["DATE"] < day_iso]
-        prev_date = _iso_to_date(before["DATE"].iloc[-1]) if len(before) else None
-        own_state = own_b2b_status(prev_date, game_day)
-        own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
-
-        inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None}
-        if cfg["injuries"]:
-            try:
-                inj_out = injury_adjustment(player_name, stat_col, cur, cfg, tuple(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)), len(pri) > 0)
-            except Exception as e:
-                inj_out["notes"].append(f"Injury adjustment unavailable ({e}); none applied.")
-        proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
-                                pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult,
-                                *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)),
-                                extra_min=inj_out["minutes_extra"], usage_mult=inj_out["usage_mult"])
-        sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
-        p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
-        decided = max(p_over + p_under, 1e-9)
-        dv_over, dv_under = devig(over_odds, under_odds)
-        ev_over = p_over * payout(over_odds) - p_under
-        ev_under = p_under * payout(under_odds) - p_over
-        is_over = ev_over >= ev_under
-        p_w, p_l = (p_over, p_under) if is_over else (p_under, p_over)
-        odds_side = over_odds if is_over else under_odds
-        ev = ev_over if is_over else ev_under
-        side_txt = f"{'Over' if is_over else 'Under'} {line:g}"
-        p_cond = p_w / decided
-        dv_side = dv_over if is_over else dv_under
-
-        sides = {}
-        for nm, pw_, pl_, od_, dv_, ev_ in (("Over", p_over, p_under, over_odds, dv_over, ev_over),
-                                            ("Under", p_under, p_over, under_odds, dv_under, ev_under
+    return 100.0 / abs
