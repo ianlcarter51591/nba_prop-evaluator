@@ -301,6 +301,12 @@ def _split_made(v: Any) -> float:
     return parse_val(s.split("-")[0]) if "-" in s else parse_val(s)
 
 
+def _split_att(v: Any) -> float:
+    """'9-18' -> 18 (attempts)."""
+    s = str(v).strip()
+    return parse_val(s.split("-")[1]) if "-" in s else 0.0
+
+
 def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
     resp = requests.get(ESPN_GAMELOG_URL.format(pid=pid), params={"season": season} if season else {}, headers=ESPN_HEADERS, timeout=12)
     resp.raise_for_status()
@@ -327,6 +333,7 @@ def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
                         "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "PTS + REB + AST": pts + reb + ast,
                         "PTS + AST": pts + ast, "PTS + REB": pts + reb, "REB + AST": reb + ast,
                         "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
+                        "FGA": _split_att(rec.get("FG", 0)), "FTA": _split_att(rec.get("FT", 0)), "TOV": parse_val(rec.get("TO")),
                         "MINUTES": parse_val(rec.get("MIN")),
                         "OPPONENT": f"{sep} {opp}",
                         "DATE": (lambda d: d.isoformat() if d else str(info.get("gameDate", ""))[:10])(_to_et_date(info.get("gameDate", ""))),
@@ -352,6 +359,7 @@ def _nba_api_fetch_logs(raw_input: str, season: str) -> pd.DataFrame:
         "POINTS": num("PTS"), "REBOUNDS": num("REB"), "ASSISTS": num("AST"), "3-POINTERS MADE": num("FG3M"),
         "PTS + REB + AST": num("PTS") + num("REB") + num("AST"), "STEALS": num("STL"), "BLOCKS": num("BLK"),
         "PTS + AST": num("PTS") + num("AST"), "PTS + REB": num("PTS") + num("REB"), "REB + AST": num("REB") + num("AST"),
+        "FGA": num("FGA"), "FTA": num("FTA"), "TOV": num("TOV"),
         "MINUTES": num("MIN"), "OPPONENT": df["MATCHUP"].astype(str),
         "DATE": pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.strftime("%Y-%m-%d"),
     })
@@ -751,6 +759,321 @@ def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataF
 
 
 # --------------------------------------------------------------------------------------
+# Injuries + usage redistribution, and stat-specific opponent factors
+#
+# Math (every constant below is a named assumption you can tune):
+#   Absent player j frees M_j minutes and X_j = rate_j * M_j of a stat per game.
+#   1. Minutes: receiver k gets dM[j,k] = M_j * omega_k, omega_k ~ a_k * M_k * max(40 - M_k, 4)  (headroom-weighted)
+#   2. Stat that extra minutes do NOT already cover: E_j = max(X_j - sum_k rate_k * dM[j,k], 0)
+#   3. Absorbed: dX[j,k] = alpha_s * E_j * share_k; share_k ~ a_k * usage possessions (points) or own production (others)
+#   4. Rate lift for k: dR[j,k] = dX[j,k] / (rate_k * (M_k + dM[j,k]))
+#   5. Net effect of j on the evaluated player i: (q_j - f_j) * D_j, where q_j = P(j misses tonight) and f_j = the share
+#      of i's baseline built from games j missed. f_j removes double counting (a star who already missed all of this
+#      season is partly baked into the baseline) and makes a RETURNING teammate pull usage back down.
+#   USG% = 100 * (FGA + 0.44*FTA + TOV) * 240 / (MIN * team possessions used)
+# --------------------------------------------------------------------------------------
+INJURY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+USAGE_STATS: List[str] = ["POINTS", "REBOUNDS", "ASSISTS", "3-POINTERS MADE", "STEALS", "BLOCKS"]
+USAGE_BASED = {"POINTS"}            # absorption shares follow usage possessions; other stats follow own production
+ABSORB: Dict[str, float] = {"POINTS": 0.85, "REBOUNDS": 0.90, "ASSISTS": 0.75, "3-POINTERS MADE": 0.75,
+                            "STEALS": 0.50, "BLOCKS": 0.50}
+COMBO_PARTS: Dict[str, List[str]] = {
+    "PTS + REB + AST": ["POINTS", "REBOUNDS", "ASSISTS"], "PTS + AST": ["POINTS", "ASSISTS"],
+    "PTS + REB": ["POINTS", "REBOUNDS"], "REB + AST": ["REBOUNDS", "ASSISTS"],
+}
+ROTATION_MIN, MIN_CAP, HEADROOM_FLOOR, MAX_MIN_SHIFT = 10.0, 40.0, 4.0, 10.0
+USAGE_MULT_BOUNDS: Tuple[float, float] = (0.80, 1.40)
+MAX_CELL_LIFT = 0.60
+ABBR_ALIAS: Dict[str, str] = {"GS": "GSW", "NY": "NYK", "SA": "SAS", "NO": "NOP", "UTAH": "UTA", "WSH": "WAS", "PHO": "PHX", "BKLN": "BKN"}
+OPP_SHRINK_G, OPP_STAT_BOUNDS, OPP_BLEND = 12.0, (0.88, 1.12), 0.5
+DEFAULT_ADJ: Dict[str, Any] = {"injuries": True, "opp_stat": True, "absorb_scale": 1.0,
+                               "manual_out": [], "manual_q": [], "manual_in": []}
+
+
+def _status_to_p_out(status: str, text: str) -> float:
+    """Probability a listed player misses the game, from the ESPN status/comment text."""
+    s, t = status.lower(), text.lower()
+    if "out" in s or "suspend" in s:
+        return 1.0
+    if "doubtful" in s or "doubtful" in t:
+        return 0.85
+    if "probable" in s or "probable" in t:
+        return 0.10
+    if "questionable" in s or "questionable" in t or "day" in s:
+        return 0.50
+    return 0.0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_injuries() -> pd.DataFrame:
+    """ESPN NBA injury report as PID, NAME, STATUS, P_OUT (empty frame if unavailable)."""
+    cols = ["PID", "NAME", "STATUS", "P_OUT"]
+    try:
+        resp = requests.get(INJURY_URL, headers=ESPN_HEADERS, timeout=10)
+        resp.raise_for_status()
+        rows: List[Dict[str, Any]] = []
+        for team in resp.json().get("injuries", []):
+            for inj in team.get("injuries", []):
+                ath = inj.get("athlete", {}) or {}
+                pid, name = str(ath.get("id", "")), ath.get("displayName") or ath.get("fullName")
+                if not pid or not name:
+                    continue
+                status = str(inj.get("status", ""))
+                text = f"{inj.get('shortComment', '')} {inj.get('longComment', '')}"
+                rows.append({"PID": pid, "NAME": str(name), "STATUS": status, "P_OUT": _status_to_p_out(status, text)})
+        return pd.DataFrame(rows, columns=cols)
+    except Exception:
+        return pd.DataFrame(columns=cols)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_all_rosters() -> Dict[str, List[Tuple[str, str]]]:
+    """Team id -> [(player id, name)] for all 30 teams."""
+    meta = load_team_meta()
+
+    def safe(tid: str) -> List[Tuple[str, str]]:
+        try:
+            return _roster(tid)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rosters = list(ex.map(lambda m: safe(m[0]), meta))
+    return {m[0]: r for m, r in zip(meta, rosters)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_player_id(name: str) -> Optional[str]:
+    """ESPN athlete id for a player name (cached)."""
+    return _espn_find_player_id(name)
+
+
+def _blend(pairs: List[Tuple[float, float]]) -> float:
+    """Weighted mean of (weight, value) pairs."""
+    w = sum(p[0] for p in pairs)
+    return sum(p[0] * p[1] for p in pairs) / w if w > 0 else 0.0
+
+
+def profile_row(pid: str, name: str, logs: pd.DataFrame, n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN) -> Optional[Dict[str, Any]]:
+    """One roster player's blended (this season + shrunk last season) minutes, per-minute rates and games-played dates."""
+    played = logs[pd.to_numeric(logs["MINUTES"], errors="coerce") > 0].copy()
+    if played.empty:
+        return None
+    for c in ("FGA", "FTA", "TOV"):
+        if c not in played:
+            played[c] = 0.0
+    played["POSS"] = played["FGA"] + 0.44 * played["FTA"] + played["TOV"]
+    cols = USAGE_STATS + ["POSS"]
+    sums = played.groupby("SEASON")[cols + ["MINUTES"]].sum()
+    cnt = played.groupby("SEASON").size()
+    n = int(cnt.get("current", 0))
+    has_c, has_p = "current" in sums.index, "prior" in sums.index
+    r0, m0 = (n0_rate if has_p else 0.0), (n0_min if has_p else 0.0)
+    rates = {}
+    for c in cols:
+        pairs = []
+        if has_c:
+            pairs.append((float(n), float(sums.loc["current", c] / sums.loc["current", "MINUTES"])))
+        if has_p:
+            pairs.append((r0 if has_c else 1.0, float(sums.loc["prior", c] / sums.loc["prior", "MINUTES"])))
+        rates["R_" + c] = _blend(pairs)
+    mins: List[Tuple[float, float]] = []
+    if has_c:
+        mins.append((float(n), float(played.loc[played["SEASON"] == "current", "MINUTES"].mean())))
+    if has_p:
+        mins.append((m0 if has_c else 1.0, float(played.loc[played["SEASON"] == "prior", "MINUTES"].tail(20).mean())))
+    return {"PID": pid, "NAME": name, "N_CUR": n, "MIN": _blend(mins), **rates,
+            "DATES": tuple(played.loc[played["SEASON"] == "current", "DATE"])}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_team_profile(tid: str) -> pd.DataFrame:
+    """Rotation profile for every player on a team (blended minutes, per-minute rates, USG%)."""
+    roster = _roster(tid)
+
+    def fetch(item: Tuple[str, str]) -> Optional[pd.DataFrame]:
+        try:
+            return _finalize_logs(pd.concat([_espn_fetch_logs(item[0], None), _espn_fetch_logs(item[0], PRIOR_ESPN_SEASON)], ignore_index=True))
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        logs = list(ex.map(fetch, roster))
+    rows = [r for (pid, nm), df in zip(roster, logs) if df is not None and not df.empty
+            for r in [profile_row(pid, nm, df)] if r is not None]
+    prof = pd.DataFrame(rows)
+    if prof.empty:
+        return prof
+    team_poss = float((prof["R_POSS"] * prof["MIN"]).sum())
+    prof["USG"] = 100.0 * prof["R_POSS"] * 240.0 / max(team_poss, 1e-9)
+    return prof
+
+
+def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, absorb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For every candidate-absent player j (rows) and receiver k (cols):
+    dM[j,k] minutes shifted to k, dR[j,k,s] fractional per-minute rate lift for stat s. Shapes: M (K,), R (K,S), W (K,S), a (K,).
+    """
+    K = len(M)
+    off = 1.0 - np.eye(K)
+    wmin = a * M * np.maximum(MIN_CAP - M, HEADROOM_FLOOR)
+    omega = wmin[None, :] * off
+    omega = omega / np.maximum(omega.sum(1, keepdims=True), 1e-9)
+    dM = np.minimum(M[:, None] * omega, np.maximum(MIN_CAP - M, 0.0)[None, :])
+    leftover = np.maximum(R * M[:, None] - dM @ R, 0.0)
+    wshare = (a[:, None] * W)[None, :, :] * off[:, :, None]
+    share = wshare / np.maximum(wshare.sum(1, keepdims=True), 1e-9)
+    dX = absorb[None, None, :] * leftover[:, None, :] * share
+    dR = dX / np.maximum((M[None, :] + dM)[:, :, None] * np.maximum(R, 1e-4)[None, :, :], 1e-9)
+    return dM, np.minimum(dR, MAX_CELL_LIFT)
+
+
+def absent_fractions(cur_dates: np.ndarray, player_dates: List[Tuple[str, ...]], weights: np.ndarray) -> np.ndarray:
+    """Per teammate: EWMA-weighted share of the evaluated player's recent games that the teammate missed."""
+    K = len(player_dates)
+    if len(cur_dates) == 0 or K == 0:
+        return np.zeros(K)
+    idx = np.repeat(np.arange(K), [len(d) for d in player_dates])
+    dts = np.concatenate([np.asarray(d, dtype=object) for d in player_dates]) if idx.size else np.array([], dtype=object)
+    present = np.zeros((K, len(cur_dates)), dtype=bool)
+    if idx.size:
+        col = {d: c for c, d in enumerate(cur_dates)}
+        hit = np.fromiter((x in col for x in dts), dtype=bool, count=len(dts))
+        present[idx[hit], np.fromiter((col[x] for x in dts[hit]), dtype=int, count=int(hit.sum()))] = True
+    return ((~present) * weights[None, :]).sum(1)
+
+
+def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: Dict[str, Any],
+                      n0: Tuple[float, float], has_prior: bool) -> Dict[str, Any]:
+    """Minutes shift + usage multiplier for the evaluated player from injured / returning teammates."""
+    out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None}
+    pid = cached_player_id(player_name)
+    if not pid:
+        out["notes"].append("Injury adjustment skipped: could not resolve the player on ESPN.")
+        return out
+    tid = next((t for t, r in load_all_rosters().items() if any(p == pid for p, _ in r)), None)
+    if tid is None:
+        out["notes"].append("Injury adjustment skipped: player not found on a current roster.")
+        return out
+    prof = load_team_profile(tid).reset_index(drop=True)
+    if prof.empty or pid not in set(prof["PID"]):
+        out["notes"].append("Injury adjustment skipped: teammate profile unavailable.")
+        return out
+    i = int(np.flatnonzero(prof["PID"].to_numpy() == pid)[0])
+    K = len(prof)
+    out["team"] = next((nm for t, nm in load_team_meta() if t == tid), None)
+    inj = load_injuries()
+    p_by_pid = dict(zip(inj["PID"], inj["P_OUT"])) if not inj.empty else {}
+    s_by_pid = dict(zip(inj["PID"], inj["STATUS"])) if not inj.empty else {}
+    q = np.array([float(p_by_pid.get(p, 0.0)) for p in prof["PID"]])
+    status = [str(s_by_pid.get(p, "")) for p in prof["PID"]]
+    names = prof["NAME"].map(_clean_name)
+    for key, val, tag in (("manual_q", 0.5, "QUESTIONABLE (manual)"), ("manual_out", 1.0, "OUT (manual)"), ("manual_in", 0.0, "ACTIVE (manual)")):
+        hit = names.isin({_clean_name(x) for x in cfg.get(key, [])}).to_numpy()
+        q = np.where(hit, val, q)
+        status = [tag if h else s for h, s in zip(hit, status)]
+    if q[i] > 0:
+        out["notes"].append(f"ESPN lists {player_name} as {status[i] or 'injured'}; the projection assumes he plays.")
+    q[i] = 0.0
+    a = 1.0 - q
+    M = prof["MIN"].to_numpy(float)
+    R = prof[["R_" + s for s in USAGE_STATS]].to_numpy(float)
+    poss = (prof["R_POSS"].to_numpy(float) * M)[:, None]
+    W = np.where(np.array([s in USAGE_BASED for s in USAGE_STATS])[None, :], poss, R * M[:, None])
+    absorb = np.minimum(np.array([ABSORB[s] for s in USAGE_STATS]) * float(cfg.get("absorb_scale", 1.0)), 1.0)
+    dM, dR = absence_effects(M, R, W, a, absorb)
+
+    n = len(cur)
+    w = ewma_weights(n) if n else np.array([])
+    f_core = absent_fractions(cur["DATE"].to_numpy(dtype=object), list(prof["DATES"]), w)
+    r0, m0 = (n0[0] if has_prior else 0.0), (n0[1] if has_prior else 0.0)
+    f_rate, f_min = f_core * n / max(n + r0, 1e-9), f_core * n / max(n + m0, 1e-9)
+    rot = (M >= ROTATION_MIN).astype(float)
+    rot[i] = 0.0
+    net_rate, net_min = (q - f_rate) * rot, (q - f_min) * rot
+
+    parts = COMBO_PARTS.get(stat_col, [stat_col])
+    pidx = [USAGE_STATS.index(s) for s in parts if s in USAGE_STATS]
+    if not pidx:
+        return out
+    base = R[i, pidx] / max(R[i, pidx].sum(), 1e-9)
+    per_j = (dR[:, i, :][:, pidx] * base[None, :]).sum(1)
+    lift = float((net_rate * per_j).sum())
+    minutes_extra = float(np.clip((net_min * dM[:, i]).sum(), -MAX_MIN_SHIFT, MAX_MIN_SHIFT))
+    out.update(minutes_extra=minutes_extra, usage_mult=float(np.clip(1.0 + lift, *USAGE_MULT_BOUNDS)),
+               usg=float(prof.loc[i, "USG"]))
+    show = np.flatnonzero((np.abs(net_rate) > 0.02) | (np.abs(net_min) > 0.02))
+    for j in show[np.argsort(-np.abs(net_rate[show] * per_j[show]))]:
+        label = ("OUT" if q[j] >= 0.99 else f"{q[j]:.0%} to miss" if q[j] > 0 else "Active (missed recent games)")
+        out["table"].append({"Teammate": prof.loc[j, "NAME"], "Status": label,
+                             "USG%": round(float(prof.loc[j, "USG"]), 1), "MPG": round(float(M[j]), 1),
+                             "Recent games missed": f"{f_core[j]:.0%}",
+                             "Weight": round(float(net_rate[j]), 2),
+                             "Minutes effect": round(float(net_min[j] * dM[j, i]), 2),
+                             "Stat effect %": round(float(net_rate[j] * per_j[j]) * 100.0, 1)})
+    return out
+
+
+def compute_opp_allowed(games: pd.DataFrame, stat_cols: List[str], min_games: int = 3) -> pd.DataFrame:
+    """Production allowed by each opponent relative to each opposing player's own average (1.00 = league average)."""
+    g = games[games.groupby("PID")["DATE"].transform("size") >= min_games]
+    if g.empty:
+        return pd.DataFrame()
+    base = g.groupby("PID")[stat_cols].transform("mean")
+    num, den = g.groupby("OPP")[stat_cols].sum(), base.groupby(g["OPP"]).sum()
+    out = (num / den.replace(0, np.nan)).fillna(1.0)
+    out["G"] = g.groupby("OPP")["DATE"].nunique()
+    return out
+
+
+def _opp_abbr(series: pd.Series) -> pd.Series:
+    """'vs. BOS' / '@ GS' -> canonical abbreviation."""
+    return series.astype(str).str.split().str[-1].str.upper().replace(ABBR_ALIAS)
+
+
+@st.cache_data(ttl=21600, show_spinner="Loading league game logs for matchup splits (one-time, about 30-60s)...")
+def load_opp_allowed() -> pd.DataFrame:
+    """Per opponent and stat: how much it allows rotation players relative to their own normal."""
+    pids = [pid for r in load_all_rosters().values() for pid, _ in r]
+
+    def fetch(pid: str) -> Optional[pd.DataFrame]:
+        try:
+            df = _finalize_logs(_espn_fetch_logs(pid, None))
+            return df.assign(PID=pid) if not df.empty else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        frames = [f for f in ex.map(fetch, pids) if f is not None]
+    if not frames:
+        raise ValueError("no league game logs available")
+    games = pd.concat(frames, ignore_index=True)
+    games = games[games["MINUTES"] >= ROTATION_MIN].assign(OPP=lambda d: _opp_abbr(d["OPPONENT"]))
+    return compute_opp_allowed(games, list(STAT_COL.values()))
+
+
+def opp_stat_detail(opponent: str, stat_col: str, allowed: pd.DataFrame, played_cur: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Opponent's stat-specific multiplier, rank (1 = softest), and the player's own top/bottom-10 defense splits."""
+    abbr = next((_opp_abbr(pd.Series([ab])).iloc[0] for _, nm, ab in load_team_abbr_meta() if nm == opponent), None)
+    if abbr is None or abbr not in allowed.index or stat_col not in allowed:
+        return None
+    f, g = float(allowed.loc[abbr, stat_col]), float(allowed.loc[abbr, "G"])
+    mult = float(np.clip(1.0 + g / (g + OPP_SHRINK_G) * (f - 1.0), *OPP_STAT_BOUNDS))
+    rank = allowed[stat_col].rank(ascending=False, method="min")
+    n_teams = len(allowed)
+    r = _opp_abbr(played_cur["OPPONENT"]).map(rank) if len(played_cur) else pd.Series(dtype=float)
+    soft, tough = played_cur.loc[r <= 10, stat_col], played_cur.loc[r > n_teams - 10, stat_col]
+    return {"abbr": abbr, "factor": f, "games": int(g), "mult": mult, "rank": int(rank[abbr]), "n_teams": n_teams,
+            "soft_avg": float(soft.mean()) if len(soft) else None, "soft_n": int(len(soft)),
+            "tough_avg": float(tough.mean()) if len(tough) else None, "tough_n": int(len(tough))}
+
+
+def _split_names(text: str) -> List[str]:
+    """'A, B ,C' -> ['A', 'B', 'C']."""
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+# --------------------------------------------------------------------------------------
 # Model math & Automated Contextual Checks
 # --------------------------------------------------------------------------------------
 @dataclass
@@ -763,6 +1086,8 @@ class Projection:
     opp_mult: float
     share_rate: float = 0.0     # fraction of the per-minute-rate estimate that comes from last season
     share_min: float = 0.0      # fraction of the minutes estimate that comes from last season
+    usage_mult: float = 1.0     # injury/usage redistribution multiplier on the per-minute rate
+    extra_min: float = 0.0      # injury/usage redistribution minutes shift
 
 
 def ewma_weights(n: int, decay: float = DECAY) -> np.ndarray:
@@ -777,11 +1102,12 @@ def _cv(x: np.ndarray) -> Optional[float]:
 
 
 def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, opp_mult: float = 1.0,
-                     n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN) -> Projection:
+                     n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN,
+                     extra_min: float = 0.0, usage_mult: float = 1.0) -> Projection:
     """
     rate    = (n*EWMA_rate + n0_rate*last_season_rate) / (n + n0_rate)
     minutes = (n*EWMA_min  + n0_min *last_season_min ) / (n + n0_min)
-    mu      = rate * minutes * opp_mult;  spread = pooled CV * mu, widened for estimation uncertainty.
+    mu      = rate * (minutes + extra_min) * opp_mult * usage_mult;  spread = pooled CV * mu, widened for estimation uncertainty.
     """
     n = len(cur_x)
     has_prior = len(pri_x) > 0
@@ -803,13 +1129,15 @@ def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pr
         pairs_min.append((m0, float(np.mean(pri_m[-20:]))))
     blend = lambda pairs: sum(w * v for w, v in pairs) / sum(w for w, _ in pairs)
     rate, minutes = blend(pairs_rate), blend(pairs_min)
-    mu = max(rate * minutes * opp_mult, 0.05)
+    minutes = float(np.clip(minutes + extra_min, 1.0, MIN_CAP + 2.0)) if extra_min else minutes
+    mu = max(rate * minutes * opp_mult * usage_mult, 0.05)
     cvs = [(w, c) for w, c in ((float(n), _cv(cur_x)), (r0, _cv(pri_x[-40:]))) if c is not None and w > 0]
     cv = sum(w * c for w, c in cvs) / sum(w for w, _ in cvs) if cvs else DEFAULT_CV
     cv = max(cv, 0.15)
     sigma = max(0.5, cv * mu) * float(np.sqrt(1.0 + 1.0 / (n + r0)))
     return Projection(mu=mu, sigma=sigma, minutes=minutes, n_current=n, n_prior=len(pri_x), opp_mult=opp_mult,
-                      share_rate=r0 / (n + r0) if n + r0 > 0 else 0.0, share_min=m0 / (n + m0) if n + m0 > 0 else 0.0)
+                      share_rate=r0 / (n + r0) if n + r0 > 0 else 0.0, share_min=m0 / (n + m0) if n + m0 > 0 else 0.0,
+                      usage_mult=usage_mult, extra_min=extra_min)
 
 
 def simulate(mu: float, sigma: float, count_stat: bool, n_sims: int = N_SIMS, seed: int = 42) -> np.ndarray:
@@ -870,8 +1198,10 @@ def run_automated_context_filters(proj_minutes: float, raw_avg: float, b2b_statu
 def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_odds: float, under_odds: float,
                       opponent: Optional[str] = None, game_date: Optional[date] = None,
                       b2b_effects: Optional[Dict[str, Dict[str, float]]] = None,
-                      prior_weights: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
+                      prior_weights: Optional[Tuple[float, float]] = None,
+                      adj_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     try:
+        cfg = {**DEFAULT_ADJ, **(adj_cfg or {})}
         for o in (over_odds, under_odds):
             if abs(float(o)) < 100:
                 return {"error": f"Odds {o:g} aren't valid American odds (must be <= -100 or >= +100)."}
@@ -892,6 +1222,16 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                 opp_mult, opp_note = opp_multiplier(opponent, stat_col, load_team_scoring())
             except Exception as e:
                 opp_note = f"Opponent data unavailable ({e}); no adjustment applied."
+        opp_detail: Optional[Dict[str, Any]] = None
+        if opponent and cfg["opp_stat"]:
+            try:
+                opp_detail = opp_stat_detail(opponent, stat_col, load_opp_allowed(), cur)
+                if opp_detail:
+                    opp_detail["mult_old"] = opp_mult
+                    opp_mult = float(np.clip(opp_mult ** (1.0 - OPP_BLEND) * opp_detail["mult"] ** OPP_BLEND, 0.88, 1.12))
+                    opp_detail["mult_final"] = opp_mult
+            except Exception as e:
+                opp_note = f"{opp_note or ''} Stat-specific matchup data unavailable ({e}).".strip()
         b2b_state, b2b_mult, b2b_note = "unknown", 1.0, None
         game_day = game_date or _today_et()
         if opponent:
@@ -908,9 +1248,16 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_state = own_b2b_status(prev_date, game_day)
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
+        inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None}
+        if cfg["injuries"]:
+            try:
+                inj_out = injury_adjustment(player_name, stat_col, cur, cfg, tuple(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)), len(pri) > 0)
+            except Exception as e:
+                inj_out["notes"].append(f"Injury adjustment unavailable ({e}); none applied.")
         proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
                                 pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult,
-                                *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)))
+                                *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)),
+                                extra_min=inj_out["minutes_extra"], usage_mult=inj_out["usage_mult"])
         sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
@@ -952,6 +1299,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             warnings.append("No prior-season games found; no shrinkage applied.")
         if opp_note:
             warnings.append(opp_note)
+        warnings.extend(inj_out["notes"])
         if b2b_note:
             warnings.append(b2b_note)
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
@@ -968,6 +1316,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
+            "injury": inj_out, "opp_detail": opp_detail,
             "b2b": {"status": b2b_state, "mult": b2b_mult, "opponent": opponent or "", "game_date": game_day.isoformat()},
             "gamelog_details": [
                 {"stat_value": float(v), "season": s, "x_label": f"{d}<br>{o}"}
@@ -1247,6 +1596,39 @@ def render_automated_checks(res: Dict[str, Any]) -> None:
         st.caption("💡 *Note: High-volume players are less exposed to single-game variance. Back-to-back effects are estimated in the B2B Backtest tab.*")
 
 
+def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
+    """Stat-specific opponent matchup and injury/usage adjustment panels."""
+    od = res.get("opp_detail")
+    if od:
+        st.markdown("#### 🎯 Opponent vs this stat")
+        m = st.columns(4)
+        _metric(m[0], f"{od['abbr']} RANK ({stat_category.upper()})", f"#{od['rank']} of {od['n_teams']}", "good" if od["rank"] <= 10 else "bad" if od["rank"] > od["n_teams"] - 10 else "neutral")
+        _metric(m[1], "ALLOWED VS NORMAL", f"{(od['factor'] - 1) * 100:+.1f}%", _tone(od["factor"] - 1))
+        _metric(m[2], "STAT MULT / OLD INDEX", f"x{od['mult']:.3f} / x{od['mult_old']:.3f}")
+        _metric(m[3], "OPP MULT USED", f"x{od['mult_final']:.3f}", _tone(od["mult_final"] - 1))
+        bits = []
+        if od["soft_avg"] is not None:
+            bits.append(f"vs the 10 softest defenses: {od['soft_avg']:.1f} ({od['soft_n']} g)")
+        if od["tough_avg"] is not None:
+            bits.append(f"vs the 10 toughest: {od['tough_avg']:.1f} ({od['tough_n']} g)")
+        st.caption(f"Rank 1 = allows the most of this stat relative to each opposing player's own average ({od['games']} games of data, shrunk toward 1.00). "
+                   + (" · ".join(bits) + ". Splits are context only: tiny samples." if bits else ""))
+    inj = res.get("injury") or {}
+    if inj.get("usg") is not None:
+        st.markdown("#### 🩺 Injuries & usage")
+        n = st.columns(4)
+        _metric(n[0], "PLAYER USG%", f"{inj['usg']:.1f}%")
+        _metric(n[1], "USAGE ADJ", f"x{inj['usage_mult']:.3f}", _tone(inj["usage_mult"] - 1))
+        _metric(n[2], "MINUTES SHIFT", f"{inj['minutes_extra']:+.1f}", _tone(inj["minutes_extra"]))
+        _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
+        if inj["table"]:
+            st.dataframe(pd.DataFrame(inj["table"]), use_container_width=True, hide_index=True)
+            st.caption("Weight = P(misses tonight) minus the share of his recent games already missed (so a long-term absence is not double counted, "
+                       "and a returning teammate pulls usage back down). Effects are the stat/minutes change for this player.")
+        else:
+            st.caption("No injured or returning rotation teammates detected for this team. Add names in the injury settings if the feed is stale.")
+
+
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     stat_category, line_val = ctx["stat"], ctx["line"]
     photo_col, title_col = st.columns([1, 6])
@@ -1282,6 +1664,7 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
         st.caption(f"{ts['push']} of {ts['n']} games this season landed exactly on the line (pushes).")
     if res["days_rest"] is not None:
         st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
+    render_matchup_injury(res, stat_category)
     for w in res["warnings"]:
         st.caption(f"⚠️ {w}")
     st.markdown("---")
@@ -1498,7 +1881,8 @@ def main() -> None:
     ss = st.session_state
     api_key = _secret("ODDS_API_KEY")
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
-                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et())):
+                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et()),
+                         ("adj_inj", True), ("adj_opp", True), ("adj_absorb", 1.0), ("adj_out", ""), ("adj_q", ""), ("adj_in", "")):
         ss.setdefault(key, default)
     if "b2b_effects" not in ss:
         ss["b2b_effects"] = load_effects_file()
@@ -1560,6 +1944,14 @@ def main() -> None:
             st.caption("Weight w means last season counts like w extra games next to this season's n games, so its share is w / (n + w). "
                        "0 = trust this season only. Rates are stable year to year (higher weight); minutes and roles change more (lower). "
                        "Press Evaluate to apply. Use the B2B Backtest tab to estimate these from data.")
+        with st.expander("🩺 Injuries, usage & matchup settings", expanded=False):
+            st.checkbox("Adjust for injured / returning teammates (usage + minutes redistribution)", key="adj_inj")
+            st.checkbox("Stat-specific opponent factors (loads league logs: about 30-60s the first time, then cached)", key="adj_opp")
+            st.slider("Usage absorption strength (scales how much of an absent player's production teammates pick up)", 0.5, 1.0, key="adj_absorb", step=0.05)
+            st.text_input("Teammates OUT (comma-separated; adds to the ESPN feed)", key="adj_out")
+            st.text_input("Teammates QUESTIONABLE (counted as 50%)", key="adj_q")
+            st.text_input("Teammates ACTIVE (overrides a stale injury feed)", key="adj_in")
+            st.caption("The feed comes from ESPN and can lag, so check the team's report near tip-off. Press Evaluate to apply.")
         opp_opts = _opp_options(ss["board_teams"])
         with st.form("nba_form"):
             c1, c2, c3 = st.columns([2, 1, 1])
@@ -1577,7 +1969,10 @@ def main() -> None:
             ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent, game_date=game_day)
             res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds,
                                     None if opponent == "None" else opponent, game_day, ss.get("b2b_effects"),
-                                    (float(ss["n0_rate"]), float(ss["n0_min"])))
+                                    (float(ss["n0_rate"]), float(ss["n0_min"])),
+                                    {"injuries": ss["adj_inj"], "opp_stat": ss["adj_opp"], "absorb_scale": float(ss["adj_absorb"]),
+                                     "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
+                                     "manual_in": _split_names(ss["adj_in"])})
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
             else:
@@ -1597,7 +1992,8 @@ def main() -> None:
                 "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
                 "- **Distribution**: Normal for points, PRA and the points/rebounds/assists combos; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
                 "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
-                "- **Opponent**: points-allowed (points, PRA, any combo with points) or scoring-pace (other stats) index from ESPN results, shrunk by games played, capped ±10%. It is a proxy, not true positional defense.\n"
+                "- **Opponent**: geometric mean of (a) the points-allowed / scoring-pace index and (b) a stat-specific factor: what the opponent allows rotation players relative to their own averages, shrunk by games played (G / (G + 12)), capped ±12%. Not true positional defense.\n"
+                "- **Injuries & usage**: injured teammates' minutes and production are redistributed to the rest of the rotation (headroom-weighted minutes; usage-weighted points, production-weighted other stats), net of what the player's recent games already reflect, so returning teammates pull usage back down. Absorption rates are assumptions to calibrate.\n"
                 "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
                 "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
                 "If the line moved, LINE MOVE shows how far (positive = in your favor)."
