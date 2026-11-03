@@ -770,7 +770,7 @@ def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataF
 #   5. Net effect of j on the evaluated player i: (q_j - f_j) * D_j, where q_j = P(j misses tonight) and f_j = the share
 #      of i's baseline built from games j missed. f_j removes double counting (a star who already missed all of this
 #      season is partly baked into the baseline) and makes a RETURNING teammate pull usage back down.
-#   USG% = 100 * (FGA + 0.44*FTA + TOV) * 240 / (MIN * team possessions used)
+#   USG% = 100 * (FGA + 0.44*FTA + TOV) * 48 / (MIN * team possessions used per game)   [48 = TeamMIN/5]
 # --------------------------------------------------------------------------------------
 INJURY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 USAGE_STATS: List[str] = ["POINTS", "REBOUNDS", "ASSISTS", "3-POINTERS MADE", "STEALS", "BLOCKS"]
@@ -804,26 +804,85 @@ def _status_to_p_out(status: str, text: str) -> float:
     return 0.0
 
 
+def _athlete_id(ath: Dict[str, Any]) -> str:
+    """Athlete id from an ESPN record (id, uid, $ref or link), '' if none."""
+    v = ath.get("id")
+    if v and str(v).isdigit():
+        return str(v)
+    links = " ".join(str(l.get("href", "")) for l in ath.get("links", []) if isinstance(l, dict))
+    blob = " ".join(str(ath.get(k, "")) for k in ("uid", "guid", "$ref")) + " " + links
+    m = re.search(r"~a:(\d+)", blob) or re.search(r"/athletes/(\d+)", blob) or re.search(r"/id/(\d+)", blob)
+    return m.group(1) if m else ""
+
+
+def _status_text(v: Any) -> str:
+    """Status field may be a string or a dict with name/description."""
+    if isinstance(v, dict):
+        return str(v.get("description") or v.get("name") or v.get("type") or "")
+    return str(v or "")
+
+
+INJ_COLS = ["PID", "NAME", "STATUS", "P_OUT"]
+
+
+def _parse_league_injuries(data: Any) -> pd.DataFrame:
+    """Any dict that has an 'athlete' and a 'status' is one injury entry (structure-agnostic)."""
+    rows: List[Dict[str, Any]] = []
+    for d in _walk_json(data):
+        ath = d.get("athlete")
+        if not isinstance(ath, dict) or "status" not in d:
+            continue
+        pid = _athlete_id(ath)
+        name = str(ath.get("displayName") or ath.get("fullName") or ath.get("shortName") or "")
+        if not pid and not name:
+            continue
+        typ = d.get("type") if isinstance(d.get("type"), dict) else {}
+        status = _status_text(d.get("status")).strip() or _status_text(typ).strip()
+        text = f"{_status_text(typ)} {d.get('shortComment', '')} {d.get('longComment', '')}"
+        rows.append({"PID": pid, "NAME": name, "STATUS": status, "P_OUT": _status_to_p_out(status, text)})
+    return pd.DataFrame(rows, columns=INJ_COLS)
+
+
+def _parse_roster_injuries(data: Any) -> pd.DataFrame:
+    """Athlete records on a team roster carry their own 'injuries' list."""
+    rows: List[Dict[str, Any]] = []
+    for d in _walk_json(data):
+        inj = d.get("injuries")
+        if not isinstance(inj, list) or not inj or not isinstance(inj[0], dict):
+            continue
+        pid = _athlete_id(d)
+        name = str(d.get("fullName") or d.get("displayName") or "")
+        if not pid and not name:
+            continue
+        first = inj[0]
+        typ = first.get("type") if isinstance(first.get("type"), dict) else {}
+        status = _status_text(first.get("status")).strip() or _status_text(typ).strip()
+        text = f"{_status_text(typ)} {first.get('shortComment', '')} {first.get('longComment', '')}"
+        rows.append({"PID": pid, "NAME": name, "STATUS": status, "P_OUT": _status_to_p_out(status, text)})
+    return pd.DataFrame(rows, columns=INJ_COLS)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def load_injuries() -> pd.DataFrame:
-    """ESPN NBA injury report as PID, NAME, STATUS, P_OUT (empty frame if unavailable)."""
-    cols = ["PID", "NAME", "STATUS", "P_OUT"]
+def load_injuries() -> Tuple[pd.DataFrame, bool]:
+    """League-wide ESPN injury report and whether the request succeeded."""
     try:
         resp = requests.get(INJURY_URL, headers=ESPN_HEADERS, timeout=10)
         resp.raise_for_status()
-        rows: List[Dict[str, Any]] = []
-        for team in resp.json().get("injuries", []):
-            for inj in team.get("injuries", []):
-                ath = inj.get("athlete", {}) or {}
-                pid, name = str(ath.get("id", "")), ath.get("displayName") or ath.get("fullName")
-                if not pid or not name:
-                    continue
-                status = str(inj.get("status", ""))
-                text = f"{inj.get('shortComment', '')} {inj.get('longComment', '')}"
-                rows.append({"PID": pid, "NAME": str(name), "STATUS": status, "P_OUT": _status_to_p_out(status, text)})
-        return pd.DataFrame(rows, columns=cols)
+        df = _parse_league_injuries(resp.json())
+        return df, bool(len(df))          # a league-wide report is never empty in season; empty means the parse failed
     except Exception:
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=INJ_COLS), False
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_team_injuries(tid: str) -> Tuple[pd.DataFrame, bool]:
+    """Injuries attached to a team's roster entries (second, independent source) and whether the request succeeded."""
+    try:
+        resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=10)
+        resp.raise_for_status()
+        return _parse_roster_injuries(resp.json()), True
+    except Exception:
+        return pd.DataFrame(columns=INJ_COLS), False
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -905,7 +964,7 @@ def load_team_profile(tid: str) -> pd.DataFrame:
     if prof.empty:
         return prof
     team_poss = float((prof["R_POSS"] * prof["MIN"]).sum())
-    prof["USG"] = 100.0 * prof["R_POSS"] * 240.0 / max(team_poss, 1e-9)
+    prof["USG"] = 100.0 * prof["R_POSS"] * 48.0 / max(team_poss, 1e-9)
     return prof
 
 
@@ -928,25 +987,37 @@ def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, 
     return dM, np.minimum(dR, MAX_CELL_LIFT)
 
 
-def absent_fractions(cur_dates: np.ndarray, player_dates: List[Tuple[str, ...]], weights: np.ndarray) -> np.ndarray:
-    """Per teammate: EWMA-weighted share of the evaluated player's recent games that the teammate missed."""
+def presence_matrix(cur_dates: np.ndarray, player_dates: List[Tuple[str, ...]]) -> np.ndarray:
+    """(K, n) bool: did teammate k play on each of the evaluated player's recent game dates?"""
     K = len(player_dates)
-    if len(cur_dates) == 0 or K == 0:
-        return np.zeros(K)
-    idx = np.repeat(np.arange(K), [len(d) for d in player_dates])
-    dts = np.concatenate([np.asarray(d, dtype=object) for d in player_dates]) if idx.size else np.array([], dtype=object)
     present = np.zeros((K, len(cur_dates)), dtype=bool)
-    if idx.size:
-        col = {d: c for c, d in enumerate(cur_dates)}
-        hit = np.fromiter((x in col for x in dts), dtype=bool, count=len(dts))
-        present[idx[hit], np.fromiter((col[x] for x in dts[hit]), dtype=int, count=int(hit.sum()))] = True
-    return ((~present) * weights[None, :]).sum(1)
+    if len(cur_dates) == 0 or K == 0:
+        return present
+    idx = np.repeat(np.arange(K), [len(d) for d in player_dates])
+    if idx.size == 0:
+        return present
+    dts = np.concatenate([np.asarray(d, dtype=object) for d in player_dates])
+    col = {d: c for c, d in enumerate(cur_dates)}
+    hit = np.fromiter((x in col for x in dts), dtype=bool, count=len(dts))
+    present[idx[hit], np.fromiter((col[x] for x in dts[hit]), dtype=int, count=int(hit.sum()))] = True
+    return present
+
+
+def absent_fractions(present: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Per teammate: EWMA-weighted share of the evaluated player's recent games the teammate missed."""
+    return ((~present) * weights[None, :]).sum(1) if present.shape[1] else np.zeros(present.shape[0])
+
+
+def missed_streak(present: np.ndarray) -> np.ndarray:
+    """Per teammate: number of consecutive most-recent games missed."""
+    return np.cumprod((~present)[:, ::-1], axis=1).sum(1) if present.shape[1] else np.zeros(present.shape[0], dtype=int)
 
 
 def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: Dict[str, Any],
                       n0: Tuple[float, float], has_prior: bool) -> Dict[str, Any]:
     """Minutes shift + usage multiplier for the evaluated player from injured / returning teammates."""
-    out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None}
+    out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None,
+                           "listed": [], "feed_ok": True}
     pid = cached_player_id(player_name)
     if not pid:
         out["notes"].append("Injury adjustment skipped: could not resolve the player on ESPN.")
@@ -962,16 +1033,36 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     i = int(np.flatnonzero(prof["PID"].to_numpy() == pid)[0])
     K = len(prof)
     out["team"] = next((nm for t, nm in load_team_meta() if t == tid), None)
-    inj = load_injuries()
-    p_by_pid = dict(zip(inj["PID"], inj["P_OUT"])) if not inj.empty else {}
-    s_by_pid = dict(zip(inj["PID"], inj["STATUS"])) if not inj.empty else {}
-    q = np.array([float(p_by_pid.get(p, 0.0)) for p in prof["PID"]])
-    status = [str(s_by_pid.get(p, "")) for p in prof["PID"]]
+
+    # injury report: league feed + the team's roster entries, matched by athlete id or cleaned name
+    league, ok1 = load_injuries()
+    roster_inj, ok2 = load_team_injuries(tid)
+    out["feed_ok"] = feed_ok = bool(ok1 or (ok2 and not roster_inj.empty))
+    feed = pd.concat([league, roster_inj], ignore_index=True)
     names = prof["NAME"].map(_clean_name)
+    q, status, listed = np.zeros(K), [""] * K, np.zeros(K, dtype=bool)
+    if not feed.empty:
+        feed = feed.assign(KEY=feed["NAME"].map(_clean_name)).sort_values("P_OUT", ascending=False)
+        by_pid = feed[feed["PID"] != ""].drop_duplicates("PID").set_index("PID")
+        by_key = feed[feed["KEY"] != ""].drop_duplicates("KEY").set_index("KEY")
+        p1 = prof["PID"].map(by_pid["P_OUT"]).fillna(-1.0).to_numpy(float)
+        p2 = names.map(by_key["P_OUT"]).fillna(-1.0).to_numpy(float)
+        listed = (p1 >= 0) | (p2 >= 0)
+        q = np.maximum(np.maximum(p1, p2), 0.0)
+        status = [a or b for a, b in zip(prof["PID"].map(by_pid["STATUS"]).fillna(""), names.map(by_key["STATUS"]).fillna(""))]
     for key, val, tag in (("manual_q", 0.5, "QUESTIONABLE (manual)"), ("manual_out", 1.0, "OUT (manual)"), ("manual_in", 0.0, "ACTIVE (manual)")):
         hit = names.isin({_clean_name(x) for x in cfg.get(key, [])}).to_numpy()
-        q = np.where(hit, val, q)
+        q, listed = np.where(hit, val, q), listed | hit
         status = [tag if h else s for h, s in zip(hit, status)]
+
+    n = len(cur)
+    present = presence_matrix(cur["DATE"].to_numpy(dtype=object), list(prof["DATES"]))
+    inferred = np.zeros(K, dtype=bool)
+    if not feed_ok:                       # no injury data at all: assume long absences continue
+        inferred = (missed_streak(present) >= 3) & ~listed
+        q = np.where(inferred, 0.75, q)
+        out["notes"].append("Injury feed unavailable: teammates who missed the last 3+ games are counted 75% likely out. "
+                            "Add names in the injury settings to override.")
     if q[i] > 0:
         out["notes"].append(f"ESPN lists {player_name} as {status[i] or 'injured'}; the projection assumes he plays.")
     q[i] = 0.0
@@ -983,15 +1074,16 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     absorb = np.minimum(np.array([ABSORB[s] for s in USAGE_STATS]) * float(cfg.get("absorb_scale", 1.0)), 1.0)
     dM, dR = absence_effects(M, R, W, a, absorb)
 
-    n = len(cur)
     w = ewma_weights(n) if n else np.array([])
-    f_core = absent_fractions(cur["DATE"].to_numpy(dtype=object), list(prof["DATES"]), w)
+    f_core = absent_fractions(present, w)
     r0, m0 = (n0[0] if has_prior else 0.0), (n0[1] if has_prior else 0.0)
     f_rate, f_min = f_core * n / max(n + r0, 1e-9), f_core * n / max(n + m0, 1e-9)
     rot = (M >= ROTATION_MIN).astype(float)
     rot[i] = 0.0
     net_rate, net_min = (q - f_rate) * rot, (q - f_min) * rot
 
+    out["listed"] = [{"name": str(prof.loc[j, "NAME"]), "status": status[j] or "listed", "p_out": float(q[j])}
+                     for j in np.flatnonzero(listed) if j != i]
     parts = COMBO_PARTS.get(stat_col, [stat_col])
     pidx = [USAGE_STATS.index(s) for s in parts if s in USAGE_STATS]
     if not pidx:
@@ -1004,7 +1096,12 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
                usg=float(prof.loc[i, "USG"]))
     show = np.flatnonzero((np.abs(net_rate) > 0.02) | (np.abs(net_min) > 0.02))
     for j in show[np.argsort(-np.abs(net_rate[show] * per_j[show]))]:
-        label = ("OUT" if q[j] >= 0.99 else f"{q[j]:.0%} to miss" if q[j] > 0 else "Active (missed recent games)")
+        if q[j] >= 0.99:
+            label = "OUT"
+        elif q[j] > 0:
+            label = f"{q[j]:.0%} to miss" + (" (inferred)" if inferred[j] else "")
+        else:
+            label = "Not listed: treated as returning (missed recent games)"
         out["table"].append({"Teammate": prof.loc[j, "NAME"], "Status": label,
                              "USG%": round(float(prof.loc[j, "USG"]), 1), "MPG": round(float(M[j]), 1),
                              "Recent games missed": f"{f_core[j]:.0%}",
@@ -1248,7 +1345,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_state = own_b2b_status(prev_date, game_day)
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
-        inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None}
+        inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None,
+                                   "listed": [], "feed_ok": True}
         if cfg["injuries"]:
             try:
                 inj_out = injury_adjustment(player_name, stat_col, cur, cfg, tuple(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)), len(pri) > 0)
@@ -1621,12 +1719,17 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
         _metric(n[1], "USAGE ADJ", f"x{inj['usage_mult']:.3f}", _tone(inj["usage_mult"] - 1))
         _metric(n[2], "MINUTES SHIFT", f"{inj['minutes_extra']:+.1f}", _tone(inj["minutes_extra"]))
         _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
+        if inj.get("listed"):
+            st.caption("🩺 Injury report for " + str(inj.get("team") or "this team") + ": " + " · ".join(
+                f"{x['name']} ({x['status']})" for x in inj["listed"]))
+        elif inj.get("feed_ok", True):
+            st.caption("🩺 The injury feed lists no teammates for this team.")
         if inj["table"]:
             st.dataframe(pd.DataFrame(inj["table"]), use_container_width=True, hide_index=True)
             st.caption("Weight = P(misses tonight) minus the share of his recent games already missed (so a long-term absence is not double counted, "
                        "and a returning teammate pulls usage back down). Effects are the stat/minutes change for this player.")
         else:
-            st.caption("No injured or returning rotation teammates detected for this team. Add names in the injury settings if the feed is stale.")
+            st.caption("No injured or returning rotation teammates move this projection. Add names in the injury settings if the feed is stale.")
 
 
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
