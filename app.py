@@ -1,4 +1,4 @@
-"""NBA Prop Evaluator: Standalone App with 6-Point Sharp Assessment Framework."""
+"""NBA Prop Evaluator: Standalone App with Robust Odds Parsing & Python 3.9+ Compatibility."""
 import json
 import os
 import re
@@ -21,6 +21,10 @@ except ImportError:  # pragma: no cover
 
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
+
+from six_point import (
+    BLOWOUT_SPREAD, RECENT_GAMES, compute_opp_allowed_recent, extract_spread, score_prop,
+)
 
 st.set_page_config(
     page_title="NBA Prop Evaluator",
@@ -74,7 +78,7 @@ ODDS_API_MARKETS: Dict[str, str] = {
     "Steals": "player_steals", "Blocks": "player_blocks",
     "Pts + Ast": "player_points_assists", "Pts + Reb": "player_points_rebounds", "Reb + Ast": "player_rebounds_assists",
 }
-CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST", "PTS + AST", "PTS + REB", "REB + AST"}
+CONTINUOUS_STATS = {"POINTS", "PTS + REB + AST", "PTS + AST", "PTS + REB", "REB + AST"}  # Normal; everything else is a low count -> NegBin/Poisson
 STAT_OPP: Dict[str, Tuple[float, str]] = {
     "POINTS": (0.5, "def"), "PTS + REB + AST": (0.3, "def"), "REBOUNDS": (0.3, "pace"),
     "ASSISTS": (0.3, "pace"), "3-POINTERS MADE": (0.3, "pace"), "STEALS": (0.3, "pace"), "BLOCKS": (0.3, "pace"),
@@ -98,6 +102,8 @@ B2B_OWN_EFFECT: Dict[str, float] = {
 BT_STATS: List[str] = list(B2B_OPP_BOOST.keys()) + ["MINUTES"]
 BT_TAU = 0.02
 EFFECTS_PATH = "b2b_effects.json"
+# Last-season weight, in pseudo-games. Per-minute production is stable year to year (high weight); minutes and roles
+# change more (lower weight). Defaults are informed assumptions: run the Backtest tab to estimate them from data.
 N_PRIOR_RATE = 12.0
 N_PRIOR_MIN = 6.0
 PRIOR_GRID: List[float] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 80]
@@ -111,6 +117,7 @@ KELLY_FRACTION, KELLY_CAP = 0.25, 0.05
 
 
 def _secret(name: str) -> str:
+    """Read a secret from Streamlit secrets, falling back to environment variables."""
     try:
         if name in st.secrets:
             return str(st.secrets[name]).strip()
@@ -120,6 +127,7 @@ def _secret(name: str) -> str:
 
 
 def parse_val(v: Any) -> float:
+    """Best-effort float parse (handles '-', None, '3/8', thousands separators)."""
     try:
         s = str(v).strip()
         if not s or s in ["-", "None", "null", "--"]:
@@ -132,6 +140,7 @@ def parse_val(v: Any) -> float:
 
 
 def _to_et_date(iso: str) -> Optional[date]:
+    """Parse an ISO timestamp into its US Eastern calendar date."""
     try:
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
         if dt.tzinfo is None:
@@ -143,6 +152,7 @@ def _to_et_date(iso: str) -> Optional[date]:
 
 
 def _iso_to_date(s: Any) -> Optional[date]:
+    """'YYYY-MM-DD' -> date, or None if blank/invalid."""
     try:
         return date.fromisoformat(str(s))
     except ValueError:
@@ -150,6 +160,7 @@ def _iso_to_date(s: Any) -> Optional[date]:
 
 
 def _clean_name(name: str) -> str:
+    """Normalize a player name for matching."""
     s = re.sub(r"[^\w\s]", "", str(name).lower())
     s = re.sub(r"\b(jr|sr|ii|iii|iv|v)\b", "", s)
     return " ".join(s.split())
@@ -199,6 +210,21 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching prop board: {e}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_game_spread(event_id: str, api_key: str) -> Tuple[Optional[float], Optional[str]]:
+    """Absolute DraftKings point spread for one game (costs 1 Odds API credit, cached 5 min)."""
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+    params = {"apiKey": api_key, "regions": "us", "markets": "spreads", "bookmakers": "draftkings", "oddsFormat": "american"}
+    try:
+        resp = requests.get(url, params=params, timeout=8)
+        if resp.status_code != 200:
+            return None, f"Spread unavailable (Odds API {resp.status_code})."
+        spread = extract_spread(resp.json())
+        return spread, (None if spread is not None else "No DraftKings spread posted for this game yet.")
+    except Exception as e:
+        return None, f"Spread unavailable ({e})."
 
 
 def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
@@ -277,6 +303,7 @@ def _espn_find_player_id(name: str) -> Optional[str]:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def player_headshot_url(name: str) -> Optional[str]:
+    """ESPN headshot URL for an NBA player (checked to exist), or None if not found."""
     try:
         pid = _espn_find_player_id(name)
         if not pid:
@@ -294,6 +321,7 @@ def _split_made(v: Any) -> float:
 
 
 def _split_att(v: Any) -> float:
+    """'9-18' -> 18 (attempts)."""
     s = str(v).strip()
     return parse_val(s.split("-")[1]) if "-" in s else 0.0
 
@@ -496,7 +524,7 @@ def opp_multiplier(team: str, stat_col: str, scoring: pd.DataFrame) -> Tuple[flo
 
 
 # --------------------------------------------------------------------------------------
-# Back-to-back & Injuries
+# Back-to-back: own-team detection + historical backtest
 # --------------------------------------------------------------------------------------
 TEAM_ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{tid}/roster"
 
@@ -596,13 +624,14 @@ def effects_from_table(table: pd.DataFrame) -> Dict[str, Dict[str, float]]:
 
 
 def _early_season_arrays(frame: pd.DataFrame, stat_col: str) -> Optional[Tuple[np.ndarray, ...]]:
+    """Player-seasons with a prior season: first EARLY_GAMES games as padded (P, G) arrays plus prior-season summaries."""
     f = frame[["PID", "SEASON", f"X_{stat_col}", "X_MINUTES"]].rename(columns={f"X_{stat_col}": "X", "X_MINUTES": "M"}).copy()
     g = f.groupby(["PID", "SEASON"])
     f["G"], f["REV"] = g.cumcount(), g.cumcount(ascending=False)
     prior = pd.DataFrame({"X_SUM": g["X"].sum(), "M_SUM": g["M"].sum(), "X_MEAN": g["X"].mean()})
     prior["M20"] = f[f["REV"] < 20].groupby(["PID", "SEASON"])["M"].mean()
     prior = prior.reset_index()
-    prior["SEASON"] = prior["SEASON"] + 1
+    prior["SEASON"] = prior["SEASON"] + 1                      # last season's summary, keyed to the season it predicts
     cur = f[f["G"] < EARLY_GAMES].merge(prior, on=["PID", "SEASON"], how="inner")
     cur = cur[(cur["X_MEAN"] > 0) & (cur["M20"] > 0) & (cur["M_SUM"] > 0)]
     if cur["PID"].nunique() < 15:
@@ -616,6 +645,11 @@ def _early_season_arrays(frame: pd.DataFrame, stat_col: str) -> Optional[Tuple[n
 
 def _prior_loss_curves(X: np.ndarray, M: np.ndarray, rate0: np.ndarray, min0: np.ndarray, pm: np.ndarray,
                        grid: List[float]) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Out-of-sample squared error of the model's one-game-ahead prediction for each prior weight n0 on the grid.
+    rate_hat = (n*EWMA_rate + n0*last_season_rate)/(n + n0) scored as (stat - rate_hat*minutes)/last_season_mean;
+    min_hat is the same blend for minutes scored as (minutes - min_hat)/last_season_minutes.
+    """
     n0 = np.asarray(grid, float)[:, None]
     rate_sse, min_sse, cnt = np.zeros(len(grid)), np.zeros(len(grid)), 0
     for g in range(X.shape[1]):
@@ -640,6 +674,11 @@ def _prior_loss_curves(X: np.ndarray, M: np.ndarray, rate0: np.ndarray, min0: np
 
 
 def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = None) -> pd.DataFrame:
+    """
+    Data-driven last-season weight: for the first EARLY_GAMES games of each season, find the n0 that minimizes
+    one-game-ahead prediction error (per stat for the per-minute rate, plus minutes). N0_RANGE = every grid value
+    within 1% of the best loss (how flat the optimum is).
+    """
     grid = list(PRIOR_GRID if grid is None else grid)
     rows: List[Dict[str, Any]] = []
     min_curve: Optional[np.ndarray] = None
@@ -666,6 +705,7 @@ def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = No
 
 
 def load_prior_file() -> Optional[Dict[str, float]]:
+    """Saved last-season weights (best effort; ephemeral on Streamlit Cloud)."""
     try:
         if os.path.exists(PRIOR_PATH):
             with open(PRIOR_PATH) as fh:
@@ -676,6 +716,7 @@ def load_prior_file() -> Optional[Dict[str, float]]:
 
 
 def save_prior_file(weights: Optional[Dict[str, float]]) -> None:
+    """Persist (or clear) the last-season weights."""
     try:
         if weights is None:
             if os.path.exists(PRIOR_PATH):
@@ -737,11 +778,22 @@ def load_backtest_dataset(n_per_team: int, seasons: Tuple[int, ...]) -> pd.DataF
 
 
 # --------------------------------------------------------------------------------------
-# Injury Engine
+# Injuries + usage redistribution, and stat-specific opponent factors
+#
+# Math (every constant below is a named assumption you can tune):
+#   Absent player j frees M_j minutes and X_j = rate_j * M_j of a stat per game.
+#   1. Minutes: receiver k gets dM[j,k] = M_j * omega_k, omega_k ~ a_k * M_k * max(40 - M_k, 4)  (headroom-weighted)
+#   2. Stat that extra minutes do NOT already cover: E_j = max(X_j - sum_k rate_k * dM[j,k], 0)
+#   3. Absorbed: dX[j,k] = alpha_s * E_j * share_k; share_k ~ a_k * usage possessions (points) or own production (others)
+#   4. Rate lift for k: dR[j,k] = dX[j,k] / (rate_k * (M_k + dM[j,k]))
+#   5. Net effect of j on the evaluated player i: (q_j - f_j) * D_j, where q_j = P(j misses tonight) and f_j = the share
+#      of i's baseline built from games j missed. f_j removes double counting (a star who already missed all of this
+#      season is partly baked into the baseline) and makes a RETURNING teammate pull usage back down.
+#   USG% = 100 * (FGA + 0.44*FTA + TOV) * 48 / (MIN * team possessions used per game)   [48 = TeamMIN/5]
 # --------------------------------------------------------------------------------------
 INJURY_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 USAGE_STATS: List[str] = ["POINTS", "REBOUNDS", "ASSISTS", "3-POINTERS MADE", "STEALS", "BLOCKS"]
-USAGE_BASED = {"POINTS"}
+USAGE_BASED = {"POINTS"}            # absorption shares follow usage possessions; other stats follow own production
 ABSORB: Dict[str, float] = {"POINTS": 0.85, "REBOUNDS": 0.90, "ASSISTS": 0.75, "3-POINTERS MADE": 0.75,
                             "STEALS": 0.50, "BLOCKS": 0.50}
 COMBO_PARTS: Dict[str, List[str]] = {
@@ -758,6 +810,7 @@ DEFAULT_ADJ: Dict[str, Any] = {"injuries": True, "opp_stat": True, "absorb_scale
 
 
 def _status_to_p_out(status: str, text: str) -> float:
+    """Probability a listed player misses the game, from the ESPN status/comment text."""
     s, t = status.lower(), text.lower()
     if "out" in s or "suspend" in s:
         return 1.0
@@ -771,6 +824,7 @@ def _status_to_p_out(status: str, text: str) -> float:
 
 
 def _athlete_id(ath: Dict[str, Any]) -> str:
+    """Athlete id from an ESPN record (id, uid, $ref or link), '' if none."""
     v = ath.get("id")
     if v and str(v).isdigit():
         return str(v)
@@ -781,6 +835,7 @@ def _athlete_id(ath: Dict[str, Any]) -> str:
 
 
 def _status_text(v: Any) -> str:
+    """Status field may be a string or a dict with name/description."""
     if isinstance(v, dict):
         return str(v.get("description") or v.get("name") or v.get("type") or "")
     return str(v or "")
@@ -790,6 +845,7 @@ INJ_COLS = ["PID", "NAME", "STATUS", "P_OUT"]
 
 
 def _parse_league_injuries(data: Any) -> pd.DataFrame:
+    """Any dict that has an 'athlete' and a 'status' is one injury entry (structure-agnostic)."""
     rows: List[Dict[str, Any]] = []
     for d in _walk_json(data):
         ath = d.get("athlete")
@@ -807,6 +863,7 @@ def _parse_league_injuries(data: Any) -> pd.DataFrame:
 
 
 def _parse_roster_injuries(data: Any) -> pd.DataFrame:
+    """Athlete records on a team roster carry their own 'injuries' list."""
     rows: List[Dict[str, Any]] = []
     for d in _walk_json(data):
         inj = d.get("injuries")
@@ -826,17 +883,19 @@ def _parse_roster_injuries(data: Any) -> pd.DataFrame:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_injuries() -> Tuple[pd.DataFrame, bool]:
+    """League-wide ESPN injury report and whether the request succeeded."""
     try:
         resp = requests.get(INJURY_URL, headers=ESPN_HEADERS, timeout=10)
         resp.raise_for_status()
         df = _parse_league_injuries(resp.json())
-        return df, bool(len(df))
+        return df, bool(len(df))          # a league-wide report is never empty in season; empty means the parse failed
     except Exception:
         return pd.DataFrame(columns=INJ_COLS), False
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_team_injuries(tid: str) -> Tuple[pd.DataFrame, bool]:
+    """Injuries attached to a team's roster entries (second, independent source) and whether the request succeeded."""
     try:
         resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=10)
         resp.raise_for_status()
@@ -847,6 +906,7 @@ def load_team_injuries(tid: str) -> Tuple[pd.DataFrame, bool]:
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_all_rosters() -> Dict[str, List[Tuple[str, str]]]:
+    """Team id -> [(player id, name)] for all 30 teams."""
     meta = load_team_meta()
 
     def safe(tid: str) -> List[Tuple[str, str]]:
@@ -862,15 +922,18 @@ def load_all_rosters() -> Dict[str, List[Tuple[str, str]]]:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_player_id(name: str) -> Optional[str]:
+    """ESPN athlete id for a player name (cached)."""
     return _espn_find_player_id(name)
 
 
 def _blend(pairs: List[Tuple[float, float]]) -> float:
+    """Weighted mean of (weight, value) pairs."""
     w = sum(p[0] for p in pairs)
     return sum(p[0] * p[1] for p in pairs) / w if w > 0 else 0.0
 
 
 def profile_row(pid: str, name: str, logs: pd.DataFrame, n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN) -> Optional[Dict[str, Any]]:
+    """One roster player's blended (this season + shrunk last season) minutes, per-minute rates and games-played dates."""
     played = logs[pd.to_numeric(logs["MINUTES"], errors="coerce") > 0].copy()
     if played.empty:
         return None
@@ -903,6 +966,7 @@ def profile_row(pid: str, name: str, logs: pd.DataFrame, n0_rate: float = N_PRIO
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_team_profile(tid: str) -> pd.DataFrame:
+    """Rotation profile for every player on a team (blended minutes, per-minute rates, USG%)."""
     roster = _roster(tid)
 
     def fetch(item: Tuple[str, str]) -> Optional[pd.DataFrame]:
@@ -924,6 +988,10 @@ def load_team_profile(tid: str) -> pd.DataFrame:
 
 
 def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, absorb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For every candidate-absent player j (rows) and receiver k (cols):
+    dM[j,k] minutes shifted to k, dR[j,k,s] fractional per-minute rate lift for stat s. Shapes: M (K,), R (K,S), W (K,S), a (K,).
+    """
     K = len(M)
     off = 1.0 - np.eye(K)
     wmin = a * M * np.maximum(MIN_CAP - M, HEADROOM_FLOOR)
@@ -939,6 +1007,7 @@ def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, 
 
 
 def presence_matrix(cur_dates: np.ndarray, player_dates: List[Tuple[str, ...]]) -> np.ndarray:
+    """(K, n) bool: did teammate k play on each of the evaluated player's recent game dates?"""
     K = len(player_dates)
     present = np.zeros((K, len(cur_dates)), dtype=bool)
     if len(cur_dates) == 0 or K == 0:
@@ -954,17 +1023,20 @@ def presence_matrix(cur_dates: np.ndarray, player_dates: List[Tuple[str, ...]]) 
 
 
 def absent_fractions(present: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Per teammate: EWMA-weighted share of the evaluated player's recent games the teammate missed."""
     return ((~present) * weights[None, :]).sum(1) if present.shape[1] else np.zeros(present.shape[0])
 
 
 def missed_streak(present: np.ndarray) -> np.ndarray:
+    """Per teammate: number of consecutive most-recent games missed."""
     return np.cumprod((~present)[:, ::-1], axis=1).sum(1) if present.shape[1] else np.zeros(present.shape[0], dtype=int)
 
 
 def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: Dict[str, Any],
                       n0: Tuple[float, float], has_prior: bool) -> Dict[str, Any]:
+    """Minutes shift + usage multiplier for the evaluated player from injured / returning teammates."""
     out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None,
-                           "listed": [], "feed_ok": True}
+                           "listed": [], "feed_ok": True, "checked": False, "self_status": ""}
     pid = cached_player_id(player_name)
     if not pid:
         out["notes"].append("Injury adjustment skipped: could not resolve the player on ESPN.")
@@ -981,6 +1053,7 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     K = len(prof)
     out["team"] = next((nm for t, nm in load_team_meta() if t == tid), None)
 
+    # injury report: league feed + the team's roster entries, matched by athlete id or cleaned name
     league, ok1 = load_injuries()
     roster_inj, ok2 = load_team_injuries(tid)
     out["feed_ok"] = feed_ok = bool(ok1 or (ok2 and not roster_inj.empty))
@@ -1004,10 +1077,13 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     n = len(cur)
     present = presence_matrix(cur["DATE"].to_numpy(dtype=object), list(prof["DATES"]))
     inferred = np.zeros(K, dtype=bool)
-    if not feed_ok:
+    if not feed_ok:                       # no injury data at all: assume long absences continue
         inferred = (missed_streak(present) >= 3) & ~listed
         q = np.where(inferred, 0.75, q)
-        out["notes"].append("Injury feed unavailable: teammates who missed the last 3+ games are counted 75% likely out.")
+        out["notes"].append("Injury feed unavailable: teammates who missed the last 3+ games are counted 75% likely out. "
+                            "Add names in the injury settings to override.")
+    out["checked"] = True
+    out["self_status"] = (status[i] or "listed") if q[i] > 0 else ""
     if q[i] > 0:
         out["notes"].append(f"ESPN lists {player_name} as {status[i] or 'injured'}; the projection assumes he plays.")
     q[i] = 0.0
@@ -1027,7 +1103,8 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     rot[i] = 0.0
     net_rate, net_min = (q - f_rate) * rot, (q - f_min) * rot
 
-    out["listed"] = [{"name": str(prof.loc[j, "NAME"]), "status": status[j] or "listed", "p_out": float(q[j])}
+    out["listed"] = [{"name": str(prof.loc[j, "NAME"]), "status": status[j] or "listed", "p_out": float(q[j]),
+                      "mpg": float(M[j])}
                      for j in np.flatnonzero(listed) if j != i]
     parts = COMBO_PARTS.get(stat_col, [stat_col])
     pidx = [USAGE_STATS.index(s) for s in parts if s in USAGE_STATS]
@@ -1041,7 +1118,12 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
                usg=float(prof.loc[i, "USG"]))
     show = np.flatnonzero((np.abs(net_rate) > 0.02) | (np.abs(net_min) > 0.02))
     for j in show[np.argsort(-np.abs(net_rate[show] * per_j[show]))]:
-        label = "OUT" if q[j] >= 0.99 else f"{q[j]:.0%} to miss" if q[j] > 0 else "Not listed: treated as returning"
+        if q[j] >= 0.99:
+            label = "OUT"
+        elif q[j] > 0:
+            label = f"{q[j]:.0%} to miss" + (" (inferred)" if inferred[j] else "")
+        else:
+            label = "Not listed: treated as returning (missed recent games)"
         out["table"].append({"Teammate": prof.loc[j, "NAME"], "Status": label,
                              "USG%": round(float(prof.loc[j, "USG"]), 1), "MPG": round(float(M[j]), 1),
                              "Recent games missed": f"{f_core[j]:.0%}",
@@ -1052,6 +1134,7 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
 
 
 def compute_opp_allowed(games: pd.DataFrame, stat_cols: List[str], min_games: int = 3) -> pd.DataFrame:
+    """Production allowed by each opponent relative to each opposing player's own average (1.00 = league average)."""
     g = games[games.groupby("PID")["DATE"].transform("size") >= min_games]
     if g.empty:
         return pd.DataFrame()
@@ -1063,11 +1146,13 @@ def compute_opp_allowed(games: pd.DataFrame, stat_cols: List[str], min_games: in
 
 
 def _opp_abbr(series: pd.Series) -> pd.Series:
+    """'vs. BOS' / '@ GS' -> canonical abbreviation."""
     return series.astype(str).str.split().str[-1].str.upper().replace(ABBR_ALIAS)
 
 
-@st.cache_data(ttl=21600, show_spinner="Loading league game logs for matchup splits...")
-def load_opp_allowed() -> pd.DataFrame:
+@st.cache_data(ttl=21600, show_spinner="Loading league game logs for matchup splits (one-time, about 30-60s)...")
+def load_league_games() -> pd.DataFrame:
+    """Every rotation player's game log this and last season, with the opponent abbreviation (cached once)."""
     pids = [pid for r in load_all_rosters().values() for pid, _ in r]
 
     def fetch(pid: str) -> Optional[pd.DataFrame]:
@@ -1082,11 +1167,24 @@ def load_opp_allowed() -> pd.DataFrame:
     if not frames:
         raise ValueError("no league game logs available")
     games = pd.concat(frames, ignore_index=True)
-    games = games[games["MINUTES"] >= ROTATION_MIN].assign(OPP=lambda d: _opp_abbr(d["OPPONENT"]))
-    return compute_opp_allowed(games, list(STAT_COL.values()))
+    return games[games["MINUTES"] >= ROTATION_MIN].assign(OPP=lambda d: _opp_abbr(d["OPPONENT"]))
 
 
-def opp_stat_detail(opponent: str, stat_col: str, allowed: pd.DataFrame, played_cur: pd.DataFrame) -> Optional[Dict[str, Any]]:
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_opp_allowed() -> pd.DataFrame:
+    """Per opponent and stat: how much it allows rotation players relative to their own normal (season-long)."""
+    return compute_opp_allowed(load_league_games(), list(STAT_COL.values()))
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_opp_allowed_recent() -> pd.DataFrame:
+    """Same index, but only each opponent's last RECENT_GAMES games."""
+    return compute_opp_allowed_recent(load_league_games(), list(STAT_COL.values()), RECENT_GAMES)
+
+
+def opp_stat_detail(opponent: str, stat_col: str, allowed: pd.DataFrame, played_cur: pd.DataFrame,
+                    recent: Optional[pd.DataFrame] = None) -> Optional[Dict[str, Any]]:
+    """Opponent's stat-specific multiplier, rank (1 = softest), and the player's own top/bottom-10 defense splits."""
     abbr = next((_opp_abbr(pd.Series([ab])).iloc[0] for _, nm, ab in load_team_abbr_meta() if nm == opponent), None)
     if abbr is None or abbr not in allowed.index or stat_col not in allowed:
         return None
@@ -1096,17 +1194,22 @@ def opp_stat_detail(opponent: str, stat_col: str, allowed: pd.DataFrame, played_
     n_teams = len(allowed)
     r = _opp_abbr(played_cur["OPPONENT"]).map(rank) if len(played_cur) else pd.Series(dtype=float)
     soft, tough = played_cur.loc[r <= 10, stat_col], played_cur.loc[r > n_teams - 10, stat_col]
+    recent_rank = None
+    if recent is not None and abbr in recent.index and stat_col in recent:
+        recent_rank = int(recent[stat_col].rank(ascending=False, method="min")[abbr])
     return {"abbr": abbr, "factor": f, "games": int(g), "mult": mult, "rank": int(rank[abbr]), "n_teams": n_teams,
+            "recent_rank": recent_rank,
             "soft_avg": float(soft.mean()) if len(soft) else None, "soft_n": int(len(soft)),
             "tough_avg": float(tough.mean()) if len(tough) else None, "tough_n": int(len(tough))}
 
 
 def _split_names(text: str) -> List[str]:
+    """'A, B ,C' -> ['A', 'B', 'C']."""
     return [x.strip() for x in str(text).split(",") if x.strip()]
 
 
 # --------------------------------------------------------------------------------------
-# Model Math & 6-Point Sharp Criterion Evaluation Engine
+# Model math & Automated Contextual Checks
 # --------------------------------------------------------------------------------------
 @dataclass
 class Projection:
@@ -1116,10 +1219,10 @@ class Projection:
     n_current: int
     n_prior: int
     opp_mult: float
-    share_rate: float = 0.0
-    share_min: float = 0.0
-    usage_mult: float = 1.0
-    extra_min: float = 0.0
+    share_rate: float = 0.0     # fraction of the per-minute-rate estimate that comes from last season
+    share_min: float = 0.0      # fraction of the minutes estimate that comes from last season
+    usage_mult: float = 1.0     # injury/usage redistribution multiplier on the per-minute rate
+    extra_min: float = 0.0      # injury/usage redistribution minutes shift
 
 
 def ewma_weights(n: int, decay: float = DECAY) -> np.ndarray:
@@ -1136,13 +1239,18 @@ def _cv(x: np.ndarray) -> Optional[float]:
 def build_projection(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, opp_mult: float = 1.0,
                      n0_rate: float = N_PRIOR_RATE, n0_min: float = N_PRIOR_MIN,
                      extra_min: float = 0.0, usage_mult: float = 1.0) -> Projection:
+    """
+    rate    = (n*EWMA_rate + n0_rate*last_season_rate) / (n + n0_rate)
+    minutes = (n*EWMA_min  + n0_min *last_season_min ) / (n + n0_min)
+    mu      = rate * (minutes + extra_min) * opp_mult * usage_mult;  spread = pooled CV * mu, widened for estimation uncertainty.
+    """
     n = len(cur_x)
     has_prior = len(pri_x) > 0
     if n == 0 and not has_prior:
         raise ValueError("No usable games (current or prior season).")
     r0 = float(n0_rate) if has_prior else 0.0
     m0 = float(n0_min) if has_prior else 0.0
-    if n == 0:
+    if n == 0:                                   # nothing but last season to go on
         r0, m0 = max(r0, 1.0), max(m0, 1.0)
     pairs_rate: List[Tuple[float, float]] = []
     pairs_min: List[Tuple[float, float]] = []
@@ -1203,84 +1311,22 @@ def kelly_fraction(p_win: float, p_lose: float, odds: float) -> float:
     return float(np.clip(full * KELLY_FRACTION, 0.0, KELLY_CAP))
 
 
-def evaluate_six_point_criteria(
-    stat_category: str,
-    line: float,
-    is_over: bool,
-    edge_pp: float,
-    ev_pct: float,
-    dv_side: float,
-    odds_side: float,
-    opponent: Optional[str],
-    opp_detail: Optional[Dict[str, Any]],
-    opp_mult: float,
-    inj_out: Dict[str, Any],
-    own_state: str,
-    b2b_state: str,
-    proj_minutes: float,
-) -> Dict[str, Any]:
+def run_automated_context_filters(proj_minutes: float, raw_avg: float, b2b_status_str: str) -> Dict[str, Any]:
     """
-    Evaluates prop against 6 criteria:
-    1. Line High Enough (Baby Line)
-    2. AI Edge
-    3. Implied Chance
-    4. Defensive Rank
-    5. Injury
-    6. Game Script & Rest
+    Automated pre-flight checks:
+    1. Secure Volume & Usage: Checked automatically if projected minutes >= 28.0 or raw average output is robust.
+    2. Clean Schedule Spot: Checked automatically if the team is NOT on the second night of a back-to-back.
+    3. Rotation Minutes: checked automatically as projected minutes >= 24 (this does not measure sportsbook line movement).
     """
-    # 1. Line High Enough (Baby Line) - avoids low volume lines
-    min_line_thresholds = {
-        "Points": 10.0, "Rebounds": 3.5, "Assists": 3.5, "3-Pointers Made": 1.5,
-        "Pts + Reb + Ast": 18.5, "Pts + Ast": 12.5, "Pts + Reb": 12.5, "Reb + Ast": 6.5,
-        "Steals": 1.5, "Blocks": 1.5,
-    }
-    min_req = min_line_thresholds.get(stat_category, 3.5)
-    c1_baby_line = line >= min_req
-
-    # 2. AI Edge - projection extends sufficiently past line with positive EV
-    c2_ai_edge = (edge_pp >= 2.5) and (ev_pct > 0.0)
-
-    # 3. Implied Chance - market favors side or odds structure is clean
-    c3_implied_chance = (dv_side >= 0.50) or (odds_side <= -105)
-
-    # 4. Defensive Rank - matchup rank supports bet direction
-    if opp_detail and "rank" in opp_detail:
-        rank = opp_detail["rank"]
-        n_teams = opp_detail.get("n_teams", 30)
-        c4_def_rank = (rank <= n_teams / 2) if is_over else (rank > n_teams / 2)
-    else:
-        c4_def_rank = (opp_mult >= 1.0) if is_over else (opp_mult <= 1.0)
-
-    # 5. Injury - no active high-risk injury flags disrupting projection
-    listed = inj_out.get("listed", [])
-    has_high_risk_injuries = any(item.get("p_out", 0) > 0.8 for item in listed)
-    c5_injury = inj_out.get("feed_ok", True) and (not has_high_risk_injuries)
-
-    # 6. Game Script & Rest - rested schedule spot (no second night of B2B fatigue/blowout risk)
-    c6_game_script = (own_state not in ("second", "both")) and (b2b_state not in ("second", "both")) and (proj_minutes >= 24.0)
-
-    checks = {
-        "1. Line High Enough (Baby Line)": (c1_baby_line, f"Line ({line:g}) ≥ {min_req:g} stat threshold"),
-        "2. AI Edge": (c2_ai_edge, f"Edge ({edge_pp:+.1f}pp) ≥ +2.5pp with positive EV ({ev_pct:+.1f}%)"),
-        "3. Implied Chance": (c3_implied_chance, f"Market probability ({dv_side*100:.1f}%) / price ({odds_side:+d}) favors side"),
-        "4. Defensive Rank": (c4_def_rank, f"Opponent matchup index (x{opp_mult:.3f}) supports {'Over' if is_over else 'Under'}"),
-        "5. Injury": (c5_injury, "No active high-risk injury flags disrupting projection stability"),
-        "6. Game Script & Rest": (c6_game_script, "Clean schedule spot & solid rotation role (no B2B fatigue)"),
-    }
-
-    score = sum(1 for val, _ in checks.values() if val)
-    if score == 6:
-        verdict = "SHARP PLAY"
-    elif score == 5:
-        verdict = "LEAN"
-    else:
-        verdict = "PASS"
-
+    secure_volume = bool(proj_minutes >= 28.0 or raw_avg >= 15.0)
+    clean_schedule = bool(b2b_status_str not in ("second", "both"))
+    sharp_movement = bool(proj_minutes >= 24.0)  # NOTE: a rotation-minutes check; it does not look at line movement
+    
     return {
-        "score": score,
-        "max_score": 6,
-        "verdict": verdict,
-        "checks": checks,
+        "secure_volume": secure_volume,
+        "clean_schedule": clean_schedule,
+        "sharp_movement": sharp_movement,
+        "all_passed": secure_volume and clean_schedule and sharp_movement
     }
 
 
@@ -1288,7 +1334,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                       opponent: Optional[str] = None, game_date: Optional[date] = None,
                       b2b_effects: Optional[Dict[str, Dict[str, float]]] = None,
                       prior_weights: Optional[Tuple[float, float]] = None,
-                      adj_cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      adj_cfg: Optional[Dict[str, Any]] = None,
+                      game_spread: Optional[float] = None) -> Dict[str, Any]:
     try:
         cfg = {**DEFAULT_ADJ, **(adj_cfg or {})}
         for o in (over_odds, under_odds):
@@ -1314,7 +1361,11 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         opp_detail: Optional[Dict[str, Any]] = None
         if opponent and cfg["opp_stat"]:
             try:
-                opp_detail = opp_stat_detail(opponent, stat_col, load_opp_allowed(), cur)
+                try:
+                    recent_tbl: Optional[pd.DataFrame] = load_opp_allowed_recent()
+                except Exception:
+                    recent_tbl = None
+                opp_detail = opp_stat_detail(opponent, stat_col, load_opp_allowed(), cur, recent_tbl)
                 if opp_detail:
                     opp_detail["mult_old"] = opp_mult
                     opp_mult = float(np.clip(opp_mult ** (1.0 - OPP_BLEND) * opp_detail["mult"] ** OPP_BLEND, 0.88, 1.12))
@@ -1338,7 +1389,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
         inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None,
-                                   "listed": [], "feed_ok": True}
+                                   "listed": [], "feed_ok": True, "checked": False, "self_status": ""}
         if cfg["injuries"]:
             try:
                 inj_out = injury_adjustment(player_name, stat_col, cur, cfg, tuple(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)), len(pri) > 0)
@@ -1377,28 +1428,20 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         recent = played.tail(WINDOW)
         vals = recent[stat_col].to_numpy(float)
         raw_avg = float(np.mean(vals)) if len(vals) else 0.0
+        
+        # Automatically run contextual checks
+        context_checks = run_automated_context_filters(proj.minutes, raw_avg, own_state)
 
-        six_point_eval = evaluate_six_point_criteria(
-            stat_category=stat_category,
-            line=line,
-            is_over=is_over,
-            edge_pp=(p_cond - dv_side) * 100.0,
-            ev_pct=ev * 100.0,
-            dv_side=dv_side,
-            odds_side=odds_side,
-            opponent=opponent,
-            opp_detail=opp_detail,
-            opp_mult=proj.opp_mult,
-            inj_out=inj_out,
-            own_state=own_state,
-            b2b_state=b2b_state,
-            proj_minutes=proj.minutes,
-        )
+        six = {nm: score_prop(nm, stat_col, float(line), float(proj.mu), float(dv_),
+                              (opp_detail or {}).get("rank"), (opp_detail or {}).get("recent_rank"),
+                              (opp_detail or {}).get("n_teams"), inj_out, game_spread, ROTATION_MIN).as_dict()
+               for nm, dv_ in (("Over", dv_over), ("Under", dv_under))}
+        six["best"] = "Over" if is_over else "Under"
 
         warnings: List[str] = []
         if proj.n_current < 8:
             warnings.append(f"Small sample: {proj.n_current} games this season; last season ({proj.n_prior} games) carries "
-                            f"{proj.share_rate:.0%} of the per-minute rate and {proj.share_min:.0%} of minutes.")
+                            f"{proj.share_rate:.0%} of the per-minute rate and {proj.share_min:.0%} of minutes (see Model settings).")
         if proj.n_prior == 0:
             warnings.append("No prior-season games found; no shrinkage applied.")
         if opp_note:
@@ -1409,14 +1452,14 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
         return {
             "player_name": player_name, "mean": float(np.mean(sims)), "median": float(np.median(sims)),
-            "verdict": six_point_eval["verdict"], "best_side": side_txt, "ev_pct": ev * 100.0,
+            "verdict": "PLAY" if ev > 0 else "PASS", "best_side": side_txt, "ev_pct": ev * 100.0,
             "edge_pp": (p_cond - dv_side) * 100.0, "p_model": p_cond * 100.0, "p_market": dv_side * 100.0,
             "fair_odds": prob_to_american(p_cond), "kelly_pct": kelly_fraction(p_w, p_l, odds_side) * 100.0,
             "proj_minutes": proj.minutes, "opp_mult": proj.opp_mult, "raw_avg": raw_avg,
             "hit10": int(np.sum(vals > line)), "n10": len(vals),
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
-            "six_point_eval": six_point_eval, "this_season": this_season,
+            "context_checks": context_checks, "this_season": this_season, "six_point": six,
             "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
@@ -1432,7 +1475,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
 
 
 # --------------------------------------------------------------------------------------
-# Bet log & CLV Tracking
+# Bet log + closing line value
 # --------------------------------------------------------------------------------------
 LOG_PATH = "bet_log.csv"
 LOG_COLS: List[str] = [
@@ -1612,7 +1655,7 @@ def summarize_log(log: pd.DataFrame) -> Tuple[Dict[str, float], pd.DataFrame, pd
 
 
 # --------------------------------------------------------------------------------------
-# UI Components
+# UI
 # --------------------------------------------------------------------------------------
 def _metric(col: Any, label: str, value: str, tone: str = "neutral") -> None:
     color = {"neutral": "#0369a1", "good": "#15803d", "bad": "#b91c1c"}[tone]
@@ -1666,50 +1709,65 @@ def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
 def render_b2b_alert(res: Dict[str, Any]) -> None:
     own = res.get("own_b2b") or {}
     if own.get("status") == "second":
-        src = "backtested" if own.get("calibrated") else "default assumption"
-        st.warning(f"🛌 **{res['player_name']} is on the SECOND night of a back-to-back**. Projection adjusted x{own['mult']:.3f} ({src}).")
+        src = "backtested" if own.get("calibrated") else "default assumption: calibrate in the Backtest tab"
+        st.warning(f"🛌 **{res['player_name']} is on the SECOND night of a back-to-back** (played yesterday). "
+                   f"Projection adjusted x{own['mult']:.3f} ({src}).")
     b = res.get("b2b") or {}
     team, status, mult = b.get("opponent", ""), b.get("status", "unknown"), b.get("mult", 1.0)
     if status == "second":
-        st.warning(f"🚨 **{team} is on the SECOND night of a back-to-back**. Projection adjusted x{mult:.3f}.")
+        st.warning(f"🚨 **{team} is on the SECOND night of a back-to-back** (played yesterday). Projection adjusted x{mult:.3f}.")
     elif status == "both":
-        st.warning(f"🚨 **{team} is on the second night of a B2B AND plays tomorrow** (3-in-3 stretch). Projection adjusted x{mult:.3f}.")
+        st.warning(f"🚨 **{team} is on the second night of a back-to-back AND plays again tomorrow** (3-in-3 stretch). Projection adjusted x{mult:.3f}.")
     elif status == "first":
-        st.info(f"⏭️ **{team} plays again tomorrow**. Informational only, no adjustment applied.")
+        st.info(f"⏭️ **{team} plays again tomorrow** (first game of a back-to-back). Informational only, no adjustment applied.")
     elif status == "none":
         st.caption(f"✅ {team} is rested: no game yesterday or tomorrow.")
 
 
-def render_six_point_assessment(res: Dict[str, Any]) -> None:
-    """Render the 6-Point Sharp Assessment Evaluation."""
-    eval_data = res.get("six_point_eval", {})
-    if not eval_data:
+def render_automated_checks(res: Dict[str, Any]) -> None:
+    """Render automated pre-flight contextual check results as verified checkboxes."""
+    checks = res.get("context_checks", {})
+    v1 = checks.get("secure_volume", True)
+    v2 = checks.get("clean_schedule", True)
+    v3 = checks.get("sharp_movement", True)
+    
+    with st.expander("🔍 Step 3: Automated Contextual Reality Check (Pre-Flight Filter)", expanded=True):
+        st.markdown("Automated filters running against player volume, schedule fatigue, and rotation minutes:")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.checkbox("1. Secure Volume & Usage", value=v1, disabled=True, help="Automatically verified via projected minutes and raw average volume.")
+        with c2:
+            st.checkbox("2. Clean Schedule Spot", value=v2, disabled=True, help="Automatically verified via team back-to-back status.")
+        with c3:
+            st.checkbox("3. Rotation Minutes (≥ 24 proj)", value=v3, disabled=True, help="Verified via projected minutes of at least 24. This does not measure sportsbook line movement.")
+        st.caption("💡 *Note: High-volume players are less exposed to single-game variance. Back-to-back effects are estimated in the B2B Backtest tab.*")
+
+
+def render_final_assessment(res: Dict[str, Any]) -> None:
+    """Final assessment: the six-point criteria for the recommended side (6/6 SHARP, 5/6 LEAN)."""
+    six = res.get("six_point")
+    if not six:
         return
-
-    score = eval_data.get("score", 0)
-    verdict = eval_data.get("verdict", "PASS")
-    checks = eval_data.get("checks", {})
-
-    with st.expander(f"🎯 6-Point Sharp Assessment (Score: {score}/6 — {verdict})", expanded=True):
-        if score == 6:
-            st.success("🔥 **6/6 CRITERIA MET — SHARP PLAY CONFIRMED**")
-        elif score == 5:
-            st.warning("⚡ **5/6 CRITERIA MET — QUALIFIES AS A LEAN**")
-        else:
-            st.error(f"❌ **{score}/6 CRITERIA MET — PASS (INSUFFICIENT CONVICTION)**")
-
-        c1, c2 = st.columns(2)
-        items = list(checks.items())
-        
-        for idx, (title, (passed, detail)) in enumerate(items):
-            col = c1 if idx < 3 else c2
-            icon = "✅" if passed else "❌"
-            with col:
-                st.checkbox(f"{icon} {title}", value=passed, disabled=True, help=detail, key=f"six_check_cb_{idx}")
-                st.caption(f"↳ *{detail}*")
+    best = six[six["best"]]
+    other = six["Under" if six["best"] == "Over" else "Over"]
+    tone = {"SHARP": "good", "LEAN": "neutral", "PASS": "bad"}[best["tier"]]
+    st.markdown("### 🏁 Final Assessment: 6-Point Check")
+    a, b, c = st.columns([1, 1, 2])
+    _metric(a, f"TIER · {best['side'].upper()} {res['best_side'].split(' ', 1)[1]}", best["tier"], tone)
+    _metric(b, "CRITERIA MET", f"{best['score']}/6", tone)
+    c.caption(f"6/6 = SHARP · 5/6 = LEAN · 4 or fewer = PASS. Scored for the model's best side ({best['side']}). "
+              f"The {other['side']} would score {other['score']}/6 ({other['tier']}). A check that can't be verified counts as failed.")
+    if best["tier"] != "PASS" and res["ev_pct"] <= 0:
+        st.warning("⚠️ The six-point score is positive but the model's EV at this price is not. Check the price before betting.")
+    for ck in best["checks"]:
+        icon = "✅" if ck["passed"] else ("⚪" if not ck["verified"] else "❌")
+        st.markdown(f"{icon} **{ck['label']}**: {ck['detail']}")
+    st.caption(f"Defensive ranks come from what each opponent allows rotation players vs their own averages (season-long and last {RECENT_GAMES} games); "
+               f"the spread is DraftKings' (blowout = {BLOWOUT_SPREAD:g}+). Thresholds live at the top of six_point.py.")
 
 
 def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
+    """Stat-specific opponent matchup and injury/usage adjustment panels."""
     od = res.get("opp_detail")
     if od:
         st.markdown("#### 🎯 Opponent vs this stat")
@@ -1720,10 +1778,11 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
         _metric(m[3], "OPP MULT USED", f"x{od['mult_final']:.3f}", _tone(od["mult_final"] - 1))
         bits = []
         if od["soft_avg"] is not None:
-            bits.append(f"vs top 10 softest: {od['soft_avg']:.1f} ({od['soft_n']} g)")
+            bits.append(f"vs the 10 softest defenses: {od['soft_avg']:.1f} ({od['soft_n']} g)")
         if od["tough_avg"] is not None:
-            bits.append(f"vs top 10 toughest: {od['tough_avg']:.1f} ({od['tough_n']} g)")
-        st.caption("Rank 1 = allows most of this stat relative to opposing player normal. " + (" · ".join(bits) if bits else ""))
+            bits.append(f"vs the 10 toughest: {od['tough_avg']:.1f} ({od['tough_n']} g)")
+        st.caption(f"Rank 1 = allows the most of this stat relative to each opposing player's own average ({od['games']} games of data, shrunk toward 1.00). "
+                   + (" · ".join(bits) + ". Splits are context only: tiny samples." if bits else ""))
     inj = res.get("injury") or {}
     if inj.get("usg") is not None:
         st.markdown("#### 🩺 Injuries & usage")
@@ -1739,6 +1798,10 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
             st.caption("🩺 The injury feed lists no teammates for this team.")
         if inj["table"]:
             st.dataframe(pd.DataFrame(inj["table"]), use_container_width=True, hide_index=True)
+            st.caption("Weight = P(misses tonight) minus the share of his recent games already missed (so a long-term absence is not double counted, "
+                       "and a returning teammate pulls usage back down). Effects are the stat/minutes change for this player.")
+        else:
+            st.caption("No injured or returning rotation teammates move this projection. Add names in the injury settings if the feed is stale.")
 
 
 def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
@@ -1749,15 +1812,10 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
         photo_col.image(photo, width=120)
     title_col.markdown(f"## {res['player_name']} | {stat_category}")
     render_b2b_alert(res)
-    
-    score = res["six_point_eval"]["score"]
-    verdict = res["verdict"]
-    tone = "good" if score == 6 else ("neutral" if score == 5 else "bad")
-
     c = st.columns(6)
     _metric(c[0], "MEAN", f"{res['mean']:.2f}")
     _metric(c[1], "MEDIAN", f"{res['median']:.1f}")
-    _metric(c[2], "FINAL EVALUATION", f"{score}/6 {verdict}", tone)
+    _metric(c[2], "BEST SIDE (BY EV)", res["best_side"], _tone(res["ev_pct"]))
     _metric(c[3], "FAIR ODDS", f"{res['fair_odds']:+d}")
     _metric(c[4], "EDGE VS DEVIG", f"{res['edge_pp']:+.1f} pp", _tone(res["edge_pp"]))
     _metric(c[5], "EV", f"{res['ev_pct']:+.1f}%", _tone(res["ev_pct"]))
@@ -1777,12 +1835,18 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     _metric(e[1], "THIS SEASON OVER HIT", pct("over"))
     _metric(e[2], "THIS SEASON UNDER HIT", pct("under"))
     _metric(e[3], "LAST-SEASON WEIGHT", f"{res['prior_share']['rate']:.0%} rate · {res['prior_share']['minutes']:.0%} min")
-    
+    if ts["n"] and ts["push"]:
+        st.caption(f"{ts['push']} of {ts['n']} games this season landed exactly on the line (pushes).")
+    if res["days_rest"] is not None:
+        st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
+    st.markdown("---")
+    render_final_assessment(res)
+    st.markdown("---")
     render_matchup_injury(res, stat_category)
     for w in res["warnings"]:
         st.caption(f"⚠️ {w}")
     st.markdown("---")
-    render_six_point_assessment(res)
+    render_automated_checks(res)
     st.markdown("---")
     render_log_form(res, ctx)
     st.markdown("---")
@@ -1812,6 +1876,7 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
 
 def render_bet_log() -> None:
     ss = st.session_state
+    st.caption("On Streamlit Cloud the server disk resets on reboot/redeploy — download your CSV regularly and re-import it here.")
     a, b, c = st.columns(3)
     if a.button("🏁 Auto-grade finished games", key="grade_btn"):
         ss["bet_log"], n, notes = auto_grade(ss["bet_log"])
@@ -1823,12 +1888,12 @@ def render_bet_log() -> None:
     board = ss.get("board_df")
     if b.button("📸 Use current board as closing lines", key="close_btn"):
         if board is None or board.empty or not ss.get("board_stat"):
-            st.warning("Fetch a prop board first (Evaluate tab, Step 3).")
+            st.warning("Fetch a prop board first (Evaluate tab, Step 3) — ideally right before tip-off.")
         else:
             ss["bet_log"], n = apply_board_as_closing(ss["bet_log"], summarize_board(board), ss["board_stat"])
             save_log_file(ss["bet_log"])
             ss["editor_ver"] += 1
-            st.toast(f"Closing lines applied to {n} pending bet(s)")
+            st.toast(f"Closing lines applied to {n} pending bet(s) ({ss['board_stat']} market)")
             st.rerun()
     c.download_button("⬇️ Download log (CSV)", data=ss["bet_log"].to_csv(index=False).encode("utf-8"),
                       file_name="bet_log.csv", mime="text/csv", key="dl_log")
@@ -1881,6 +1946,11 @@ def render_bet_log() -> None:
     _metric(m[3], "ROI", _fmt(stats["roi"], "+.1f", "%"), _tone(stats["roi"]))
     _metric(m[4], "AVG CLV", _fmt(stats["avg_clv"], "+.2f", " pp"), _tone(stats["avg_clv"]))
     _metric(m[5], "+CLV RATE", _fmt(stats["pos_clv"], ".0f", "%"))
+    st.caption(
+        f"CLV is measured on {int(stats['n_clv'])} bet(s) with closing odds at the same line. "
+        f"Brier (lower is better): model {_fmt(stats['brier_model'], '.4f')} vs market {_fmt(stats['brier_market'], '.4f')}. "
+        "Treat everything as noise until you have 50+ graded bets; CLV converges much faster than win/loss."
+    )
     graded = ss["bet_log"][ss["bet_log"]["RESULT"].isin(["Win", "Loss", "Push"])].sort_values("TS")
     if len(graded) >= 2:
         fig = go.Figure(go.Scatter(x=list(range(1, len(graded) + 1)), y=graded["PROFIT"].cumsum(), mode="lines+markers",
@@ -1897,13 +1967,17 @@ def render_bet_log() -> None:
 
 def render_backtest() -> None:
     ss = st.session_state
-    st.markdown("Estimates back-to-back performance adjustments from historical NBA game data.")
+    st.markdown(
+        "Estimates how much a player's stat changes when **he** is on the second night of a back-to-back and when "
+        "**the opponent** is, using within-player regressions (each game as a % of that player's own season average, "
+        "controlling for home/away, standard errors clustered by player). Results are shrunk toward 0 before use."
+    )
     c1, c2, c3 = st.columns(3)
-    n_per_team = c1.slider("Players per team", 3, 12, 8)
-    seasons = c2.multiselect("Seasons", [2026, 2025, 2024], default=[2026, 2025, 2024])
+    n_per_team = c1.slider("Players per team (roster order)", 3, 12, 8)
+    seasons = c2.multiselect("Seasons (ESPN ending year)", [2026, 2025, 2024], default=[2026, 2025, 2024])
     c3.write("")
     if c3.button("🔬 Run backtest", key="run_bt") and seasons:
-        with st.spinner("Downloading rosters, logs and schedules..."):
+        with st.spinner("Downloading rosters, logs and schedules from ESPN (first run takes a minute or two)…"):
             try:
                 frame = load_backtest_dataset(int(n_per_team), tuple(sorted(seasons)))
                 ss["bt_table"] = estimate_b2b_effects(frame)
@@ -1915,8 +1989,11 @@ def render_backtest() -> None:
     table = ss.get("bt_table")
     if table is not None and not table.empty:
         meta = ss["bt_meta"]
-        st.caption(f"{meta['games']:,} player-games · {meta['players']} players")
-        st.dataframe(table.round(2), use_container_width=True, hide_index=True)
+        st.caption(f"{meta['games']:,} player-games · {meta['players']} players · {meta['own']:,} own-B2B games · {meta['opp']:,} opponent-B2B games")
+        show = table.round(2)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("Effects are % of the player's own average (negative OWN = fatigue; positive OPP = tired opponent helps). "
+                   "|effect| < 2 × SE is not distinguishable from zero. SHRUNK columns are what the model uses.")
         a, b = st.columns(2)
         if a.button("✅ Apply to model", key="apply_bt"):
             ss["b2b_effects"] = effects_from_table(table)
@@ -1926,6 +2003,47 @@ def render_backtest() -> None:
             ss["b2b_effects"] = None
             save_effects_file(None)
             st.toast("Back to default assumptions")
+    elif table is not None:
+        st.warning("Not enough back-to-back games in the sample. Try more players per team or more seasons.")
+    st.markdown("---")
+    st.markdown("### ⚖️ Last-season weight calibration")
+    st.markdown(
+        "For the first 15 games of each season, finds the last-season weight (in pseudo-games) that predicts the next game best, "
+        "separately for each stat's per-minute rate and for minutes. Needs at least two completed seasons in the selection above "
+        "(e.g. 2025 and 2024)."
+    )
+    if st.button("⚖️ Calibrate last-season weight", key="run_pw") and seasons:
+        with st.spinner("Loading logs (cached after the first run) and scoring predictions…"):
+            try:
+                ss["pw_table"] = estimate_prior_weights(load_backtest_dataset(int(n_per_team), tuple(sorted(seasons))))
+            except Exception as e:
+                ss["pw_table"] = None
+                st.error(f"Calibration failed: {e}")
+    pw = ss.get("pw_table")
+    if pw is not None and not pw.empty:
+        st.dataframe(pw.round(4), use_container_width=True, hide_index=True)
+        st.caption("N0_BEST = best last-season weight on the grid; N0_RANGE = every weight within 1% of the best loss (a wide range means the "
+                   "choice barely matters). LOSS is squared error relative to last season's average; GAIN_VS_DEFAULT compares to your current setting.")
+        rate_rows, min_rows = pw[pw["TARGET"] == "per-minute rate"], pw[pw["TARGET"] == "minutes"]
+        if not rate_rows.empty and not min_rows.empty:
+            rate_pick, min_pick = int(round(float(rate_rows["N0_BEST"].median()))), int(round(float(min_rows["N0_BEST"].iloc[0])))
+            if st.button(f"✅ Apply: rate {rate_pick} / minutes {min_pick} pseudo-games", key="apply_pw"):
+                ss["pw_pending"] = (rate_pick, min_pick)
+                save_prior_file({"rate": rate_pick, "minutes": min_pick})
+                st.rerun()
+    elif pw is not None:
+        st.warning("Not enough player-seasons with a prior season. Select at least two completed seasons (e.g. 2025 and 2024) and more players per team.")
+    active = ss.get("b2b_effects")
+    st.markdown("**Active parameters**" + (" (backtested)" if active else " (default assumptions)"))
+    own, opp = (active or {}).get("own", B2B_OWN_EFFECT), (active or {}).get("opp", B2B_OPP_BOOST)
+    st.dataframe(pd.DataFrame({"STAT": list(B2B_OPP_BOOST.keys()),
+                               "OWN_B2B_%": [own.get(k, 0.0) * 100 for k in B2B_OPP_BOOST],
+                               "OPP_B2B_%": [opp.get(k, 0.0) * 100 for k in B2B_OPP_BOOST]}).round(2),
+                 use_container_width=True, hide_index=True)
+    if active:
+        st.caption("To make these permanent, paste into the constants at the top of the file:")
+        st.code(f"B2B_OWN_EFFECT = {json.dumps({k: round(v, 4) for k, v in active['own'].items()})}\n"
+                f"B2B_OPP_BOOST = {json.dumps({k: round(v, 4) for k, v in active['opp'].items()})}", language="python")
 
 
 def main() -> None:
@@ -1949,7 +2067,7 @@ def main() -> None:
     if "n0_rate" not in ss:
         saved = load_prior_file() or {}
         ss["n0_rate"], ss["n0_min"] = int(saved.get("rate", N_PRIOR_RATE)), int(saved.get("minutes", N_PRIOR_MIN))
-    if ss.get("pw_pending"):
+    if ss.get("pw_pending"):                       # applied from the backtest tab; must be set before the sliders exist
         ss["n0_rate"], ss["n0_min"] = ss.pop("pw_pending")
     if "bet_log" not in ss:
         ss["bet_log"] = read_log_file()
@@ -1979,6 +2097,9 @@ def main() -> None:
                             ss["board_df"] = board_df
                             ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
+                            ss["board_spread"], spread_err = fetch_game_spread(str(events_df.loc[game_idx, "id"]), api_key)
+                            if spread_err:
+                                st.warning(f"{spread_err} The Game Script check can't be verified without it.")
                             ss["board_date"] = _iso_to_date(events_df.loc[game_idx].get("game_date", ""))
                 board_df = ss.get("board_df")
                 if board_df is not None and not board_df.empty:
@@ -1997,18 +2118,21 @@ def main() -> None:
                                       game_date=ss.get("board_date") or _today_et())
                             st.rerun()
 
-        with st.expander("⚙️ Model settings: last-season weights", expanded=False):
+        with st.expander("⚙️ Model settings: how much weight does last season get?", expanded=False):
             s1, s2 = st.columns(2)
             s1.slider("Per-minute rate: last-season weight (pseudo-games)", 0, 40, key="n0_rate")
             s2.slider("Minutes: last-season weight (pseudo-games)", 0, 40, key="n0_min")
+            st.caption("Weight w means last season counts like w extra games next to this season's n games, so its share is w / (n + w). "
+                       "0 = trust this season only. Rates are stable year to year (higher weight); minutes and roles change more (lower). "
+                       "Press Evaluate to apply. Use the B2B Backtest tab to estimate these from data.")
         with st.expander("🩺 Injuries, usage & matchup settings", expanded=False):
-            st.checkbox("Adjust for injured / returning teammates", key="adj_inj")
-            st.checkbox("Stat-specific opponent factors", key="adj_opp")
-            st.slider("Usage absorption strength", 0.5, 1.0, key="adj_absorb", step=0.05)
-            st.text_input("Teammates OUT", key="adj_out")
-            st.text_input("Teammates QUESTIONABLE", key="adj_q")
-            st.text_input("Teammates ACTIVE", key="adj_in")
-
+            st.checkbox("Adjust for injured / returning teammates (usage + minutes redistribution)", key="adj_inj")
+            st.checkbox("Stat-specific opponent factors (loads league logs: about 30-60s the first time, then cached)", key="adj_opp")
+            st.slider("Usage absorption strength (scales how much of an absent player's production teammates pick up)", 0.5, 1.0, key="adj_absorb", step=0.05)
+            st.text_input("Teammates OUT (comma-separated; adds to the ESPN feed)", key="adj_out")
+            st.text_input("Teammates QUESTIONABLE (counted as 50%)", key="adj_q")
+            st.text_input("Teammates ACTIVE (overrides a stale injury feed)", key="adj_in")
+            st.caption("The feed comes from ESPN and can lag, so check the team's report near tip-off. Press Evaluate to apply.")
         opp_opts = _opp_options(ss["board_teams"])
         with st.form("nba_form"):
             c1, c2, c3 = st.columns([2, 1, 1])
@@ -2029,7 +2153,8 @@ def main() -> None:
                                     (float(ss["n0_rate"]), float(ss["n0_min"])),
                                     {"injuries": ss["adj_inj"], "opp_stat": ss["adj_opp"], "absorb_scale": float(ss["adj_absorb"]),
                                      "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
-                                     "manual_in": _split_names(ss["adj_in"])})
+                                     "manual_in": _split_names(ss["adj_in"])},
+                                    ss.get("board_spread") if opponent in ss["board_teams"] else None)
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
             else:
@@ -2042,6 +2167,20 @@ def main() -> None:
         elif ss.get("last_res"):
             render_results(ss["last_res"], ss["last_ctx"])
 
+        with st.expander("ℹ️ How the model works"):
+            st.markdown(
+                "- **Projection** = shrunk per-minute rate × shrunk minutes × opponent multiplier. Current-season games "
+                "(last 10, EWMA decay 0.8) are blended with last season's rates; the last-season weights (per-minute rate and minutes) are set in Model settings.\n"
+                "- **Spread** = pooled coefficient of variation × projection, inflated for estimation uncertainty.\n"
+                "- **Distribution**: Normal for points, PRA and the points/rebounds/assists combos; Negative Binomial (Poisson if under-dispersed) for rebounds, assists, 3PM, steals, blocks. 50,000 seeded draws.\n"
+                "- **Market**: two-way multiplicative devig. Edge = model % − devigged market %. EV uses the model probability at the offered price (pushes refunded).\n"
+                "- **Opponent**: geometric mean of (a) the points-allowed / scoring-pace index and (b) a stat-specific factor: what the opponent allows rotation players relative to their own averages, shrunk by games played (G / (G + 12)), capped ±12%. Not true positional defense.\n"
+                "- **Injuries & usage**: injured teammates' minutes and production are redistributed to the rest of the rotation (headroom-weighted minutes; usage-weighted points, production-weighted other stats), net of what the player's recent games already reflect, so returning teammates pull usage back down. Absorption rates are assumptions to calibrate.\n"
+                "- **Final assessment (6-point check)**: baby line, AI edge, implied chance, defensive rank (season + recent), injury flags, game script (spread under 10). 6/6 = SHARP, 5/6 = LEAN; checks that can't be verified count as failed. Thresholds are in six_point.py.\n"
+                "- **Kelly**: ¼ Kelly capped at 5% of bankroll; 0 when EV ≤ 0.\n"
+                "- **CLV**: devigged closing probability of your side minus the devigged probability when you bet, same line only. "
+                "If the line moved, LINE MOVE shows how far (positive = in your favor)."
+            )
     with tab_log:
         render_bet_log()
     with tab_bt:
