@@ -23,7 +23,8 @@ from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
 
 from six_point import (
-    BLOWOUT_SPREAD, RECENT_GAMES, compute_opp_allowed_recent, extract_spread, score_prop,
+    BLOWOUT_SPREAD, RECENT_GAMES, add_six_point_column, compute_opp_allowed_recent, extract_spread, opponent_for,
+    score_prop, style_tags,
 )
 
 st.set_page_config(
@@ -2046,6 +2047,55 @@ def render_backtest() -> None:
                 f"B2B_OPP_BOOST = {json.dumps({k: round(v, 4) for k, v in active['opp'].items()})}", language="python")
 
 
+def _adj_cfg() -> Dict[str, Any]:
+    """Injury / opponent / usage settings from the sidebar-style expanders (shared by Evaluate and the board scan)."""
+    ss = st.session_state
+    return {"injuries": ss["adj_inj"], "opp_stat": ss["adj_opp"], "absorb_scale": float(ss["adj_absorb"]),
+            "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
+            "manual_in": _split_names(ss["adj_in"])}
+
+
+def player_team_name(player_name: str) -> Optional[str]:
+    """ESPN display name of the player's current team (None if he can't be resolved)."""
+    pid = cached_player_id(player_name)
+    if not pid:
+        return None
+    tid = next((t for t, r in load_all_rosters().items() if any(p == pid for p, _ in r)), None)
+    return next((nm for t, nm in load_team_meta() if t == tid), None) if tid else None
+
+
+def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], spread: Optional[float],
+               game_date: Optional[date], progress: Any = None) -> Dict[str, Optional[Dict[str, Any]]]:
+    """Run the full evaluation (and six-point check) for every player on the odds board.
+
+    Each player's opponent is the other team in the selected game. Players who can't be placed on either
+    team, or whose evaluation fails, map to None (shown as a dash).
+    """
+    ss = st.session_state
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    n = len(summary)
+    for k, (_, r) in enumerate(summary.iterrows()):
+        name = str(r["Player"])
+        if r[["Line", "Over", "Under"]].isna().any():     # incomplete offer: nothing to score
+            out[name] = None
+            continue
+        if progress is not None:
+            progress.progress(k / max(n, 1), text=f"Scanning {name} ({k + 1}/{n})")
+        try:
+            opp = opponent_for(player_team_name(name), game_teams)
+            if opp is None:
+                out[name] = None
+                continue
+            res = evaluate_nba_prop(name, stat_label, float(r["Line"]), float(r["Over"]), float(r["Under"]), opp, game_date,
+                                    ss.get("b2b_effects"), (float(ss["n0_rate"]), float(ss["n0_min"])), _adj_cfg(), spread)
+            out[name] = None if "error" in res else res.get("six_point")
+        except Exception:
+            out[name] = None
+    if progress is not None:
+        progress.progress(1.0, text="Scan complete")
+    return out
+
+
 def main() -> None:
     st.markdown(
         """
@@ -2095,6 +2145,7 @@ def main() -> None:
                             st.error(err)
                         else:
                             ss["board_df"] = board_df
+                            ss["board_token"], ss["board_scan"] = uuid.uuid4().hex, None
                             ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
                             ss["board_spread"], spread_err = fetch_game_spread(str(events_df.loc[game_idx, "id"]), api_key)
@@ -2104,7 +2155,20 @@ def main() -> None:
                 board_df = ss.get("board_df")
                 if board_df is not None and not board_df.empty:
                     summary = summarize_board(board_df)
-                    st.dataframe(summary, use_container_width=True)
+                    scan = ss.get("board_scan")
+                    shown = summary
+                    if scan and scan.get("token") == ss.get("board_token"):
+                        shown = add_six_point_column(summary, scan["six"])
+                    st.dataframe(style_tags(shown) if "Six-Point" in shown else shown, use_container_width=True)
+                    st.caption("🔥 SHARP = 6/6 criteria · ⚡ LEAN = 5/6 · other rows show their score; — = couldn't be scored. "
+                               "Each prop is scored on its best side by EV.")
+                    if st.button("🔎 Scan board for 5/6 & 6/6 props", key="scan_board_btn"):
+                        bar = st.progress(0.0, text="Starting scan...")
+                        ss["board_scan"] = {"token": ss.get("board_token"),
+                                            "six": scan_board(summary, ss.get("board_stat", selected_stat_label), ss["board_teams"],
+                                                              ss.get("board_spread"), ss.get("board_date") or _today_et(), bar)}
+                        st.rerun()
+                    summary = shown[[c for c in summary.columns]]
                     player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
                     pick_photo = player_headshot_url(str(player_pick))
                     if pick_photo:
@@ -2151,9 +2215,7 @@ def main() -> None:
             res = evaluate_nba_prop(player_name, stat_category, line_val, over_odds, under_odds,
                                     None if opponent == "None" else opponent, game_day, ss.get("b2b_effects"),
                                     (float(ss["n0_rate"]), float(ss["n0_min"])),
-                                    {"injuries": ss["adj_inj"], "opp_stat": ss["adj_opp"], "absorb_scale": float(ss["adj_absorb"]),
-                                     "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
-                                     "manual_in": _split_names(ss["adj_in"])},
+                                    _adj_cfg(),
                                     ss.get("board_spread") if opponent in ss["board_teams"] else None)
             if "error" in res:
                 ss["last_res"], ss["last_err"] = None, res["error"]
