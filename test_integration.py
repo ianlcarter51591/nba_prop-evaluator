@@ -160,5 +160,75 @@ class TestIntegration(unittest.TestCase):
             self.assertIsNone(app.fetch_game_spread("evt", "KEY")[0])
 
 
+class TestBoardScan(unittest.TestCase):
+    """scan_board runs the real evaluation per player and add_six_point_column tags the odds table."""
+
+    def setUp(self):
+        self.app = load_app()
+        allowed = ALLOWED(1.15)
+        for target, kw in (("fetch_player_logs", dict(return_value=(synthetic_logs(self.app), None))),
+                           ("load_team_scoring", dict(return_value=pd.DataFrame())),
+                           ("opp_multiplier", dict(return_value=(1.0, None))),
+                           ("load_team_game_dates", dict(return_value=[])),
+                           ("load_team_abbr_meta", dict(return_value=[("2", "Boston Celtics", "BOS")])),
+                           ("load_opp_allowed", dict(return_value=allowed)),
+                           ("load_opp_allowed_recent", dict(return_value=allowed)),
+                           ("injury_adjustment", dict(return_value=dict(CLEAN_INJ)))):
+            p = patch.object(self.app, target, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        teams = {"Clip Star": "LA Clippers", "Celtic Guy": "Boston Celtics", "Traded Guy": "Miami Heat", "Crash": None}
+        p = patch.object(self.app, "player_team_name", side_effect=lambda n: teams.get(n))
+        p.start()
+        self.addCleanup(p.stop)
+        self.app.st.session_state.update({"n0_rate": 6, "n0_min": 6, "adj_inj": True, "adj_opp": True, "adj_absorb": 1.0,
+                                         "adj_out": "", "adj_q": "", "adj_in": "", "b2b_effects": None})
+
+    def summary(self):
+        return pd.DataFrame({"Player": ["Celtic Guy", "Clip Star", "Traded Guy", "Crash", "No Odds"],
+                             "Line": [22.5, 22.5, 22.5, 22.5, 22.5], "Over": [-120] * 4 + [float("nan")],
+                             "Under": [100] * 5})
+
+    def test_scan_scores_each_player_against_the_other_team(self):
+        calls = []
+        real = self.app.evaluate_nba_prop
+        def spy(name, stat, line, over, under, opp, *rest):
+            calls.append((name, opp, rest[-1]))
+            return real(name, stat, line, over, under, opp, *rest)
+        with patch.object(self.app, "evaluate_nba_prop", side_effect=spy):
+            six = self.app.scan_board(self.summary(), "Points", ["Boston Celtics", "Los Angeles Clippers"], 6.5, date(2026, 11, 9))
+        self.assertEqual(set(six), {"Celtic Guy", "Clip Star", "Traded Guy", "Crash", "No Odds"})
+        self.assertEqual({(n, o) for n, o, _ in calls}, {("Celtic Guy", "Los Angeles Clippers"), ("Clip Star", "Boston Celtics")})
+        self.assertTrue(all(sp_ == 6.5 for _, _, sp_ in calls))                  # the board's spread is passed through
+        self.assertEqual((six["Clip Star"][six["Clip Star"]["best"]]["tier"]), "SHARP")
+        celtic = six["Celtic Guy"][six["Celtic Guy"]["best"]]
+        self.assertNotEqual(celtic["tier"], "SHARP")                              # opponent unresolvable -> defense unverified
+        self.assertFalse([c for c in celtic["checks"] if c["key"] == "defensive_rank"][0]["verified"])
+        for skipped in ("Traded Guy", "Crash", "No Odds"):
+            self.assertIsNone(six[skipped])
+
+    def test_evaluation_error_becomes_a_dash(self):
+        with patch.object(self.app, "evaluate_nba_prop", return_value={"error": "no logs"}):
+            six = self.app.scan_board(self.summary(), "Points", ["Boston Celtics", "Los Angeles Clippers"], None, None)
+        self.assertTrue(all(v is None for v in six.values()))
+        with patch.object(self.app, "evaluate_nba_prop", side_effect=RuntimeError("boom")):
+            six = self.app.scan_board(self.summary(), "Points", ["Boston Celtics", "Los Angeles Clippers"], None, None)
+        self.assertTrue(all(v is None for v in six.values()))
+
+    def test_progress_bar_is_updated(self):
+        bar = MagicMock()
+        self.app.scan_board(self.summary(), "Points", ["Boston Celtics", "Los Angeles Clippers"], 6.5, None, bar)
+        self.assertGreaterEqual(bar.progress.call_count, 3)
+        self.assertEqual(bar.progress.call_args.args[0], 1.0)
+
+    def test_tagged_table_puts_sharp_first(self):
+        import six_point as sp
+        six = self.app.scan_board(self.summary(), "Points", ["Boston Celtics", "Los Angeles Clippers"], 6.5, None)
+        table = sp.add_six_point_column(self.summary(), six)
+        self.assertEqual(table["Player"].iloc[0], "Clip Star")
+        self.assertTrue(table[sp.TAG_COL].iloc[0].startswith("🔥 SHARP 6/6"))
+        self.assertEqual(table[sp.TAG_COL].iloc[-1], "—")
+
+
 if __name__ == "__main__":
     unittest.main()
