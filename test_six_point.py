@@ -154,5 +154,52 @@ class TestDataHelpers(unittest.TestCase):
         self.assertIsNone(sp.extract_spread({"bookmakers": [{"markets": [{"key": "h2h", "outcomes": []}]}]}))
 
 
+class TestTagging(unittest.TestCase):
+    def six(self, score_, side="Over", tier=None):
+        t = tier or sp.tier_for(score_)
+        return {"best": side, side: {"side": side, "score": score_, "tier": t, "checks": []}}
+
+    def test_nickname_and_opponent(self):
+        self.assertEqual(sp.nickname("LA Clippers"), sp.nickname("Los Angeles Clippers"))
+        teams = ["Boston Celtics", "Los Angeles Clippers"]
+        self.assertEqual(sp.opponent_for("LA Clippers", teams), "Boston Celtics")
+        self.assertEqual(sp.opponent_for("Boston Celtics", teams), "Los Angeles Clippers")
+        self.assertIsNone(sp.opponent_for("Miami Heat", teams))
+        self.assertIsNone(sp.opponent_for(None, teams))
+        self.assertIsNone(sp.opponent_for("Boston Celtics", ["Boston Celtics"]))
+        self.assertIsNone(sp.opponent_for("Portland Trail Blazers", ["Portland Trail Blazers", "Portland Trail Blazers"]))  # ambiguous
+
+    def test_tag_text(self):
+        self.assertEqual(sp.tag_text(self.six(6)), "🔥 SHARP 6/6 · Over")
+        self.assertEqual(sp.tag_text(self.six(5, "Under")), "⚡ LEAN 5/6 · Under")
+        self.assertEqual(sp.tag_text(self.six(4)), "4/6")
+        self.assertEqual(sp.tag_text(self.six(0)), "0/6")
+        self.assertEqual(sp.tag_text(None), "—")
+
+    def board(self):
+        return pd.DataFrame({"Player": ["A", "B", "C", "D", "E"], "Line": [10.5, 11.5, 12.5, 13.5, 14.5],
+                             "Over": [-110] * 5, "Under": [-110] * 5})
+
+    def test_column_added_and_sorted_best_first_stably(self):
+        six = {"A": self.six(4), "B": self.six(6), "C": None, "D": self.six(5, "Under"), "E": self.six(4)}
+        out = sp.add_six_point_column(self.board(), six)
+        self.assertEqual(out["Player"].tolist(), ["B", "D", "A", "E", "C"])     # 6, 5, 4, 4 (stable), unscored last
+        self.assertEqual(out[sp.TAG_COL].tolist(), ["🔥 SHARP 6/6 · Over", "⚡ LEAN 5/6 · Under", "4/6", "4/6", "—"])
+        self.assertEqual(out.index.tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(self.board().columns.tolist(), ["Player", "Line", "Over", "Under"])   # input untouched
+
+    def test_players_missing_from_results_get_a_dash(self):
+        out = sp.add_six_point_column(self.board(), {})
+        self.assertTrue((out[sp.TAG_COL] == "—").all())
+        self.assertEqual(out["Player"].tolist(), ["A", "B", "C", "D", "E"])
+
+    def test_row_styling(self):
+        out = sp.add_six_point_column(self.board(), {"A": self.six(6), "B": self.six(5), "C": self.six(3)})
+        html = sp.style_tags(out).to_html()
+        self.assertIn("#166534", html)       # SHARP row
+        self.assertIn("#a16207", html)       # LEAN row
+        self.assertEqual(html.count("#166534") > 0 and html.count("#a16207") > 0, True)
+
+
 if __name__ == "__main__":
     unittest.main()
