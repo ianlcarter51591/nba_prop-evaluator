@@ -204,3 +204,57 @@ def extract_spread(payload: Mapping[str, Any]) -> Optional[float]:
                 if points:
                     return min(points)
     return None
+
+
+# --- Odds-board tagging --------------------------------------------------------
+TAG_COL = "Six-Point"
+
+
+def nickname(team: Any) -> str:
+    """Last word of a team name, lower-cased ("LA Clippers" and "Los Angeles Clippers" both -> "clippers")."""
+    parts = str(team or "").split()
+    return parts[-1].lower() if parts else ""
+
+
+def opponent_for(player_team: Optional[str], game_teams: List[str]) -> Optional[str]:
+    """The other team in a two-team game, or None if the player's team isn't one of them."""
+    if not player_team or len(game_teams) != 2:
+        return None
+    mine = [i for i, t in enumerate(game_teams) if nickname(t) == nickname(player_team)]
+    return game_teams[1 - mine[0]] if len(mine) == 1 else None
+
+
+def _best(six: Optional[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    """The scored result for the recommended side, or None."""
+    return six[six["best"]] if six else None
+
+
+def tag_text(six: Optional[Mapping[str, Any]]) -> str:
+    """Cell text: tier tag for 5/6 and 6/6, plain score otherwise, a dash when not scored."""
+    best = _best(six)
+    if best is None:
+        return "—"
+    if best["tier"] == "SHARP":
+        return f"🔥 SHARP {best['score']}/6 · {best['side']}"
+    if best["tier"] == "LEAN":
+        return f"⚡ LEAN {best['score']}/6 · {best['side']}"
+    return f"{best['score']}/6"
+
+
+def add_six_point_column(summary: pd.DataFrame, six_by_player: Mapping[str, Optional[Mapping[str, Any]]]) -> pd.DataFrame:
+    """Add the tag column to the odds-board table and list the best-scoring props first (stable)."""
+    out = summary.copy()
+    out[TAG_COL] = out["Player"].map(lambda p: tag_text(six_by_player.get(p)))
+    rank = out["Player"].map(lambda p: (_best(six_by_player.get(p)) or {"score": -1})["score"])
+    return out.assign(_rank=rank).sort_values("_rank", ascending=False, kind="stable").drop(columns="_rank").reset_index(drop=True)
+
+
+def style_tags(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
+    """Row colors: green for SHARP, gold for LEAN (white-on-dark so they read on the dark table)."""
+    def row_style(row: pd.Series) -> List[str]:
+        tag = str(row.get(TAG_COL, ""))
+        css = ("background-color:#166534;color:#ffffff;font-weight:700" if tag.startswith("🔥")
+               else "background-color:#a16207;color:#ffffff;font-weight:700" if tag.startswith("⚡") else "")
+        return [css] * len(row)
+
+    return df.style.apply(row_style, axis=1)
