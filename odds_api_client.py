@@ -1,169 +1,129 @@
-"""Odds API client for fetching live DraftKings player prop markets."""
+"""Client for fetching live player props from The Odds API."""
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
-import numpy as np
-import pandas as pd
 import requests
+import pandas as pd
+from typing import Dict, Any, Tuple, List
 
-API_BASE = "https://api.the-odds-api.com/v4/sports"
+BASE_URL = "https://api.the-odds-api.com/v4"
+DEFAULT_BOOKS = "draftkings"
 
 SPORT_KEYS: Dict[str, str] = {
     "NFL": "americanfootball_nfl",
     "NBA": "basketball_nba",
 }
 
+# Mapping user-friendly names to official market keys required by The Odds API
 MARKETS: Dict[str, Dict[str, str]] = {
     "NFL": {
         "Passing Yards": "player_pass_yds",
         "Pass Completions": "player_pass_completions",
         "Pass Attempts": "player_pass_attempts",
         "Passing TDs": "player_pass_tds",
-        "Interceptions": "player_pass_interceptions",
         "Rushing Yards": "player_rush_yds",
         "Rushing Attempts": "player_rush_attempts",
         "Receiving Yards": "player_reception_yds",
         "Receptions": "player_receptions",
-        "Kicking Points": "player_kicking_points",
-        "Field Goals Made": "player_field_goals",
-        "Anytime Touchdown Scorer": "player_anytime_td",
-    }
+        "Interceptions": "player_pass_interceptions",
+    },
+    "NBA": {
+        "Points": "player_points",
+        "Rebounds": "player_rebounds",
+        "Assists": "player_assists",
+        "3-Pointers Made": "player_threes",
+        "Pts + Reb + Ast": "player_points_rebounds_assists",
+        "Steals": "player_steals",
+        "Blocks": "player_blocks",
+    },
 }
 
-
 class OddsApiError(Exception):
-    """Custom exception for Odds API request issues."""
     pass
 
+def parse_books(books_str: str) -> Tuple[str, ...]:
+    return tuple(b.strip().lower() for b in books_str.split(",") if b.strip())
 
-def _resolve_sport_key(sport: str) -> str:
-    s = str(sport or "").upper().strip()
-    return SPORT_KEYS.get(s, s.lower())
-
-
-def et_label(iso: str) -> str:
-    """Odds API UTC timestamp -> US Eastern label like '2026-11-09 8:20 PM EST' (EDT in summer); the raw text if unparseable."""
-    try:
-        from zoneinfo import ZoneInfo
-        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt = dt.astimezone(ZoneInfo("America/New_York"))
-        return f"{dt:%Y-%m-%d} {int(dt.strftime('%I'))}:{dt:%M} {dt:%p} {dt:%Z}"
-    except Exception:
-        return str(iso)
-
-
-def list_events(sport: str, api_key: str) -> Tuple[pd.DataFrame, int]:
-    sport_key = _resolve_sport_key(sport)
-    url = f"{API_BASE}/{sport_key}/events"
+def list_events(sport: str, api_key: str) -> Tuple[pd.DataFrame, Any]:
+    sport_key = SPORT_KEYS.get(sport.upper(), "americanfootball_nfl")
+    url = f"{BASE_URL}/sports/{sport_key}/events"
     params = {"apiKey": api_key}
-    resp = requests.get(url, params=params, timeout=10)
-    if resp.status_code != 200:
-        raise OddsApiError(f"API Error ({resp.status_code}): {resp.text}")
     
-    data = resp.json()
-    remaining_requests = int(resp.headers.get("x-requests-remaining", 0))
+    res = requests.get(url, params=params, timeout=10)
+    if res.status_code != 200:
+        raise OddsApiError(f"API Error ({res.status_code}): {res.text}")
     
+    events = res.json()
     rows = []
-    for ev in data:
+    for e in events:
+        home = e.get("home_team", "Home")
+        away = e.get("away_team", "Away")
         rows.append({
-            "id": ev["id"],
-            "commence_time": ev["commence_time"],
-            "home_team": ev["home_team"],
-            "away_team": ev["away_team"],
-            "label": f"{ev['away_team']} @ {ev['home_team']} ({et_label(ev['commence_time'])})"
+            "id": e.get("id"),
+            "label": f"{away} @ {home}",
+            "commence_time": e.get("commence_time")
         })
-    return pd.DataFrame(rows), remaining_requests
-
+    return pd.DataFrame(rows), None
 
 def fetch_prop_board(
-    sport: str,
-    event_id: str,
-    market_label: str,
-    bookmakers: Tuple[str, ...],
-    api_key: str
-) -> Tuple[pd.DataFrame, int]:
-    sport_map = MARKETS.get(sport.upper(), MARKETS.get("NFL", {}))
-    market_key = sport_map.get(market_label)
-    if not market_key:
-        raise OddsApiError(f"Market label '{market_label}' is not supported for live API fetching.")
-
-    sport_key = _resolve_sport_key(sport)
-    url = f"{API_BASE}/{sport_key}/events/{event_id}/odds"
+    sport: str, event_id: str, market_label: str, books: Tuple[str, ...], api_key: str
+) -> Tuple[pd.DataFrame, Any]:
+    sport_key = SPORT_KEYS.get(sport.upper(), "americanfootball_nfl")
+    market_key = MARKETS.get(sport.upper(), {}).get(market_label, "player_pass_yds")
+    book_param = ",".join(books) if books else "draftkings"
+    
+    url = f"{BASE_URL}/sports/{sport_key}/events/{event_id}/odds"
     params = {
         "apiKey": api_key,
         "regions": "us",
         "markets": market_key,
-        "bookmakers": ",".join(bookmakers),
+        "bookmakers": book_param,
         "oddsFormat": "american",
     }
-    resp = requests.get(url, params=params, timeout=10)
-    if resp.status_code != 200:
-        raise OddsApiError(f"API Error ({resp.status_code}): {resp.text}")
-
-    remaining_requests = int(resp.headers.get("x-requests-remaining", 0))
-    data = resp.json()
     
+    res = requests.get(url, params=params, timeout=10)
+    if res.status_code != 200:
+        raise OddsApiError(f"API Error ({res.status_code}): {res.text}")
+    
+    data = res.json()
     rows = []
-    for bmark in data.get("bookmakers", []):
-        book_title = bmark.get("title", bmark.get("key"))
-        for mkt in bmark.get("markets", []):
-            for outcome in mkt.get("outcomes", []):
+    for b in data.get("bookmakers", []):
+        book_name = b.get("title", "DraftKings")
+        for m in b.get("markets", []):
+            for outcome in m.get("outcomes", []):
                 rows.append({
-                    "Bookmaker": book_title,
                     "Player": outcome.get("description", outcome.get("name")),
-                    "Side": outcome.get("name"),
-                    "Line": outcome.get("point", np.nan),
-                    "Odds": outcome.get("price"),
+                    "Book": book_name,
+                    "Type": outcome.get("name"),  # Over or Under
+                    "Line": outcome.get("point", 0.0),
+                    "Price": outcome.get("price", -110),
                 })
-    return pd.DataFrame(rows), remaining_requests
-
-
-def _synthetic_under(over_odds: float) -> float:
-    """Generate fair synthetic opposite Under odds if the sportsbook only lists Over."""
-    try:
-        o = float(over_odds)
-        p_over = 100.0 / (o + 100.0) if o > 0 else (-o) / (-o + 100.0)
-        p_under = max(1.0 - p_over, 0.05)
-        p_juiced = min(p_under * 1.05, 0.95)
-        if p_juiced >= 0.5:
-            return -round((p_juiced / (1.0 - p_juiced)) * 100.0)
-        return round(((1.0 - p_juiced) / p_juiced) * 100.0)
-    except Exception:
-        return -110.0
-
+    return pd.DataFrame(rows), None
 
 def summarize_board(board: pd.DataFrame) -> pd.DataFrame:
-    """Pivot raw outcomes table into a single row per player with Line, Over, and Under columns."""
     if board.empty:
-        return pd.DataFrame(columns=["Player", "Line", "Over", "Under"])
+        return pd.DataFrame()
     
-    pivoted = []
-    for player, grp in board.groupby("Player"):
-        line_series = grp["Line"].dropna()
-        line = line_series.iloc[0] if not line_series.empty else 0.5
+    players = board["Player"].unique()
+    rows = []
+    for p in players:
+        p_df = board[board["Player"] == p]
+        line = p_df["Line"].iloc[0] if not p_df.empty else 0.0
+        over_row = p_df[p_df["Type"] == "Over"]
+        under_row = p_df[p_df["Type"] == "Under"]
         
-        over_odds = grp[grp["Side"].isin(["Over", "Yes"])]["Odds"].values
-        under_odds = grp[grp["Side"].isin(["Under", "No"])]["Odds"].values
+        over_price = over_row["Price"].iloc[0] if not over_row.empty else -110
+        under_price = under_row["Price"].iloc[0] if not under_row.empty else -110
         
-        over_val = over_odds[0] if len(over_odds) > 0 else np.nan
-        under_val = under_odds[0] if len(under_odds) > 0 else np.nan
-        
-        if pd.notna(over_val) and pd.isna(under_val):
-            under_val = _synthetic_under(over_val)
-        
-        pivoted.append({
-            "Player": player,
-            "Line": float(line) if pd.notna(line) else 0.5,
-            "Over": float(over_val) if pd.notna(over_val) else np.nan,
-            "Under": float(under_val) if pd.notna(under_val) else np.nan,
+        rows.append({
+            "Player": p,
+            "Line": line,
+            "Over": over_price,
+            "Under": under_price,
         })
-    return pd.DataFrame(pivoted)
+    return pd.DataFrame(rows)
 
-
-def player_offers(board: pd.DataFrame, player_name: str) -> pd.DataFrame:
-    summary = summarize_board(board)
-    return summary[summary["Player"] == player_name]
+def player_offers(board: pd.DataFrame, player: str) -> pd.DataFrame:
+    p_df = board[board["Player"] == player]
+    if p_df.empty:
+        return pd.DataFrame()
+    return summarize_board(p_df)
