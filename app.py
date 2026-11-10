@@ -22,6 +22,43 @@ except ImportError:  # pragma: no cover
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
 
+
+def _startup_problems() -> List[str]:
+    """One line per missing / wrong file among the six-point modules (Streamlit Cloud hides ImportError text)."""
+    import importlib
+    out: List[str] = []
+    for mod, names in (("six_point_core", ("LEGEND", "assessment_summary", "choose_best", "assemble", "tag_text")),
+                       ("six_point", ("assess", "extract_spread", "compute_opp_allowed_recent", "opponent_for", "nickname"))):
+        try:
+            m = importlib.import_module(mod)
+        except ModuleNotFoundError as e:
+            if e.name == mod:
+                out.append(f"{mod}.py is missing from the app folder.")
+            elif e.name in ("six_point_core", "six_point"):
+                out.append(f"{e.name}.py is missing from the app folder (needed by {mod}.py).")
+            elif str(e.name).startswith(("nfl_", "multi_sport", "sports_data")):
+                out.append(f"{mod}.py is the NFL version of the file (it needs {e.name}). Replace it with the NBA {mod}.py.")
+            else:
+                out.append(f"{mod}.py needs the package '{e.name}', which isn't installed (add it to requirements.txt).")
+            continue
+        except Exception as e:
+            out.append(f"{mod}.py failed to import: {type(e).__name__}: {e}")
+            continue
+        missing = [n for n in names if not hasattr(m, n)]
+        if missing:
+            out.append(f"{mod}.py is an older or different version: it has no {', '.join(missing)}. Replace it with the matching file.")
+    return out
+
+
+_STARTUP_PROBLEMS = _startup_problems()
+if _STARTUP_PROBLEMS:
+    st.set_page_config(page_title="NBA Prop Evaluator", page_icon="⚡", layout="wide")
+    st.error("The app can't start: some files are missing or out of date.")
+    for _p in _STARTUP_PROBLEMS:
+        st.code(_p)
+    st.caption("Upload the named file(s) to the same folder as app.py on GitHub, then reboot the app.")
+    st.stop()
+
 from six_point_core import LEGEND, assessment_summary
 from six_point import (
     BLOWOUT_SPREAD, RECENT_GAMES, add_six_point_column, assess as six_point_assess, compute_opp_allowed_recent, extract_spread,
