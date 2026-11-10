@@ -28,7 +28,8 @@ def _startup_problems() -> List[str]:
     """One line per missing / wrong file among the six-point modules (Streamlit Cloud hides ImportError text)."""
     import importlib
     out: List[str] = []
-    for mod, names in (("six_point_core", ("LEGEND", "assessment_summary", "choose_best", "assemble", "tag_text")),
+    for mod, names in (("odds_credits", ("record_headers", "fetch_cached", "credits_status", "friendly_error", "cache_note")),
+                       ("six_point_core", ("LEGEND", "assessment_summary", "choose_best", "assemble", "tag_text", "find_espn_spread")),
                        ("six_point", ("assess", "extract_spread", "compute_opp_allowed_recent", "opponent_for", "nickname"))):
         try:
             m = importlib.import_module(mod)
@@ -60,7 +61,8 @@ if _STARTUP_PROBLEMS:
     st.caption("Upload the named file(s) to the same folder as app.py on GitHub, then reboot the app.")
     st.stop()
 
-from six_point_core import LEGEND, assessment_summary
+import odds_credits
+from six_point_core import LEGEND, assessment_summary, find_espn_spread
 from six_point import (
     BLOWOUT_SPREAD, RECENT_GAMES, add_six_point_column, assess as six_point_assess, compute_opp_allowed_recent, extract_spread,
     nickname, opponent_for, style_tags,
@@ -225,6 +227,7 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
     url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
     try:
         resp = requests.get(url, params={"apiKey": api_key}, timeout=8)
+        odds_credits.record_headers(resp.headers)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
         rows = []
@@ -244,6 +247,7 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
     params = {"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "american"}
     try:
         resp = requests.get(url, params=params, timeout=8)
+        odds_credits.record_headers(resp.headers)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
         bookmakers = resp.json().get("bookmakers", [])
@@ -264,13 +268,33 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         return pd.DataFrame(), f"Error fetching prop board: {e}"
 
 
+ESPN_NBA_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+
+
+def espn_game_spread(away: str, home: str, game_date: str) -> Optional[float]:
+    """Absolute spread for the game from ESPN's free scoreboard (DraftKings line), or None if ESPN has none."""
+    try:
+        day = date.fromisoformat(str(game_date)).strftime("%Y%m%d")
+        resp = requests.get(ESPN_NBA_SCOREBOARD, params={"dates": day, "limit": 50}, headers=ESPN_HEADERS, timeout=8)
+        resp.raise_for_status()
+        return find_espn_spread(resp.json(), [away, home])
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_game_spread(event_id: str, api_key: str) -> Tuple[Optional[float], Optional[str]]:
-    """Absolute DraftKings point spread for one game (costs 1 Odds API credit, cached 5 min)."""
+def fetch_game_spread(event_id: str, api_key: str, away: str = "", home: str = "", game_date: str = "") -> Tuple[Optional[float], Optional[str]]:
+    """Absolute point spread for one game, cached 5 min. Tries ESPN first (free); only if ESPN has no line does it spend
+    1 Odds API credit on DraftKings' spread."""
+    if away and home and game_date:
+        free = espn_game_spread(away, home, game_date)
+        if free is not None:
+            return free, None
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     params = {"apiKey": api_key, "regions": "us", "markets": "spreads", "bookmakers": "draftkings", "oddsFormat": "american"}
     try:
         resp = requests.get(url, params=params, timeout=8)
+        odds_credits.record_headers(resp.headers)
         if resp.status_code != 200:
             return None, f"Spread unavailable (Odds API {resp.status_code})."
         spread = extract_spread(resp.json())
@@ -2295,25 +2319,38 @@ def main() -> None:
                 if st.button("Step 1: Load Upcoming NBA Games", key="load_nba_games"):
                     events_df, err = list_nba_events(api_key)
                     if err:
-                        st.error(err)
+                        st.error(odds_credits.friendly_error(err))
                     else:
                         ss["events_df"] = events_df
                 events_df = ss.get("events_df")
                 if events_df is not None and not events_df.empty:
                     game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
+                    refresh = st.checkbox("Refresh odds (costs credits; otherwise a board fetched in the last 10 min is reused for free)",
+                                          key="refresh_odds")
                     if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
-                        board_df, err = fetch_nba_prop_board(str(events_df.loc[game_idx, "id"]), market_key, api_key)
+                        ev_id = str(events_df.loc[game_idx, "id"])
+                        (board_df, err), cached_age = odds_credits.fetch_cached(
+                            ("NBA", ev_id, market_key), lambda: fetch_nba_prop_board(ev_id, market_key, api_key),
+                            lambda v: v[1] is None and not v[0].empty, refresh)
                         if err:
-                            st.error(err)
+                            st.error(odds_credits.friendly_error(err))
                         else:
+                            st.caption(odds_credits.cache_note(cached_age))
                             ss["board_df"] = board_df
                             ss["board_token"], ss["board_scan"] = uuid.uuid4().hex, None
                             ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
-                            ss["board_spread"], spread_err = fetch_game_spread(str(events_df.loc[game_idx, "id"]), api_key)
+                            ss["board_spread"], spread_err = fetch_game_spread(
+                                ev_id, api_key, str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"]),
+                                str(events_df.loc[game_idx].get("game_date", "")))
                             if spread_err:
                                 st.warning(f"{spread_err} The Game Script check can't be verified without it.")
                             ss["board_date"] = _iso_to_date(events_df.loc[game_idx].get("game_date", ""))
+                _credit_text, _credit_level = odds_credits.credits_status()
+                if _credit_level in ("low", "out"):
+                    st.warning(_credit_text)
+                elif _credit_text:
+                    st.caption(_credit_text)
                 board_df = ss.get("board_df")
                 if board_df is not None and not board_df.empty:
                     summary = summarize_board(board_df)
