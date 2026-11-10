@@ -18,6 +18,7 @@ Only sport-specific data (thresholds, injury rules, weather, rank source) lives 
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -169,6 +170,34 @@ def side_p_market(res: Mapping[str, Any], ev_side: str) -> Dict[str, float]:
         return {s: float(sides[s]["p_market"]) / 100.0 for s in SIDES}
     p = float(res["p_market"]) / 100.0
     return {ev_side: p, ("Under" if ev_side == "Over" else "Over"): 1.0 - p}
+
+
+# --- Free spread from ESPN's scoreboard (saves an Odds API credit) -----------------------------
+def spread_from_espn_odds(odds: Any) -> Optional[float]:
+    """Absolute spread from an ESPN `odds` list (numeric field, else the 'KC -3.5' text); 0 for pick'em; None if absent."""
+    for o in odds or []:
+        sp = o.get("spread")
+        if isinstance(sp, (int, float)) and not isinstance(sp, bool):
+            return abs(float(sp))
+        det = str(o.get("details") or "")
+        if re.search(r"\b(EVEN|PK|PICK)\b", det, re.IGNORECASE):
+            return 0.0
+        m = re.search(r"([+-]\d+(?:\.\d+)?)\s*$", det)
+        if m:
+            return abs(float(m[1]))
+    return None
+
+
+def find_espn_spread(payload: Mapping[str, Any], teams: Sequence[str]) -> Optional[float]:
+    """Absolute spread for the game between `teams` in an ESPN scoreboard payload (teams matched by nickname), else None."""
+    want = {nickname(t) for t in teams if nickname(t)}
+    for ev in payload.get("events", []) if isinstance(payload, Mapping) else []:
+        comp = (ev.get("competitions") or [{}])[0]
+        got = {nickname((c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("name") or "")
+               for c in comp.get("competitors", [])}
+        if want and want <= got:
+            return spread_from_espn_odds(comp.get("odds"))
+    return None
 
 
 # --- Odds-board tagging (same cell text, order and colors in both apps) -----------------
