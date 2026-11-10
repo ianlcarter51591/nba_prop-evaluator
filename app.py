@@ -22,9 +22,10 @@ except ImportError:  # pragma: no cover
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
 
+from six_point_core import LEGEND, assessment_summary
 from six_point import (
-    BLOWOUT_SPREAD, RECENT_GAMES, add_six_point_column, compute_opp_allowed_recent, extract_spread, nickname, opponent_for,
-    score_prop, style_tags,
+    BLOWOUT_SPREAD, RECENT_GAMES, add_six_point_column, assess as six_point_assess, compute_opp_allowed_recent, extract_spread,
+    nickname, opponent_for, style_tags,
 )
 
 st.set_page_config(
@@ -1445,11 +1446,9 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         # Automatically run contextual checks
         context_checks = run_automated_context_filters(proj.minutes, raw_avg, own_state)
 
-        six = {nm: score_prop(nm, stat_col, float(line), float(proj.mu), float(dv_),
-                              (opp_detail or {}).get("rank"), (opp_detail or {}).get("recent_rank"),
-                              (opp_detail or {}).get("n_teams"), inj_out, game_spread, ROTATION_MIN).as_dict()
-               for nm, dv_ in (("Over", dv_over), ("Under", dv_under))}
-        six["best"] = "Over" if is_over else "Under"
+        six = six_point_assess(stat_col, float(line), float(proj.mu), {nm: sides[nm]["p_market"] / 100.0 for nm in ("Over", "Under")},
+                               (opp_detail or {}).get("rank"), (opp_detail or {}).get("recent_rank"),
+                               (opp_detail or {}).get("n_teams"), inj_out, game_spread, "Over" if is_over else "Under", ROTATION_MIN)
 
         warnings: List[str] = []
         if proj.n_current < 8:
@@ -1757,21 +1756,24 @@ def render_automated_checks(res: Dict[str, Any]) -> None:
 
 
 def render_final_assessment(res: Dict[str, Any]) -> None:
-    """Final assessment: the six-point criteria for the recommended side (6/6 SHARP, 5/6 LEAN)."""
-    six = res.get("six_point")
-    if not six:
+    """Final assessment: six-point criteria for the better-scoring side (6/6 SHARP, 5/6 LEAN). Same result the odds table tags."""
+    info = assessment_summary(res)
+    if info is None:
         return
-    best = six[six["best"]]
-    other = six["Under" if six["best"] == "Over" else "Over"]
+    best, other = info["best"], info["other"]
     tone = {"SHARP": "good", "LEAN": "neutral", "PASS": "bad"}[best["tier"]]
+    line_txt = res["best_side"].split(" ", 1)[1] if " " in str(res["best_side"]) else ""
     st.markdown("### 🏁 Final Assessment: 6-Point Check")
     a, b, c = st.columns([1, 1, 2])
-    _metric(a, f"TIER · {best['side'].upper()} {res['best_side'].split(' ', 1)[1]}", best["tier"], tone)
-    _metric(b, "CRITERIA MET", f"{best['score']}/6", tone)
-    c.caption(f"6/6 = SHARP · 5/6 = LEAN · 4 or fewer = PASS. Scored for the model's best side ({best['side']}). "
-              f"The {other['side']} would score {other['score']}/6 ({other['tier']}). A check that can't be verified counts as failed.")
-    if best["tier"] != "PASS" and res["ev_pct"] <= 0:
-        st.warning("⚠️ The six-point score is positive but the model's EV at this price is not. Check the price before betting.")
+    _metric(a, f"TIER · {best['side'].upper()} {line_txt}".strip(), best["tier"], tone)
+    _metric(b, f"CRITERIA FOR {best['side'].upper()}", f"{best['score']}/6", tone)
+    c.caption(f"**{best['score']}/6 criteria support the {best['side']}** (6/6 = SHARP · 5/6 = LEAN · 4 or fewer = PASS). "
+              f"The {other['side']} meets {other['score']}/6 ({other['tier']}). A check that can't be verified counts as failed.")
+    if info["side_differs"]:
+        st.info(f"The model's highest-EV side is {info['ev_side']}, but {best['side']} meets more of the six criteria.")
+    if best["tier"] != "PASS" and info["side_ev_pct"] <= 0:
+        st.warning(f"⚠️ {best['side']} meets the criteria but the model's EV at this price is {info['side_ev_pct']:+.1f}%. "
+                   "Check the price before betting.")
     cx = res.get("context") or {}
     if cx:
         src = " (taken from the game selected in Step 2)" if cx.get("from_game") else ""
@@ -2212,8 +2214,7 @@ def main() -> None:
                     if scan and scan.get("token") == ss.get("board_token"):
                         shown = add_six_point_column(summary, scan["six"])
                     st.dataframe(style_tags(shown) if "Six-Point" in shown else shown, use_container_width=True)
-                    st.caption("🔥 SHARP = 6/6 criteria · ⚡ LEAN = 5/6 · other rows show their score; — = couldn't be scored. "
-                               "Each prop is scored on its best side by EV.")
+                    st.caption(LEGEND)
                     if st.button("🔎 Scan board for 5/6 & 6/6 props", key="scan_board_btn"):
                         bar = st.progress(0.0, text="Starting scan...")
                         ss["board_scan"] = {"token": ss.get("board_token"),
