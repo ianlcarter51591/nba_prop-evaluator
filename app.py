@@ -152,6 +152,18 @@ def _to_et_date(iso: str) -> Optional[date]:
         return None
 
 
+def et_label(iso: str) -> str:
+    """Odds API UTC timestamp -> US Eastern label like '2026-11-10 7:40 PM EST' (EDT in summer); '' if unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(ZoneInfo("America/New_York"))
+        return f"{dt:%Y-%m-%d} {int(dt.strftime('%I'))}:{dt:%M} {dt:%p} {dt:%Z}"
+    except Exception:
+        return ""
+
+
 def _iso_to_date(s: Any) -> Optional[date]:
     """'YYYY-MM-DD' -> date, or None if blank/invalid."""
     try:
@@ -179,9 +191,9 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
         rows = []
         for ev in resp.json():
             home, away = ev.get("home_team", ""), ev.get("away_team", "")
-            commence = ev.get("commence_time", "")[:16].replace("T", " ")
             et = _to_et_date(ev.get("commence_time", ""))
-            rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({commence} UTC)", "home": home, "away": away,
+            when = et_label(ev.get("commence_time", "")) or str(ev.get("commence_time", ""))[:16].replace("T", " ") + " UTC"
+            rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({when})", "home": home, "away": away,
                          "game_date": et.isoformat() if et else ""})
         return pd.DataFrame(rows), None
     except Exception as e:
