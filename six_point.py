@@ -1,256 +1,144 @@
-"""Six-point prop criteria, shared by the NBA and NFL apps (one copy of the rules, so both score identically).
+"""Six-point prop criteria for the NBA Prop Evaluator.
 
-Score = number of passed checks for a side:  6/6 -> SHARP,  5/6 -> LEAN,  <= 4/6 -> PASS.
-A check that cannot be verified counts as NOT passed (shown as unverified).
-
-    1. Baby line      line >= spec.min_line[stat]
-    2. AI edge        margin (proj - line for Over, line - proj for Under) >= max(min_edge_abs[stat], min_edge_pct * line)
-    3. Implied chance devigged market probability of the side > spec.implied_min
-    4. Defensive rank season-long AND recent opponent ranks both support the side
-                      (rank 1 = softest: Over needs rank <= cutoff, Under needs rank > n_teams - cutoff)
-    5. Injury         nobody relevant flagged (the sport module decides who is relevant)
-    6. Game script    |spread| < spec.blowout_spread, and no bad weather where the sport has any
-
-Which side is shown: whichever side meets MORE criteria; a tie goes to the model's best-EV side (choose_best).
-The odds-table tag and the Final Assessment both read the same result, so they cannot disagree.
-
-Only sport-specific data (thresholds, injury rules, weather, rank source) lives in six_point.py / nfl_six_point.py.
+The rules, tiers, side selection and odds-table tagging live in six_point_core.py (shared with the NFL app, so both
+score identically). This file holds only NBA-specific data: thresholds, who counts as a relevant injury, the recent
+opponent table, and the spread parser. 6/6 -> SHARP, 5/6 -> LEAN, <= 4/6 -> PASS; an unverifiable check counts as failed.
 """
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 import pandas as pd
 
-SHARP_SCORE, LEAN_SCORE = 6, 5
-SIDES: Tuple[str, str] = ("Over", "Under")
+import six_point_core as core
+from six_point_core import (  # noqa: F401  (re-exported: the app and tests import these from here)
+    SHARP_SCORE, LEAN_SCORE, TAG_COL, Check, SixPointResult, add_six_point_column, nickname, opponent_for, style_tags,
+    tag_text, tier_for,
+)
+
+_best = core.shown
+
+# --- Thresholds (edit freely) -------------------------------------------------
+MIN_LINE: Dict[str, float] = {
+    "POINTS": 14.5, "REBOUNDS": 4.5, "ASSISTS": 3.5, "3-POINTERS MADE": 1.5,
+    "PTS + REB + AST": 20.5, "PTS + AST": 16.5, "PTS + REB": 17.5, "REB + AST": 8.5,
+    "STEALS": 1.5, "BLOCKS": 1.5,
+}
+MIN_EDGE_ABS: Dict[str, float] = {
+    "POINTS": 1.5, "REBOUNDS": 1.0, "ASSISTS": 1.0, "3-POINTERS MADE": 0.5,
+    "PTS + REB + AST": 2.5, "PTS + AST": 2.0, "PTS + REB": 2.0, "REB + AST": 1.5,
+    "STEALS": 0.4, "BLOCKS": 0.4,
+}
+MIN_EDGE_PCT = 0.06
+IMPLIED_MIN = 0.50
+RANK_CUTOFF = 15          # half of a 30-team league
+RECENT_GAMES = 10         # "recent" opponent window, in that team's games
+BLOWOUT_SPREAD = 10.0
+
+NBA_SPEC = core.SportSpec("NBA", MIN_LINE, MIN_EDGE_ABS, RANK_CUTOFF, RECENT_GAMES, MIN_EDGE_PCT, IMPLIED_MIN, BLOWOUT_SPREAD)
 
 
-@dataclass(frozen=True)
-class SportSpec:
-    """Per-sport thresholds. Everything else in this file is identical for every sport."""
-
-    name: str
-    min_line: Mapping[str, float]
-    min_edge_abs: Mapping[str, float]
-    rank_cutoff: int                 # half of the league (15 of 30 NBA teams, 16 of 32 NFL teams)
-    recent_games: int                # "recent" defense window, in that team's games
-    min_edge_pct: float = 0.06
-    implied_min: float = 0.50
-    blowout_spread: float = 10.0
+# --- Individual checks (thin wrappers over the shared rules) --------------------------
+def check_line(stat_col: str, line: float) -> Check:
+    """1. Baby line."""
+    return core.check_line(NBA_SPEC, stat_col, line)
 
 
-@dataclass(frozen=True)
-class Check:
-    """One criterion's outcome. `verified=False` means the data was unavailable."""
-
-    key: str
-    label: str
-    passed: bool
-    detail: str
-    verified: bool = True
+def check_edge(side: str, stat_col: str, line: float, proj: float) -> Check:
+    """2. AI edge."""
+    return core.check_edge(NBA_SPEC, side, stat_col, line, proj)
 
 
-@dataclass(frozen=True)
-class SixPointResult:
-    """All six checks for one side plus the tier."""
-
-    side: str
-    score: int
-    tier: str
-    checks: Tuple[Check, ...]
-
-    def as_dict(self) -> Dict[str, Any]:
-        """Plain-dict form (safe for st.session_state / JSON)."""
-        return {"side": self.side, "score": self.score, "tier": self.tier,
-                "checks": [c.__dict__.copy() for c in self.checks]}
+def check_implied(side: str, p_market: float) -> Check:
+    """3. Implied chance."""
+    return core.check_implied(NBA_SPEC, side, p_market)
 
 
-def tier_for(score: int) -> str:
-    """6 -> SHARP, 5 -> LEAN, otherwise PASS."""
-    return "SHARP" if score >= SHARP_SCORE else "LEAN" if score == LEAN_SCORE else "PASS"
-
-
-# --- The six checks -------------------------------------------------------------
-def check_line(spec: SportSpec, stat: str, line: float) -> Check:
-    """1. Baby line: the line must be at or above the stat's minimum."""
-    need = spec.min_line.get(stat, 0.0)
-    ok = bool(line >= need)
-    return Check("baby_line", "1. Line High Enough (Baby Line)", ok,
-                 f"Line {line:g} vs minimum {need:g} for this stat" + ("" if ok else ": too low, too risky"))
-
-
-def check_edge(spec: SportSpec, side: str, stat: str, line: float, proj: float) -> Check:
-    """2. AI edge: projection far enough past the line in the side's direction."""
-    margin = proj - line if side == "Over" else line - proj
-    need = max(spec.min_edge_abs.get(stat, 0.0), spec.min_edge_pct * abs(line))
-    ok = bool(margin >= need)
-    return Check("ai_edge", "2. AI Edge", ok,
-                 f"Projection {proj:.1f} is {margin:+.1f} {'above' if side == 'Over' else 'below'} "
-                 f"the line in your direction; needs at least {need:.1f}")
-
-
-def check_implied(spec: SportSpec, side: str, p_market: float) -> Check:
-    """3. Implied chance: the devigged market favors the selected side."""
-    ok = bool(p_market > spec.implied_min)
-    return Check("implied_chance", "3. Implied Chance", ok,
-                 f"Devigged DraftKings price gives {side} {p_market:.1%} (needs more than {spec.implied_min:.0%}); "
-                 "single book, no multi-book vote")
-
-
-def rank_supports(side: str, rank: int, n_teams: int, cutoff: int) -> bool:
+def rank_supports(side: str, rank: int, n_teams: int, cutoff: int = RANK_CUTOFF) -> bool:
     """Rank 1 = softest defense. Over wants a soft defense, Under a tough one."""
-    return rank <= cutoff if side == "Over" else rank > n_teams - cutoff
+    return core.rank_supports(side, rank, n_teams, cutoff)
 
 
-def check_defense(spec: SportSpec, side: str, season_rank: Optional[int], season_n: Optional[int],
-                  recent_rank: Optional[int], recent_n: Optional[int], who: str = "", hint: str = "") -> Check:
-    """4. Defensive rank: season-long and recent opponent ranks both support the side."""
-    label = "4. Defensive Rank"
-    if None in (season_rank, season_n, recent_rank, recent_n) or not season_n or not recent_n:
-        have = "season" if season_rank is not None else "recent" if recent_rank is not None else "neither"
-        return Check("defensive_rank", label, False,
-                     f"Not verified ({have} rank available)" + (f": {hint}" if hint else ""), verified=False)
-    ok = (rank_supports(side, int(season_rank), int(season_n), spec.rank_cutoff)
-          and rank_supports(side, int(recent_rank), int(recent_n), spec.rank_cutoff))
-    want = f"{spec.rank_cutoff} softest" if side == "Over" else f"{spec.rank_cutoff} toughest"
-    return Check("defensive_rank", label, bool(ok),
-                 f"{who}season #{season_rank} of {season_n}, last {spec.recent_games} games #{recent_rank} of {recent_n} "
-                 f"(1 = softest); {side} needs both in the {want}")
+def check_defense(side: str, season_rank: Optional[int], recent_rank: Optional[int], n_teams: Optional[int]) -> Check:
+    """4. Defensive rank: season-long and recent opponent ranks (30 teams) both support the side."""
+    return core.check_defense(NBA_SPEC, side, season_rank, n_teams, recent_rank, n_teams,
+                              hint="pick an opponent and enable stat-specific opponent factors")
 
 
-def check_injury(flagged: Optional[Sequence[str]], hint: str = "") -> Check:
-    """5. Injury: `flagged` lists everyone relevant with an active flag; None = the feed could not be read."""
-    label = "5. Injury"
-    if flagged is None:
-        return Check("injury", label, False, "Not verified: " + (hint or "injury feed unavailable or injury adjustment turned off"),
-                     verified=False)
-    return Check("injury", label, not flagged,
-                 "No active injury flags on the team" if not flagged else "Flagged: " + ", ".join(flagged))
-
-
-def check_game_script(spec: SportSpec, spread: Optional[float], env_verified: bool = True, env_bad: bool = False,
-                      env_detail: str = "", hint: str = "") -> Check:
-    """6. Game script: no blowout risk and no bad weather (`env_*` describe weather; indoor sports pass verified/not bad)."""
-    label = "6. Game Script"
-    if spread is None or not env_verified:
-        parts = ([hint or "spread unavailable"] if spread is None else []) + ([env_detail or "weather unavailable"] if not env_verified else [])
-        return Check("game_script", label, False, "Not verified: " + "; ".join(parts), verified=False)
-    ok = bool(abs(spread) < spec.blowout_spread) and not env_bad
-    return Check("game_script", label, ok,
-                 f"Spread {abs(spread):g} (blowout risk at {spec.blowout_spread:g}+)" + (f"; {env_detail}" if env_detail else ""))
-
-
-def result_from_checks(side: str, checks: Sequence[Check]) -> SixPointResult:
-    """Count the passed checks for one side and attach the tier."""
-    score = int(np.sum([c.passed for c in checks]))
-    return SixPointResult(side=side, score=score, tier=tier_for(score), checks=tuple(checks))
-
-
-# --- Which side is shown ----------------------------------------------------------
-def choose_best(six: Mapping[str, Mapping[str, Any]], ev_side: str) -> str:
-    """Side with the higher score; a tie goes to the model's best-EV side."""
-    return max(SIDES, key=lambda s: (six[s]["score"], s == ev_side))
-
-
-def assemble(over: SixPointResult, under: SixPointResult, ev_side: str) -> Dict[str, Any]:
-    """The dict both apps store: {"Over": {...}, "Under": {...}, "best": side shown, "ev_side": model's EV side}."""
-    out: Dict[str, Any] = {"Over": over.as_dict(), "Under": under.as_dict(), "ev_side": ev_side}
-    out["best"] = choose_best(out, ev_side)
+def flagged_players(inj: Mapping[str, Any], rotation_min: float) -> List[str]:
+    """Names with an active flag: the player himself and rotation teammates."""
+    out: List[str] = []
+    if inj.get("self_status"):
+        out.append(f"the player ({inj['self_status']})")
+    out += [f"{x['name']} ({x['status']})" for x in inj.get("listed", [])
+            if x.get("p_out", 0.0) > 0 and x.get("mpg", rotation_min) >= rotation_min]
     return out
 
 
-def side_p_market(res: Mapping[str, Any], ev_side: str) -> Dict[str, float]:
-    """Devigged market probability (0-1) of each side from an evaluation result (per-side numbers, else derived)."""
-    sides = res.get("sides")
-    if sides:
-        return {s: float(sides[s]["p_market"]) / 100.0 for s in SIDES}
-    p = float(res["p_market"]) / 100.0
-    return {ev_side: p, ("Under" if ev_side == "Over" else "Over"): 1.0 - p}
+def check_injury(inj: Mapping[str, Any], rotation_min: float) -> Check:
+    """5. Injury: nobody in the rotation carries an active flag (feed must have been read)."""
+    if not inj.get("checked") or not inj.get("feed_ok", False):
+        return core.check_injury(None)
+    return core.check_injury(flagged_players(inj, rotation_min))
 
 
-# --- Odds-board tagging (same cell text, order and colors in both apps) -----------------
-TAG_COL = "Six-Point"
+def check_game_script(spread: Optional[float]) -> Check:
+    """6. Game script: no blowout risk; the NBA is indoors, so weather cannot interfere."""
+    return core.check_game_script(NBA_SPEC, spread, True, False, "indoors, no weather risk",
+                                  hint="spread unavailable (load the game in Steps 1-3 to fetch it)")
 
 
-def nickname(team: Any) -> str:
-    """Last word of a team name, lower-cased ("LA Clippers" and "Los Angeles Clippers" both -> "clippers")."""
-    parts = str(team or "").split()
-    return parts[-1].lower() if parts else ""
+def score_prop(side: str, stat_col: str, line: float, proj: float, p_market: float,
+               season_rank: Optional[int], recent_rank: Optional[int], n_teams: Optional[int],
+               inj: Mapping[str, Any], spread: Optional[float], rotation_min: float = 10.0) -> SixPointResult:
+    """Run all six checks for one side and return the score and tier."""
+    return core.result_from_checks(side, (
+        check_line(stat_col, line), check_edge(side, stat_col, line, proj), check_implied(side, p_market),
+        check_defense(side, season_rank, recent_rank, n_teams), check_injury(inj, rotation_min), check_game_script(spread),
+    ))
 
 
-def opponent_for(player_team: Optional[str], game_teams: List[str]) -> Optional[str]:
-    """The other team in a two-team game, or None if the player's team isn't one of them."""
-    if not player_team or len(game_teams) != 2:
-        return None
-    mine = [i for i, t in enumerate(game_teams) if nickname(t) == nickname(player_team)]
-    return game_teams[1 - mine[0]] if len(mine) == 1 else None
+def assess(stat_col: str, line: float, proj: float, p_market: Mapping[str, float], season_rank: Optional[int],
+           recent_rank: Optional[int], n_teams: Optional[int], inj: Mapping[str, Any], spread: Optional[float],
+           ev_side: str, rotation_min: float = 10.0) -> Dict[str, Any]:
+    """Both sides scored; `best` = the side meeting more criteria (ties -> `ev_side`). p_market: {"Over": p, "Under": p} in 0-1."""
+    both = {s: score_prop(s, stat_col, line, proj, float(p_market[s]), season_rank, recent_rank, n_teams, inj, spread, rotation_min)
+            for s in core.SIDES}
+    return core.assemble(both["Over"], both["Under"], ev_side)
 
 
-def shown(six: Any) -> Optional[Mapping[str, Any]]:
-    """The scored result for the side that is shown, or None (also None for a 'not scored' reason string)."""
-    return six[six["best"]] if isinstance(six, Mapping) and six else None
+# --- Data helpers (pure, testable) -------------------------------------------
+def compute_opp_allowed_recent(games: pd.DataFrame, stat_cols: List[str],
+                               n_recent: int = RECENT_GAMES, min_games: int = 3) -> pd.DataFrame:
+    """Like compute_opp_allowed, but only each opponent's last `n_recent` games.
 
-
-def tag_text(six: Any) -> str:
-    """Cell text that always names the side the score belongs to.
-
-    "🔥 SHARP UNDER 6/6" and "⚡ LEAN OVER 5/6" for 6/6 and 5/6; "4/6 Under" otherwise; a dash (plus the reason) if not scored.
+    Production allowed relative to each opposing player's own full-sample average
+    (1.00 = normal). Expects columns PID, DATE, OPP plus `stat_cols`.
     """
-    if isinstance(six, str):
-        return f"— {six}"
-    best = shown(six)
-    if best is None:
-        return "—"
-    if best["tier"] == "SHARP":
-        return f"🔥 SHARP {best['side'].upper()} {best['score']}/6"
-    if best["tier"] == "LEAN":
-        return f"⚡ LEAN {best['side'].upper()} {best['score']}/6"
-    return f"{best['score']}/6 {best['side']}"
+    g = games[games.groupby("PID")["DATE"].transform("size") >= min_games]
+    if g.empty:
+        return pd.DataFrame()
+    base = g.groupby("PID")[stat_cols].transform("mean")
+    day = pd.to_datetime(g["DATE"])
+    newest_first = day.groupby(g["OPP"]).rank(method="dense", ascending=False)
+    mask = (newest_first <= n_recent).to_numpy()
+    recent, base_recent = g[mask], base[mask]
+    num = recent.groupby("OPP")[stat_cols].sum()
+    den = base_recent.groupby(recent["OPP"]).sum()
+    out = (num / den.replace(0, np.nan)).fillna(1.0)
+    out["G"] = recent.groupby("OPP")["DATE"].nunique()
+    return out
 
 
-def add_six_point_column(summary: pd.DataFrame, six_by_player: Mapping[str, Any]) -> pd.DataFrame:
-    """Add the tag column to the odds-board table and list the best-scoring props first (stable)."""
-    out = summary.copy()
-    out[TAG_COL] = out["Player"].map(lambda p: tag_text(six_by_player.get(p)))
-    rank = out["Player"].map(lambda p: (shown(six_by_player.get(p)) or {"score": -1})["score"])
-    return out.assign(_rank=rank).sort_values("_rank", ascending=False, kind="stable").drop(columns="_rank").reset_index(drop=True)
-
-
-# Row colors: Over = green (SHARP) / gold (LEAN); Under = navy (SHARP) / purple (LEAN). White text on all of them.
-ROW_COLORS: Dict[Tuple[str, str], str] = {
-    ("SHARP", "OVER"): "#166534", ("LEAN", "OVER"): "#a16207",
-    ("SHARP", "UNDER"): "#1e3a8a", ("LEAN", "UNDER"): "#6b21a8",
-}
-LEGEND = ("🔥 SHARP = 6/6 criteria · ⚡ LEAN = 5/6 · the tag names the side the criteria support "
-          "(green/gold rows = Over, navy/purple rows = Under) · other rows show their best side's score · — = couldn't be scored")
-
-
-def style_tags(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
-    """Row colors by tier and side (see ROW_COLORS)."""
-    def row_style(row: pd.Series) -> List[str]:
-        tag = str(row.get(TAG_COL, ""))
-        tier = "SHARP" if tag.startswith("🔥") else "LEAN" if tag.startswith("⚡") else ""
-        side = "UNDER" if " UNDER " in tag else "OVER" if " OVER " in tag else ""
-        color = ROW_COLORS.get((tier, side))
-        return [f"background-color:{color};color:#ffffff;font-weight:700" if color else ""] * len(row)
-
-    return df.style.apply(row_style, axis=1)
-
-
-def assessment_summary(res: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    """Everything the Final Assessment panel shows, from one result: the same numbers the odds table tags use.
-
-    Returns None when the result has no six-point block. Keys: best, other, ev_side, side_differs, side_ev_pct.
-    """
-    six = res.get("six_point")
-    if not six:
-        return None
-    best = six[six["best"]]
-    other = six["Under" if six["best"] == "Over" else "Over"]
-    ev_side = six.get("ev_side", six["best"])
-    side_ev = (res.get("sides") or {}).get(best["side"], {}).get("ev_pct", res.get("ev_pct", 0.0))
-    return {"best": best, "other": other, "ev_side": ev_side, "side_differs": best["side"] != ev_side, "side_ev_pct": float(side_ev),
-            "tag": tag_text(six)}
+def extract_spread(payload: Mapping[str, Any]) -> Optional[float]:
+    """Absolute point spread from a The Odds API event-odds payload (first book)."""
+    for book in payload.get("bookmakers", []):
+        for market in book.get("markets", []):
+            if market.get("key") == "spreads":
+                points = [abs(float(o["point"])) for o in market.get("outcomes", [])
+                          if o.get("point") is not None]
+                if points:
+                    return min(points)
+    return None
