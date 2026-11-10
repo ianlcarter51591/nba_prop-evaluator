@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -956,19 +957,53 @@ def load_team_injuries(tid: str) -> Tuple[pd.DataFrame, bool]:
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
+def _cached_team_roster(tid: str) -> List[Tuple[str, str]]:
+    """One team's roster (cached 6 h). Retries a flaky ESPN call; RAISES if it still fails, so a failure is never cached."""
+    last: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            roster = _roster(tid)
+            if roster:
+                return roster
+            last = ValueError("empty roster")
+        except Exception as e:
+            last = e
+        time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"ESPN roster for team {tid} unavailable: {last}")
+
+
 def load_all_rosters() -> Dict[str, List[Tuple[str, str]]]:
-    """Team id -> [(player id, name)] for all 30 teams."""
+    """Team id -> [(player id, name)] for all 30 teams. A team whose fetch fails is empty NOW but retried next call (never cached)."""
     meta = load_team_meta()
 
     def safe(tid: str) -> List[Tuple[str, str]]:
         try:
-            return _roster(tid)
+            return _cached_team_roster(tid)
         except Exception:
             return []
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         rosters = list(ex.map(lambda m: safe(m[0]), meta))
     return {m[0]: r for m, r in zip(meta, rosters)}
+
+
+def load_game_rosters(game_teams: List[str]) -> Dict[str, Optional[List[Tuple[str, str]]]]:
+    """Rosters of just the two teams in the selected game, keyed by the game's team names (None = that fetch failed).
+    Raises only if neither roster could be fetched."""
+    meta = load_team_meta()
+    out: Dict[str, Optional[List[Tuple[str, str]]]] = {}
+    last: Optional[Exception] = None
+    for team in game_teams:
+        tid = next((t for t, nm in meta if nickname(nm) == nickname(team)), None)
+        try:
+            if tid is None:
+                raise RuntimeError(f"No ESPN team matches '{team}'")
+            out[team] = _cached_team_roster(tid)
+        except Exception as e:
+            out[team], last = None, e
+    if all(v is None for v in out.values()):
+        raise RuntimeError(str(last) if last else "no rosters")
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -2120,21 +2155,57 @@ def player_team_name(player_name: str) -> Optional[str]:
     return next((nm for t, nm in load_team_meta() if t == tid), None) if tid else None
 
 
+def team_in_game(player_name: str, game_teams: List[str]) -> Tuple[Optional[str], str]:
+    """(the game team this player is on, or None) and, when None, why.
+
+    Looks only at the two rosters of the selected game (by name, then ESPN id), so it doesn't depend on all 30 rosters
+    loading. If ONE roster can't be fetched, a player not found on the other team is assumed to be on the failed one
+    (the board only lists that game's players). If neither can be fetched it falls back to the league-wide lookup.
+    """
+    try:
+        rosters = load_game_rosters(game_teams)
+    except Exception as e:
+        team = player_team_name(player_name)
+        if team is None:
+            return None, f"couldn't find his team: ESPN roster lookup failed ({str(e)[:40]})"
+        return next((t for t in game_teams if nickname(t) == nickname(team)), None), "isn't on either team in this game"
+    want = _clean_name(player_name)
+    live = {t: r for t, r in rosters.items() if r is not None}
+    for team, roster in live.items():
+        if any(_clean_name(n) == want for _, n in roster):
+            return team, ""
+    pid = cached_player_id(player_name)
+    if pid:
+        for team, roster in live.items():
+            if any(p == pid for p, _ in roster):
+                return team, ""
+    failed = [t for t, r in rosters.items() if r is None]
+    if len(failed) == 1:
+        return failed[0], ""
+    return None, "isn't on either team's ESPN roster for this game"
+
+
 def resolve_context(player_name: str, opponent_choice: Optional[str], form_date: Optional[date], board_teams: List[str],
                     board_spread: Optional[float], board_date: Optional[date]) -> Dict[str, Any]:
     """Opponent, spread and game date for ONE evaluation. The Evaluate button and the board scan both use this,
     so the same prop always gets the same score.
 
     - Opponent: the one picked in the form; if it is "None"/blank and a game is selected in Step 2, the other team
-      in that game (looked up from the player's team). No game and no pick -> no opponent.
+      in that game (found from the two rosters in that game). No game and no pick -> no opponent, and `why` says why.
     - Spread and date: the selected game's, whenever the opponent belongs to that game; otherwise no spread
       (the Game Script check then counts as unverified) and the form's date.
     """
     explicit = opponent_choice not in (None, "", "None")
-    opp: Optional[str] = str(opponent_choice) if explicit else (
-        opponent_for(player_team_name(player_name), board_teams) if board_teams else None)
+    why = ""
+    if explicit:
+        opp: Optional[str] = str(opponent_choice)
+    elif len(board_teams) == 2:
+        mine, why = team_in_game(player_name, board_teams)
+        opp = opponent_for(mine, board_teams) if mine else None
+    else:
+        opp, why = None, "no game selected"
     in_game = opp is not None and any(nickname(opp) == nickname(t) for t in board_teams)
-    return {"opponent": opp, "from_game": bool(in_game and not explicit), "in_game": bool(in_game),
+    return {"opponent": opp, "from_game": bool(in_game and not explicit), "in_game": bool(in_game), "why": "" if opp else why,
             "spread": board_spread if in_game else None,
             "game_date": (board_date or form_date) if in_game else form_date}
 
@@ -2158,30 +2229,30 @@ def run_form_evaluation(player_name: str, stat_label: str, line: float, over: fl
 
 
 def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], spread: Optional[float],
-               game_date: Optional[date], progress: Any = None) -> Dict[str, Optional[Dict[str, Any]]]:
+               game_date: Optional[date], progress: Any = None) -> Dict[str, Any]:
     """Run the full evaluation (and six-point check) for every player on the odds board.
 
-    Same context rules as the Evaluate button (resolve_context): each player's opponent is the other team in the
-    selected game. Players who can't be placed on either team, or whose evaluation fails, map to None (a dash).
+    Same context rules as the Evaluate button (resolve_context). Each player maps to his six-point result, or to a short
+    reason string when he couldn't be scored (shown after a dash in the table).
     """
-    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    out: Dict[str, Any] = {}
     n = len(summary)
     for k, (_, r) in enumerate(summary.iterrows()):
         name = str(r["Player"])
         if r[["Line", "Over", "Under"]].isna().any():     # incomplete offer: nothing to score
-            out[name] = None
+            out[name] = "incomplete odds"
             continue
         if progress is not None:
             progress.progress(k / max(n, 1), text=f"Scanning {name} ({k + 1}/{n})")
         try:
             ctx = resolve_context(name, None, game_date, game_teams, spread, game_date)
             if ctx["opponent"] is None:
-                out[name] = None
+                out[name] = ctx["why"] or "not in this game"
                 continue
             res = evaluate_in_context(name, stat_label, r["Line"], r["Over"], r["Under"], ctx)
-            out[name] = None if "error" in res else res.get("six_point")
-        except Exception:
-            out[name] = None
+            out[name] = f"error: {res['error']}"[:80] if "error" in res else res.get("six_point") or "no six-point result"
+        except Exception as e:
+            out[name] = f"error: {str(e)[:70]}"
     if progress is not None:
         progress.progress(1.0, text="Scan complete")
     return out
