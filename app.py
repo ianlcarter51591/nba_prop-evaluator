@@ -2081,6 +2081,65 @@ def render_bet_log() -> None:
     st.dataframe(calib, use_container_width=True, hide_index=True)
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_league_positions() -> Dict[str, str]:
+    """ESPN player id -> position group (G/F/C) from every team's roster JSON (cached 6 h; ESPN only, no Odds API credits)."""
+    import nba_matchups as nm
+
+    def one(tid: str) -> Dict[str, str]:
+        try:
+            resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=12)
+            resp.raise_for_status()
+            return nm.positions_from_roster_json(resp.json())
+        except Exception:
+            return {}
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        parts = list(ex.map(lambda m: one(m[0]), load_team_meta()))
+    out: Dict[str, str] = {}
+    for d in parts:
+        out.update(d)
+    if not out:
+        raise ValueError("no player positions available from ESPN")
+    return out
+
+
+def render_position_backtest() -> None:
+    """Backtest ONLY: does opponent-vs-position add predictive power beyond the existing all-player opponent factor?"""
+    st.markdown("---")
+    st.subheader("Position vs defense (backtest only, not used by the engine)")
+    st.markdown(
+        "For each stat, a defense's allowed production is measured **per position group** (G / F / C) and compared with its "
+        "all-player index, using only earlier games. **K_INC** is the weight the position split deserves *on top of* the existing "
+        "factor (about 1 = fully real, about 0 = noise). **VERDICT = USE** only if t ≥ 2 **and** the later-half hold-out error improves."
+    )
+    try:
+        import nba_matchups as nm
+    except ImportError:
+        st.warning("nba_matchups.py is not uploaded to the app's GitHub repo yet.")
+        return
+    if st.button("🧪 Run position backtest", key="run_pos_bt"):
+        with st.spinner("Loading league logs and positions (uses the cached league logs; first run can take a minute)…"):
+            try:
+                games, pos = load_league_games(), load_league_positions()
+                frame = nm.build_ratio_frame(games, pos, [c for c in nm.BT_MIN_MEAN if c in games.columns])
+                st.session_state["pos_bt"] = (nm.run_position_backtests(frame), int(games["PID"].nunique()), len(frame), frame)
+            except Exception as e:
+                st.session_state["pos_bt"] = None
+                st.error(f"Position backtest failed: {e}")
+    res = st.session_state.get("pos_bt")
+    if res:
+        table, n_players, n_rows, frame = res
+        if table.empty:
+            st.info("Not enough games per defense and position yet. Try again later in the season.")
+            return
+        st.caption(f"{n_players} players, {n_rows:,} player-stat rows. GAIN columns = % drop in later-half squared error vs no matchup adjustment.")
+        cols = ["STAT", "N", "PLAYERS", "K_ALL", "K_INC", "SE_INC", "T_INC", "GAIN_ALL_%", "GAIN_POS_ONLY_%", "K_EFF", "VERDICT"]
+        st.dataframe(table[cols].round(3), use_container_width=True, hide_index=True)
+        stat = st.selectbox("Show current position index for", list(table["STAT"]), key="pos_bt_stat")
+        st.dataframe(nm.position_index_now(frame, stat).round(3), use_container_width=True, hide_index=True)
+
+
 def render_backtest() -> None:
     ss = st.session_state
     st.markdown(
@@ -2441,6 +2500,7 @@ def main() -> None:
         render_bet_log()
     with tab_bt:
         render_backtest()
+        render_position_backtest()
 
 
 if __name__ == "__main__":
