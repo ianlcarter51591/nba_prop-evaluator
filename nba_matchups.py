@@ -67,17 +67,34 @@ def positions_from_roster_json(payload: Any) -> Dict[str, str]:
     return out
 
 
+_NAME_TO_ABBR: Dict[str, str] = {"POINT GUARD": "PG", "SHOOTING GUARD": "SG", "GUARD": "G", "SMALL FORWARD": "SF", "POWER FORWARD": "PF",
+                                 "FORWARD": "F", "CENTER": "C", "GUARD-FORWARD": "GF", "FORWARD-CENTER": "FC"}
+
+
+def _raw_position(d: Dict[str, Any]) -> str:
+    """Position text of one athlete dict, whichever way ESPN spells it: abbreviation, name / displayName, or a plain string."""
+    pos = d.get("position")
+    if isinstance(pos, dict):
+        for k in ("abbreviation", "name", "displayName"):
+            v = str(pos.get(k) or "").strip().upper()
+            if v:
+                return _NAME_TO_ABBR.get(v, v)
+        return ""
+    v = str(pos or "").strip().upper()
+    return _NAME_TO_ABBR.get(v, v)
+
+
 def position_abbrs_from_roster_json(payload: Any) -> Dict[str, str]:
-    """{ESPN player id -> raw position abbreviation (PG, SG, SF, PF, C, G, F...)} from one team's roster JSON."""
+    """{ESPN player id -> raw position abbreviation (PG, SG, SF, PF, C, G, F...)} from one team's roster JSON.
+    The id comes from the athlete's uid (...~a:123) or, failing that, its plain `id` when the dict also has a name."""
     import re
     out: Dict[str, str] = {}
     for d in _walk(payload):
         m = re.search(r"~a:(\d+)", str(d.get("uid", "")))
-        pos = d.get("position")
-        raw = pos.get("abbreviation") if isinstance(pos, dict) else pos
-        abbr = str(raw).strip().upper() if raw else ""
-        if m and abbr:
-            out[m.group(1)] = abbr
+        pid = m.group(1) if m else (str(d["id"]) if d.get("id") and (d.get("fullName") or d.get("displayName")) and "position" in d else "")
+        abbr = _raw_position(d)
+        if pid and abbr:
+            out[pid] = abbr
     return out
 
 
