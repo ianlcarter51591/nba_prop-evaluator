@@ -67,6 +67,20 @@ def positions_from_roster_json(payload: Any) -> Dict[str, str]:
     return out
 
 
+def position_abbrs_from_roster_json(payload: Any) -> Dict[str, str]:
+    """{ESPN player id -> raw position abbreviation (PG, SG, SF, PF, C, G, F...)} from one team's roster JSON."""
+    import re
+    out: Dict[str, str] = {}
+    for d in _walk(payload):
+        m = re.search(r"~a:(\d+)", str(d.get("uid", "")))
+        pos = d.get("position")
+        raw = pos.get("abbreviation") if isinstance(pos, dict) else pos
+        abbr = str(raw).strip().upper() if raw else ""
+        if m and abbr:
+            out[m.group(1)] = abbr
+    return out
+
+
 def build_ratio_frame(games: pd.DataFrame, groups: Mapping[str, str], stat_cols: List[str]) -> pd.DataFrame:
     """
     Long frame (PID, DATE, OPP, GROUP, STAT, R). R = stat / leave-one-out player mean, so a game never inflates its own
@@ -182,6 +196,18 @@ def position_index_now(frame: pd.DataFrame, stat: str, m0_pos: float = M0_POS, m
     t["D"] = t["I_POS"] - t["I_ALL"]
     t["RANK"] = t.groupby("GROUP")["I_POS"].rank(ascending=False, method="min").astype(int)
     return t.sort_values(["GROUP", "RANK"]).reset_index(drop=True)
+
+
+def position_rank_table(frame: pd.DataFrame, stat: str, m0_pos: float = M0_POS) -> pd.DataFrame:
+    """Defense vs position group for one stat: OPP, GROUP, I_POS (shrunk toward 1), N (player-games), RANK (1 = softest in that group)."""
+    cols = ["OPP", "GROUP", "I_POS", "N", "RANK"]
+    sub = frame[frame["STAT"] == stat].assign(E=lambda x: x["R"] - 1.0)
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+    g = sub.groupby(["OPP", "GROUP"])["E"].agg(S="sum", N="size").reset_index()
+    g["I_POS"] = 1.0 + g["S"] / (g["N"] + m0_pos)
+    g["RANK"] = g.groupby("GROUP")["I_POS"].rank(ascending=False, method="min").astype(int)
+    return g[cols].sort_values(["GROUP", "RANK"]).reset_index(drop=True)
 
 
 def position_multiplier(i_pos: float, i_all: float, k_inc: float) -> float:
