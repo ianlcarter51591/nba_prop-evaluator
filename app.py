@@ -1544,6 +1544,10 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                     opp_detail["mult_old"] = opp_mult
                     opp_mult = float(np.clip(opp_mult ** (1.0 - OPP_BLEND) * opp_detail["mult"] ** OPP_BLEND, 0.88, 1.12))
                     opp_detail["mult_final"] = opp_mult
+                    try:
+                        opp_detail["pos"] = opp_position_detail(opp_detail["abbr"], player_name, stat_col)
+                    except Exception:
+                        opp_detail["pos"] = None      # position ranks are display context; never break the evaluation
             except Exception as e:
                 opp_note = f"{opp_note or ''} Stat-specific matchup data unavailable ({e}).".strip()
         b2b_state, b2b_mult, b2b_note = "unknown", 1.0, None
@@ -1983,18 +1987,39 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
     """Stat-specific opponent matchup and injury/usage adjustment panels."""
     od = res.get("opp_detail")
     if od:
-        st.markdown("#### 🎯 Opponent vs this stat")
+        pos = od.get("pos")
+        st.markdown("#### 🎯 Opponent vs this stat by position")
         m = st.columns(4)
-        _metric(m[0], f"{od['abbr']} RANK ({stat_category.upper()})", f"#{od['rank']} of {od['n_teams']}", "good" if od["rank"] <= 10 else "bad" if od["rank"] > od["n_teams"] - 10 else "neutral")
-        _metric(m[1], "ALLOWED VS NORMAL", f"{(od['factor'] - 1) * 100:+.1f}%", _tone(od["factor"] - 1))
-        _metric(m[2], "STAT MULT / OLD INDEX", f"x{od['mult']:.3f} / x{od['mult_old']:.3f}")
+        all_tone = "good" if od["rank"] <= 10 else "bad" if od["rank"] > od["n_teams"] - 10 else "neutral"
+        if pos:
+            who = POS_GROUP_NAMES.get(pos["group"], pos["group"]).upper()
+            _metric(m[0], f"{od['abbr']} RANK VS {who} ({stat_category.upper()})", f"#{pos['rank']} of {pos['n_teams']}",
+                    "good" if pos["rank"] <= 10 else "bad" if pos["rank"] > pos["n_teams"] - 10 else "neutral")
+            _metric(m[1], f"ALLOWED VS NORMAL ({who})", f"{(pos['index'] - 1) * 100:+.1f}%", _tone(pos["index"] - 1))
+            _metric(m[2], "ALL-PLAYER RANK", f"#{od['rank']} of {od['n_teams']}", all_tone)
+        else:
+            _metric(m[0], f"{od['abbr']} RANK ({stat_category.upper()})", f"#{od['rank']} of {od['n_teams']}", all_tone)
+            _metric(m[1], "ALLOWED VS NORMAL", f"{(od['factor'] - 1) * 100:+.1f}%", _tone(od["factor"] - 1))
+            _metric(m[2], "STAT MULT / OLD INDEX", f"x{od['mult']:.3f} / x{od['mult_old']:.3f}")
         _metric(m[3], "OPP MULT USED", f"x{od['mult_final']:.3f}", _tone(od["mult_final"] - 1))
+        if pos:
+            st.caption(f"{res['player_name']} is listed as **{pos['abbr']}**, so he is compared with {POS_GROUP_NAMES.get(pos['group'], pos['group'])} "
+                       f"(G = PG/SG, F = SF/PF/GF, C = C/FC). Rank 1 = the defense allows the most of this stat to that position relative to each "
+                       f"player's own average ({pos['n']} player-games, shrunk toward 1.00).")
+            st.dataframe(pd.DataFrame(pos["by_group"]).assign(GROUP=lambda d: d["GROUP"].map(lambda g: f"vs {POS_GROUP_NAMES.get(g, g)}")).round(1),
+                         use_container_width=True, hide_index=True)
+            with st.expander(f"All {pos['n_teams']} defenses vs {POS_GROUP_NAMES.get(pos['group'], pos['group'])} for {stat_category}"):
+                st.dataframe(pd.DataFrame(pos["all_teams"]).round(1), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Position ranks unavailable (ESPN doesn't list this player's position or the league logs haven't loaded), so this shows "
+                       "the all-player rank.")
         bits = []
         if od["soft_avg"] is not None:
             bits.append(f"vs the 10 softest defenses: {od['soft_avg']:.1f} ({od['soft_n']} g)")
         if od["tough_avg"] is not None:
             bits.append(f"vs the 10 toughest: {od['tough_avg']:.1f} ({od['tough_n']} g)")
-        st.caption(f"Rank 1 = allows the most of this stat relative to each opposing player's own average ({od['games']} games of data, shrunk toward 1.00). "
+        st.caption(f"All-player rank: 1 = allows the most of this stat relative to each opposing player's own average ({od['games']} games of data, shrunk toward 1.00); "
+                   f"stat multiplier x{od['mult']:.3f}, old index x{od['mult_old']:.3f}. The multiplier and the six-point defense check still use the all-player rank. "
                    + (" · ".join(bits) + ". Splits are context only: tiny samples." if bits else ""))
     inj = res.get("injury") or {}
     if inj.get("usg") is not None:
@@ -2006,7 +2031,7 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
         _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
         if inj.get("listed"):
             st.caption("🩺 Injury report for " + str(inj.get("team") or "this team") + ": " + " · ".join(
-                f"{x['name']} ({x['status']})" for x in inj["listed"]))
+                f"{with_pos(x['name'])} ({x['status']})" for x in inj["listed"]))
         elif inj.get("feed_ok", True):
             st.caption("🩺 The injury feed lists no teammates for this team.")
         if inj["table"]:
@@ -2023,7 +2048,7 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     photo = player_headshot_url(res["player_name"])
     if photo:
         photo_col.image(photo, width=120)
-    title_col.markdown(f"## {res['player_name']} | {stat_category}")
+    title_col.markdown(f"## {with_pos(res['player_name'])} | {stat_category}")
     render_b2b_alert(res)
     c = st.columns(6)
     _metric(c[0], "MEAN", f"{res['mean']:.2f}")
@@ -2182,15 +2207,15 @@ def render_bet_log() -> None:
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
-def load_league_positions() -> Dict[str, str]:
-    """ESPN player id -> position group (G/F/C) from every team's roster JSON (cached 6 h; ESPN only, no Odds API credits)."""
+def load_league_pos_abbr() -> Dict[str, str]:
+    """ESPN player id -> position abbreviation (PG, SG, SF, PF, C...) from every team's roster JSON (cached 6 h; ESPN only, no Odds API credits)."""
     import nba_matchups as nm
 
     def one(tid: str) -> Dict[str, str]:
         try:
             resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=12)
             resp.raise_for_status()
-            return nm.positions_from_roster_json(resp.json())
+            return nm.position_abbrs_from_roster_json(resp.json())
         except Exception:
             return {}
 
@@ -2202,6 +2227,88 @@ def load_league_positions() -> Dict[str, str]:
     if not out:
         raise ValueError("no player positions available from ESPN")
     return out
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_league_positions() -> Dict[str, str]:
+    """ESPN player id -> position group (G/F/C), derived from the abbreviations (one roster fetch serves both)."""
+    import nba_matchups as nm
+    out = {pid: nm.position_group(a) for pid, a in load_league_pos_abbr().items()}
+    out = {pid: g for pid, g in out.items() if g}
+    if not out:
+        raise ValueError("no player positions available from ESPN")
+    return out
+
+
+def _pos_key(name: str) -> str:
+    """Name key that ignores accents, punctuation and Jr/Sr suffixes (ESPN 'Nikola Jokić' = Odds API 'Nikola Jokic')."""
+    import unicodedata
+    return _clean_name(unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode())
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def _name_positions() -> Dict[str, str]:
+    """{normalized player name -> position abbreviation} for every rostered player (no per-player requests)."""
+    abbr = load_league_pos_abbr()
+    out: Dict[str, str] = {}
+    for roster in load_all_rosters().values():
+        for pid, nm_ in roster:
+            if pid in abbr:
+                out[_pos_key(nm_)] = abbr[pid]
+    if not out:
+        raise ValueError("no player positions available")
+    return out
+
+
+def position_of(name: str) -> Optional[str]:
+    """Position abbreviation (PG, SG, SF, PF, C...) of a player, or None when ESPN doesn't list him."""
+    try:
+        return _name_positions().get(_pos_key(name))
+    except Exception:
+        return None
+
+
+def with_pos(name: Any) -> str:
+    """'Stephen Curry (PG)' for display; the plain name when the position is unknown."""
+    p = position_of(str(name))
+    return f"{name} ({p})" if p else str(name)
+
+
+POS_GROUP_NAMES: Dict[str, str] = {"G": "guards", "F": "forwards", "C": "bigs"}
+
+
+@st.cache_data(ttl=21600, show_spinner="Loading league logs for position matchups (one-time, about 30-60s)...")
+def load_position_ranks() -> pd.DataFrame:
+    """Defense-vs-position index for every stat: OPP, GROUP, STAT, I_POS, N, RANK (1 = softest). Cached 6 h."""
+    import nba_matchups as nm
+    games = load_league_games()
+    stats = [c for c in dict.fromkeys(STAT_COL.values()) if c in games.columns]
+    frame = nm.build_ratio_frame(games, load_league_positions(), stats)
+    parts = [nm.position_rank_table(frame, s).assign(STAT=s) for s in stats]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["OPP", "GROUP", "STAT", "I_POS", "N", "RANK"])
+
+
+def opp_position_detail(opp_abbr: str, player_name: str, stat_col: str) -> Optional[Dict[str, Any]]:
+    """The opponent's rank against the player's own position group for this stat (and against the other groups), or None."""
+    import nba_matchups as nm
+    abbr = position_of(player_name)
+    group = nm.position_group(abbr)
+    if not abbr or not group:
+        return None
+    t = load_position_ranks()
+    t = t[t["STAT"] == stat_col]
+    mine = t[(t["OPP"] == opp_abbr) & (t["GROUP"] == group)]
+    if mine.empty:
+        return None
+    row = mine.iloc[0]
+    n_teams = int(t[t["GROUP"] == group]["OPP"].nunique())
+    others = t[t["OPP"] == opp_abbr].sort_values("GROUP")
+    full = t[t["GROUP"] == group].sort_values("RANK")
+    return {"abbr": abbr, "group": group, "rank": int(row["RANK"]), "n_teams": n_teams, "index": float(row["I_POS"]), "n": int(row["N"]),
+            "by_group": [{"GROUP": r.GROUP, "RANK": int(r.RANK), "ALLOWED_VS_NORMAL_%": (float(r.I_POS) - 1.0) * 100.0, "PLAYER_GAMES": int(r.N)}
+                         for r in others.itertuples()],
+            "all_teams": [{"RANK": int(r.RANK), "TEAM": r.OPP, "ALLOWED_VS_NORMAL_%": (float(r.I_POS) - 1.0) * 100.0, "PLAYER_GAMES": int(r.N)}
+                          for r in full.itertuples()]}
 
 
 def render_position_backtest() -> None:
@@ -2523,7 +2630,7 @@ def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], sp
             out[name] = "incomplete odds"
             continue
         if progress is not None:
-            progress.progress(k / max(n, 1), text=f"Scanning {name} ({k + 1}/{n})")
+            progress.progress(k / max(n, 1), text=f"Scanning {with_pos(name)} ({k + 1}/{n})")
         try:
             ctx = resolve_context(name, None, game_date, game_teams, spread, game_date)
             if ctx["opponent"] is None:
@@ -2623,7 +2730,9 @@ def main() -> None:
                     shown = summary
                     if scan and scan.get("token") == ss.get("board_token"):
                         shown = add_six_point_column(summary, scan["six"])
-                    st.dataframe(style_tags(shown) if "Six-Point" in shown else shown, use_container_width=True)
+                    shown_pos = shown.copy()
+                    shown_pos.insert(1, "Pos", shown_pos["Player"].map(lambda n: position_of(str(n)) or "—"))
+                    st.dataframe(style_tags(shown_pos) if "Six-Point" in shown_pos else shown_pos, use_container_width=True)
                     st.caption(LEGEND)
                     if st.button("🔎 Scan board for 5/6 & 6/6 props", key="scan_board_btn"):
                         bar = st.progress(0.0, text="Starting scan...")
@@ -2632,14 +2741,14 @@ def main() -> None:
                                                               ss.get("board_spread"), ss.get("board_date") or _today_et(), bar)}
                         st.rerun()
                     summary = shown[[c for c in summary.columns]]
-                    player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown")
+                    player_pick = st.selectbox("Step 4: Choose Player to Evaluate", summary["Player"].tolist(), key="pick_player_dropdown", format_func=with_pos)
                     pick_photo = player_headshot_url(str(player_pick))
                     if pick_photo:
                         st.image(pick_photo, width=110)
                     matched_row = summary[summary["Player"] == player_pick]
                     if not matched_row.empty:
                         r = matched_row.iloc[0]
-                        if st.button(f"⚡ Populate {player_pick} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
+                        if st.button(f"⚡ Populate {with_pos(player_pick)} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
                             ss.update(player=player_pick, stat=ss.get("board_stat", selected_stat_label), line=float(r["Line"]),
                                       over=int(r["Over"]), under=int(r["Under"]), opp="None",
                                       game_date=ss.get("board_date") or _today_et())
