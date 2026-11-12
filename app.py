@@ -2211,21 +2211,29 @@ def load_league_pos_abbr() -> Dict[str, str]:
     """ESPN player id -> position abbreviation (PG, SG, SF, PF, C...) from every team's roster JSON (cached 6 h; ESPN only, no Odds API credits)."""
     import nba_matchups as nm
 
-    def one(tid: str) -> Dict[str, str]:
-        try:
-            resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=12)
-            resp.raise_for_status()
-            return nm.position_abbrs_from_roster_json(resp.json())
-        except Exception:
-            return {}
+    errors: List[str] = []
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    def one(tid: str) -> Dict[str, str]:
+        for attempt in range(3):                        # same retry idea as the roster loader: ESPN drops the odd request
+            try:
+                resp = requests.get(TEAM_ROSTER_URL.format(tid=tid), headers=ESPN_HEADERS, timeout=12)
+                resp.raise_for_status()
+                got = nm.position_abbrs_from_roster_json(resp.json())
+                if got:
+                    return got
+                errors.append(f"team {tid}: roster loaded but lists no positions")
+            except Exception as e:
+                errors.append(f"team {tid}: {type(e).__name__}: {str(e)[:80]}")
+            time.sleep(0.4 * (attempt + 1))
+        return {}
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
         parts = list(ex.map(lambda m: one(m[0]), load_team_meta()))
     out: Dict[str, str] = {}
     for d in parts:
         out.update(d)
     if not out:
-        raise ValueError("no player positions available from ESPN")
+        raise ValueError("no player positions available from ESPN (" + (errors[-1] if errors else "no teams listed") + ")")
     return out
 
 
@@ -2258,6 +2266,15 @@ def _name_positions() -> Dict[str, str]:
     if not out:
         raise ValueError("no player positions available")
     return out
+
+
+def positions_problem() -> str:
+    """Why positions can't be shown right now ('' when they load fine). Failures are never cached, so a later run retries."""
+    try:
+        _name_positions()
+        return ""
+    except Exception as e:
+        return str(e)
 
 
 def position_of(name: str) -> Optional[str]:
@@ -2730,6 +2747,9 @@ def main() -> None:
                     shown = summary
                     if scan and scan.get("token") == ss.get("board_token"):
                         shown = add_six_point_column(summary, scan["six"])
+                    _why = positions_problem()
+                    if _why:
+                        st.warning(f"Player positions couldn't be loaded: {_why}. Reload the page to retry.")
                     shown_pos = shown.copy()
                     shown_pos.insert(1, "Pos", shown_pos["Player"].map(lambda n: position_of(str(n)) or "—"))
                     st.dataframe(style_tags(shown_pos) if "Six-Point" in shown_pos else shown_pos, use_container_width=True)
