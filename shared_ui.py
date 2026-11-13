@@ -67,13 +67,35 @@ def _legs(st: Any) -> List[Dict[str, Any]]:
     return ss["parlay_legs"]
 
 
-def add_leg(st: Any, label: str, p_model: float, odds: Optional[float], p_market: Optional[float], game: str) -> bool:
+def add_leg(st: Any, label: str, p_model: float, odds: Optional[float], p_market: Optional[float], game: str, link: str = "") -> bool:
     """Append a leg unless the same label is already on the ticket."""
     legs = _legs(st)
     if not label or any(l["label"] == label for l in legs):
         return False
-    legs.append({"label": label, "p_model": float(p_model), "odds": odds, "p_market": p_market, "game": str(game or "").strip()})
+    legs.append({"label": label, "p_model": float(p_model), "odds": odds, "p_market": p_market, "game": str(game or "").strip(), "link": str(link or "")})
     return True
+
+
+def render_slip(st: Any, legs: List[Dict[str, Any]]) -> None:
+    """DraftKings buttons for the ticket: one link per leg plus one that opens them all. The app never places the bet."""
+    try:
+        import bet_links as bl
+    except ImportError:
+        st.warning("bet_links.py isn't uploaded to the app's GitHub repo yet, so the DraftKings buttons are off.")
+        return
+    st.markdown("**Take it to DraftKings**")
+    links = [(l.get("link") or bl.DK_HOME, bl.kind_of(l.get("link"))) for l in legs]
+    for l, (url, kind) in zip(legs, links):
+        st.markdown(f"- {l['label']}: [Bet on DraftKings ↗]({url}) ({bl.KIND_LABEL.get(kind, kind)})")
+    try:
+        from streamlit.components.v1 import html as _components_html
+        _components_html(bl.open_all_html([u for u, _ in links], f"➕ Add slip: open all {len(links)} legs"), height=60)
+    except Exception:
+        pass       # no components support (tests): the per-leg links above still work
+    st.caption(f"{bl.real_links(links)} of {len(links)} legs have a DraftKings link for that pick or game; the rest open the DraftKings sportsbook. "
+               "Each link opens in its own tab (allow pop-ups for this site once). DraftKings decides what a link does, so check the slip: the "
+               "price and line there are DraftKings' current ones, and you confirm the bet yourself. Legs typed in by hand have no link."
+               " Links are saved when you evaluate a prop, so a leg saved before this update opens the sportsbook home page.")
 
 
 def render_parlay(st: Any, snaps: Optional[pd.DataFrame]) -> None:
@@ -90,7 +112,7 @@ def render_parlay(st: Any, snaps: Optional[pd.DataFrame]) -> None:
         if c2.button("➕ Add leg", key="parlay_add") and pick in set(pool["LABEL"]):
             r = pool[pool["LABEL"] == pick].iloc[0]
             ok = add_leg(st, r["LABEL"], r["P_MODEL"], None if pd.isna(r["ODDS"]) else float(r["ODDS"]),
-                         None if pd.isna(r["P_MARKET"]) else float(r["P_MARKET"]), r["GAME"])
+                         None if pd.isna(r["P_MARKET"]) else float(r["P_MARKET"]), r["GAME"], r.get("LINK", ""))
             (st.toast if ok else st.warning)("Leg added" if ok else "That leg is already on the ticket.")
     else:
         st.caption("No pending saved predictions yet: evaluate a prop or scan a board first, or add legs by hand below.")
@@ -120,6 +142,7 @@ def render_parlay(st: Any, snaps: Optional[pd.DataFrame]) -> None:
     if st.button("Clear ticket", key="parlay_clear"):
         ss["parlay_legs"] = []
         st.rerun()
+    render_slip(st, legs)
     p1, p2, p3 = st.columns(3)
     offered = _num(p1.number_input("Parlay odds offered, before any boost (0 = multiply the leg odds)", value=0, step=5, key="parlay_offered"), 0.0)
     boost = _num(p2.number_input("Boost %", min_value=0.0, max_value=200.0, value=0.0, step=5.0, key="parlay_boost"), 0.0)
