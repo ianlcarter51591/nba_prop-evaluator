@@ -76,6 +76,34 @@ def add_leg(st: Any, label: str, p_model: float, odds: Optional[float], p_market
     return True
 
 
+def _link_button(st: Any, label: str, url: str, primary: bool) -> None:
+    """A button that opens `url` in a new tab (plain markdown link on Streamlit versions without link_button)."""
+    if hasattr(st, "link_button"):
+        st.link_button(label, url, type="primary" if primary else "secondary", use_container_width=True)
+    else:
+        st.markdown(f"[{label}]({url})")
+
+
+def render_place_bet(st: Any, player: str, stat: str, line: float, odds: Dict[str, Optional[float]], links: Any, best_side: str = "") -> None:
+    """Solo-bet buttons under an evaluation: one per side that has a saved DraftKings link. The app only opens DraftKings; you confirm the bet there."""
+    over_link, under_link = (links or ("", ""))[:2]
+    st.markdown("### 🎯 Place Bet")
+    if not (over_link or under_link):
+        st.caption("No DraftKings link is saved for this prop. Fetch the player's odds board (Step 3), then evaluate from the board so the link is kept.")
+        return
+    cols = st.columns(2)
+    for col, side, url in ((cols[0], "Over", over_link), (cols[1], "Under", under_link)):
+        price = odds.get(side)
+        label = f"Place Bet: {side} {line:g} {stat}" + (f" ({price:+.0f})" if price is not None else "")
+        with col:
+            if url:
+                _link_button(st, label, url, primary=(side == best_side))
+            else:
+                st.caption(f"{side}: no DraftKings link (that price is an estimate, not a listed bet).")
+    st.caption(f"{player}: opens DraftKings with the pick added to your bet slip when DraftKings provides that link, otherwise the game page. "
+               "Check the line and price on the slip before you confirm; the app never places the bet.")
+
+
 def render_slip(st: Any, legs: List[Dict[str, Any]]) -> None:
     """DraftKings buttons for the ticket: one link per leg plus one that opens them all. The app never places the bet."""
     try:
