@@ -25,7 +25,7 @@ SNAP_PATH = os.environ.get("SNAPSHOT_PATH", "snapshots.csv")
 MIN_MISS_PCT = 0.25                 # minutes off by 25%+ of the projection counts as a minutes miss
 KEY_COLS: List[str] = ["PLAYER", "STAT", "LINE", "GAME_DATE"]
 TEXT_COLS: List[str] = ["SNAP_ID", "TS_ET", "GAME_DATE", "GAME", "PLAYER", "STAT", "OPPONENT", "SOURCE", "SHOWN_SIDE", "EV_SIDE",
-                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY"]
+                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK"]
 NUM_COLS: List[str] = ["SEASON", "WEEK", "LINE", "OVER_ODDS", "UNDER_ODDS", "MU", "PROJ_MEAN", "PROJ_MIN", "RAW_AVG", "OPP_MULT", "VEGAS_TOTAL", "MIN_EXTRA",
                        "P_OVER", "P_UNDER", "PM_OVER", "PM_UNDER", "SIX_OVER", "SIX_UNDER", "ACTUAL", "ACTUAL_MIN", "STAT_ERR", "MIN_ERR", "MIN_ERR_PCT"]
 COLS: List[str] = TEXT_COLS + NUM_COLS
@@ -41,7 +41,7 @@ def _failed(six_side: Optional[Mapping[str, Any]]) -> str:
 
 def make_row(res: Mapping[str, Any], ctx: Mapping[str, Any], stat_label: str, line: float, over: float, under: float,
              source: str, now_et: str, game_date: str, season: Optional[int] = None,
-             week: Optional[int] = None) -> Dict[str, Any]:
+             week: Optional[int] = None, links: Tuple[str, str] = ("", "")) -> Dict[str, Any]:
     """One snapshot row from an evaluation result (a dict without 'error'). NFL passes season + week; NBA a game date."""
     six = res.get("six_point") or {}
     sides = res.get("sides") or {}
@@ -58,6 +58,7 @@ def make_row(res: Mapping[str, Any], ctx: Mapping[str, Any], stat_label: str, li
         "SHOWN_SIDE": shown, "EV_SIDE": six.get("ev_side", ""), "TIER_SHOWN": (six.get(shown) or {}).get("tier", ""),
         "SIX_OVER": (six.get("Over") or {}).get("score"), "SIX_UNDER": (six.get("Under") or {}).get("score"),
         "FAILED_OVER": _failed(six.get("Over")), "FAILED_UNDER": _failed(six.get("Under")), "STATUS": "Pending",
+        "OVER_LINK": links[0], "UNDER_LINK": links[1],
     }
 
 
