@@ -36,7 +36,7 @@ def _startup_problems() -> List[str]:
                        ("parlay", ("Leg", "evaluate", "legs_from_snapshots")),
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier")),
-                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay"))):
+                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet"))):
         try:
             m = importlib.import_module(mod)
         except ModuleNotFoundError as e:
@@ -2083,6 +2083,12 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
         st.caption(f"Days since the player's previous game: {res['days_rest']} (1 = back-to-back)")
     st.markdown("---")
     render_final_assessment(res)
+    try:
+        info_ = assessment_summary(res)
+        shared_ui.render_place_bet(st, res["player_name"], stat_category, float(line_val), {"Over": ctx.get("over"), "Under": ctx.get("under")},
+                                   links_for(res["player_name"], stat_category, line_val), info_["best"]["side"] if info_ else "")
+    except Exception:
+        pass       # the bet buttons are a convenience: never break the result screen
     st.markdown("---")
     render_matchup_injury(res, stat_category)
     for w in res["warnings"]:
@@ -2768,6 +2774,7 @@ def main() -> None:
                 if board_df is not None and not board_df.empty:
                     summary = summarize_board(board_df)
                     remember_links(summary, ss.get("board_stat", selected_stat_label))
+                    summary = summary.drop(columns=["OverLink", "UnderLink"], errors="ignore")      # links are used by Place Bet and the parlay slip, not shown here
                     scan = ss.get("board_scan")
                     shown = summary
                     if scan and scan.get("token") == ss.get("board_token"):
@@ -2837,7 +2844,8 @@ def main() -> None:
                 res["uid"] = uuid.uuid4().hex
                 ss["last_res"], ss["last_err"] = res, None
                 ss["last_ctx"] = {"player": player_name, "stat": stat_category, "line": float(line_val),
-                                  "opponent": None if opponent == "None" else opponent, "game_date": game_day}
+                                  "opponent": None if opponent == "None" else opponent, "game_date": game_day,
+                                  "over": float(over_odds), "under": float(under_odds)}
         if ss.get("last_err"):
             st.error(ss["last_err"])
         elif ss.get("last_res"):
