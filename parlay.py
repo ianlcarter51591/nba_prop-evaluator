@@ -127,7 +127,7 @@ def evaluate(legs: Sequence[Leg], offered_odds: Optional[float] = None, boost_pc
 
 def legs_from_snapshots(snaps: pd.DataFrame) -> pd.DataFrame:
     """Pending snapshots as pickable legs, one row per side: LABEL, GAME, P_MODEL, P_MARKET, ODDS (probabilities in [0, 1])."""
-    cols = ["LABEL", "GAME", "P_MODEL", "P_MARKET", "ODDS"]
+    cols = ["LABEL", "GAME", "P_MODEL", "P_MARKET", "ODDS", "LINK"]
     need = ["STATUS", "PLAYER", "STAT", "LINE", "P_OVER", "P_UNDER", "OVER_ODDS", "UNDER_ODDS"]
     if snaps is None or snaps.empty or any(c not in snaps.columns for c in need):
         return pd.DataFrame(columns=cols)
@@ -140,6 +140,7 @@ def legs_from_snapshots(snaps: pd.DataFrame) -> pd.DataFrame:
             "LABEL": s["PLAYER"] + " " + side + " " + line + " " + s["STAT"].astype(str), "GAME": game.fillna("").astype(str),
             "P_MODEL": pd.to_numeric(s[pc], errors="coerce") / 100.0,
             "P_MARKET": pd.to_numeric(s[mc], errors="coerce") / 100.0 if mc in s else np.nan,
-            "ODDS": pd.to_numeric(s[oc], errors="coerce")}))
+            "ODDS": pd.to_numeric(s[oc], errors="coerce"),
+            "LINK": s[side.upper() + "_LINK"].fillna("").astype(str) if side.upper() + "_LINK" in s else ""}))
     out = pd.concat(parts, ignore_index=True).dropna(subset=["P_MODEL"])
     return out[(out["P_MODEL"] > 0) & (out["P_MODEL"] < 1)].sort_values("LABEL").reset_index(drop=True)[cols]
