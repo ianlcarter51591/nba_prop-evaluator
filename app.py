@@ -259,7 +259,9 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
     params = {"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "american"}
     try:
-        resp = requests.get(url, params=params, timeout=8)
+        resp = requests.get(url, params={**params, "includeLinks": "true"}, timeout=8)      # DraftKings deep links for the bet buttons
+        if resp.status_code in (400, 422):
+            resp = requests.get(url, params=params, timeout=8)                               # plan or API without links: plain odds
         odds_credits.record_headers(resp.headers)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
@@ -275,7 +277,8 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
                 price = int(round(float(o.get("price", -110))))
             except Exception:
                 price = -110
-            rows.append({"Player": o.get("description"), "Line": o.get("point", 0.5), "Price": price, "Outcome": o.get("name")})
+            rows.append({"Player": o.get("description"), "Line": o.get("point", 0.5), "Price": price, "Outcome": o.get("name"),
+                         "Link": o.get("link") or markets[0].get("link") or bookmakers[0].get("link") or ""})
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching prop board: {e}"
@@ -363,13 +366,14 @@ def summarize_board(board_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for player, group in board_df.groupby("Player"):
-        over, under = -110, -110
-        for outcome, price in zip(group["Outcome"].astype(str).str.lower(), group["Price"]):
+        over, under, over_link, under_link = -110, -110, "", ""
+        links = group["Link"].fillna("").astype(str) if "Link" in group.columns else pd.Series("", index=group.index)
+        for outcome, price, link in zip(group["Outcome"].astype(str).str.lower(), group["Price"], links):
             if "over" in outcome:
-                over = int(price)
+                over, over_link = int(price), link
             elif "under" in outcome:
-                under = int(price)
-        rows.append({"Player": player, "Line": group["Line"].iloc[0], "Over": over, "Under": under})
+                under, under_link = int(price), link
+        rows.append({"Player": player, "Line": group["Line"].iloc[0], "Over": over, "Under": under, "OverLink": over_link, "UnderLink": under_link})
     return pd.DataFrame(rows)
 
 
@@ -2585,6 +2589,26 @@ def _now_et_text() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def remember_links(summary: pd.DataFrame, stat_label: str) -> None:
+    """Keep each board row's DraftKings links so an evaluation of that prop can save them with its snapshot (read by record_snapshot)."""
+    if summary is None or summary.empty or "OverLink" not in summary.columns:
+        return
+    store = st.session_state.setdefault("bet_links", {})
+    for r in summary.itertuples():
+        try:
+            store[(str(r.Player).strip().lower(), str(stat_label).upper().strip(), round(float(r.Line), 2))] = (str(r.OverLink or ""), str(r.UnderLink or ""))
+        except (TypeError, ValueError):
+            continue
+
+
+def links_for(name: str, stat_label: str, line: float) -> Tuple[str, str]:
+    """(over link, under link) remembered for this prop, or empty strings."""
+    try:
+        return st.session_state.get("bet_links", {}).get((str(name).strip().lower(), str(stat_label).upper().strip(), round(float(line), 2)), ("", ""))
+    except (TypeError, ValueError):
+        return ("", "")
+
+
 def record_snapshot(res: Dict[str, Any], ctx: Dict[str, Any], stat_label: str, line: float, over: float, under: float,
                     source: str) -> None:
     """Save what the model believed for this prop (projection, minutes, probabilities, six-point) so it can be graded later.
@@ -2602,7 +2626,7 @@ def record_snapshot(res: Dict[str, Any], ctx: Dict[str, Any], stat_label: str, l
             ss["snapshots"] = load_snapshots()
         gd = ctx.get("game_date") or _today_et()
         row = sn.make_row(res, ctx, stat_label, float(line), float(over), float(under), source, _now_et_text(),
-                          gd.isoformat() if hasattr(gd, "isoformat") else str(gd))
+                          gd.isoformat() if hasattr(gd, "isoformat") else str(gd), links=links_for(res.get("player_name", ""), stat_label, line))
         ss["snapshots"] = save_snapshots(sn.upsert(ss["snapshots"], [row]), force=source != "scan")
     except Exception:
         pass
@@ -2743,6 +2767,7 @@ def main() -> None:
                 board_df = ss.get("board_df")
                 if board_df is not None and not board_df.empty:
                     summary = summarize_board(board_df)
+                    remember_links(summary, ss.get("board_stat", selected_stat_label))
                     scan = ss.get("board_scan")
                     shown = summary
                     if scan and scan.get("token") == ss.get("board_token"):
