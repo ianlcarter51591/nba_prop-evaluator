@@ -1887,13 +1887,16 @@ def _tone(x: float) -> str:
     return "neutral" if x is None or not np.isfinite(x) else ("good" if x > 0 else "bad")
 
 
+AUTO_OPP = "Auto (from selected game)"
+
+
 def _opp_options(game_teams: List[str]) -> List[str]:
     try:
         names = [n for _, n in load_team_meta()]
     except Exception:
         names = []
     gt = [t for t in game_teams if t]
-    return ["None"] + gt + sorted(n for n in names if n not in gt)
+    return [AUTO_OPP, "None"] + gt + sorted(n for n in names if n not in gt)
 
 
 def render_log_form(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
@@ -2572,7 +2575,7 @@ def resolve_context(player_name: str, opponent_choice: Optional[str], form_date:
     - Spread and date: the selected game's, whenever the opponent belongs to that game; otherwise no spread
       (the Game Script check then counts as unverified) and the form's date.
     """
-    explicit = opponent_choice not in (None, "", "None")
+    explicit = opponent_choice not in (None, "", "None", AUTO_OPP)
     why = ""
     if explicit:
         opp: Optional[str] = str(opponent_choice)
@@ -2707,7 +2710,7 @@ def main() -> None:
     api_key = _secret("ODDS_API_KEY")
     cloud_store.configure(_secret("GITHUB_GIST_TOKEN"))
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
-                         ("under", -110), ("opp", "None"), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et()),
+                         ("under", -110), ("opp", AUTO_OPP), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et()),
                          ("adj_inj", True), ("adj_opp", True), ("adj_absorb", 1.0), ("adj_out", ""), ("adj_q", ""), ("adj_in", ""),
                          ("adj_vegas", True), ("board_vegas", None)):
         ss.setdefault(key, default)
@@ -2802,8 +2805,9 @@ def main() -> None:
                         r = matched_row.iloc[0]
                         if st.button(f"⚡ Populate {with_pos(player_pick)} ({r['Line']} | Over {r['Over']} / Under {r['Under']})", key="populate_btn_odds"):
                             ss.update(player=player_pick, stat=ss.get("board_stat", selected_stat_label), line=float(r["Line"]),
-                                      over=int(r["Over"]), under=int(r["Under"]), opp="None",
+                                      over=int(r["Over"]), under=int(r["Under"]), opp=AUTO_OPP,
                                       game_date=ss.get("board_date") or _today_et())
+                            ss["pending_eval"] = True          # evaluate right away, like the NFL app: metrics load without a second click
                             st.rerun()
 
         with st.expander("⚙️ Model settings: how much weight does last season get?", expanded=False):
@@ -2835,7 +2839,11 @@ def main() -> None:
             game_day = c7.date_input("Game date (ET)", value=ss["game_date"])
             submitted = st.form_submit_button("⚡ Evaluate Prop")
 
-        if submitted:
+        pending = bool(ss.pop("pending_eval", False))
+        if pending and not submitted:          # Populate was pressed: use the populated values, not whatever the form widgets still hold
+            player_name, stat_category, line_val = ss["player"], ss["stat"], float(ss["line"])
+            over_odds, under_odds, opponent, game_day = int(ss["over"]), int(ss["under"]), ss["opp"], ss["game_date"]
+        if submitted or pending:
             ss.update(player=player_name, stat=stat_category, line=line_val, over=over_odds, under=under_odds, opp=opponent, game_date=game_day)
             res = run_form_evaluation(player_name, stat_category, line_val, over_odds, under_odds, opponent, game_day)
             if "error" in res:
@@ -2843,12 +2851,18 @@ def main() -> None:
             else:
                 res["uid"] = uuid.uuid4().hex
                 ss["last_res"], ss["last_err"] = res, None
+                auto_opp = (res.get("context") or {}).get("opponent")
                 ss["last_ctx"] = {"player": player_name, "stat": stat_category, "line": float(line_val),
-                                  "opponent": None if opponent == "None" else opponent, "game_date": game_day,
+                                  "opponent": auto_opp or (None if opponent in ("None", AUTO_OPP) else opponent), "game_date": game_day,
                                   "over": float(over_odds), "under": float(under_odds)}
         if ss.get("last_err"):
             st.error(ss["last_err"])
         elif ss.get("last_res"):
+            _c = ss["last_res"].get("context") or {}
+            if _c.get("from_game") and _c.get("opponent"):
+                st.caption(f"🎯 Opponent auto-selected from the game: **{_c['opponent']}**")
+            elif ss.get("opp") in (AUTO_OPP, "None") and not _c.get("opponent"):
+                st.caption(f"No opponent was set ({_c.get('why') or 'no game selected'}). Pick a game in Step 2 or choose the opponent in the form.")
             render_results(ss["last_res"], ss["last_ctx"])
 
         with st.expander("ℹ️ How the model works"):
