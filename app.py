@@ -35,7 +35,8 @@ def _startup_problems() -> List[str]:
                        ("validation", ("by_score", "by_criterion", "calibration", "brier", "verdict")),
                        ("parlay", ("Leg", "evaluate", "legs_from_snapshots")),
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
-                       ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier")),
+                       ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
+                       ("pin_check", ("split", "table", "for_player", "cross", "assess")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet"))):
         try:
             m = importlib.import_module(mod)
@@ -71,6 +72,7 @@ import io
 
 import cloud_store
 import odds_credits
+import pin_check
 import shared_ui
 import snapshots as snaps_mod
 import vegas_env
@@ -255,9 +257,10 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
         return pd.DataFrame(), f"Error fetching NBA events: {e}"
 
 
-def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
+def fetch_nba_prop_board(event_id: str, market: str, api_key: str, pinnacle: bool = False) -> Tuple[pd.DataFrame, Optional[str]]:
+    """DraftKings prop board (plus Pinnacle's rows when `pinnacle`, for the cross-check). Rows carry a Book column."""
     url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
-    params = {"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings", "oddsFormat": "american"}
+    params = {"apiKey": api_key, "regions": "us", "markets": market, "bookmakers": "draftkings,pinnacle" if pinnacle else "draftkings", "oddsFormat": "american"}
     try:
         resp = requests.get(url, params={**params, "includeLinks": "true"}, timeout=8)      # DraftKings deep links for the bet buttons
         if resp.status_code in (400, 422):
@@ -265,20 +268,21 @@ def fetch_nba_prop_board(event_id: str, market: str, api_key: str) -> Tuple[pd.D
         odds_credits.record_headers(resp.headers)
         if resp.status_code != 200:
             return pd.DataFrame(), f"Odds API Error ({resp.status_code}): {resp.text}"
-        bookmakers = resp.json().get("bookmakers", [])
-        if not bookmakers:
+        books = {b.get("key"): b for b in resp.json().get("bookmakers", [])}
+        if "draftkings" not in books:
             return pd.DataFrame(), "No DraftKings odds found for this event/market."
-        markets = bookmakers[0].get("markets", [])
-        if not markets:
-            return pd.DataFrame(), "No market data available."
         rows = []
-        for o in markets[0].get("outcomes", []):
-            try:
-                price = int(round(float(o.get("price", -110))))
-            except Exception:
-                price = -110
-            rows.append({"Player": o.get("description"), "Line": o.get("point", 0.5), "Price": price, "Outcome": o.get("name"),
-                         "Link": o.get("link") or markets[0].get("link") or bookmakers[0].get("link") or ""})
+        for key in ("draftkings", "pinnacle"):
+            mk = (books.get(key) or {}).get("markets", [])
+            for o in (mk[0].get("outcomes", []) if mk else []):
+                try:
+                    price = int(round(float(o.get("price", -110))))
+                except Exception:
+                    price = -110
+                rows.append({"Player": o.get("description"), "Line": o.get("point", 0.5), "Price": price, "Outcome": o.get("name"), "Book": key,
+                             "Link": o.get("link") or mk[0].get("link") or books[key].get("link") or ""})
+        if not rows:
+            return pd.DataFrame(), "No market data available."
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching prop board: {e}"
@@ -2416,6 +2420,10 @@ def render_snapshots() -> None:
         st.info("No snapshots yet. Evaluate a prop or scan a board and they will appear here.")
         return
     tiers = sn.by_tier(snaps)
+    pins = sn.by_pin(snaps)
+    if not pins.empty:
+        st.markdown("**Graded results by Pinnacle cross-check** (does agreeing with Pinnacle predict winning? Wait for 100+ graded picks before trusting this.)")
+        st.dataframe(pins.round(1), use_container_width=True, hide_index=True)
     if not tiers.empty:
         st.markdown("**Graded results by tier shown**")
         st.dataframe(tiers.round(1), use_container_width=True, hide_index=True)
@@ -2618,6 +2626,25 @@ def links_for(name: str, stat_label: str, line: float) -> Tuple[str, str]:
         return ("", "")
 
 
+def pin_assessment(res: Dict[str, Any], stat_label: str, line: float, over: float, under: float) -> Dict[str, Any]:
+    """Pinnacle cross-check for the side the app shows ({} when no Pinnacle board was fetched for this stat)."""
+    ss = st.session_state
+    if str(ss.get("pin_stat", "")).upper() != str(stat_label).upper():
+        return {}
+    side = (res.get("six_point") or {}).get("best") or res.get("best_side") or "Over"
+    return pin_check.for_player(ss.get("pin_summary"), str(res.get("player_name", "")), float(line), float(over), float(under), str(side))
+
+
+def render_pin_panel(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
+    """One line under the Evaluate button: does Pinnacle agree with the side shown?"""
+    a = pin_assessment(res, ctx.get("stat", ""), ctx.get("line", 0.0), ctx.get("over", -110), ctx.get("under", -110))
+    if not a:
+        return
+    side = (res.get("six_point") or {}).get("best") or res.get("best_side") or ""
+    show = {"Agrees": st.success, "Disagrees": st.warning}.get(a["FLAG"], st.info)
+    show(f"**Pinnacle cross-check ({side}): {a['FLAG']}.** {a['TEXT']}")
+
+
 def record_snapshot(res: Dict[str, Any], ctx: Dict[str, Any], stat_label: str, line: float, over: float, under: float,
                     source: str) -> None:
     """Save what the model believed for this prop (projection, minutes, probabilities, six-point) so it can be graded later.
@@ -2635,7 +2662,8 @@ def record_snapshot(res: Dict[str, Any], ctx: Dict[str, Any], stat_label: str, l
             ss["snapshots"] = load_snapshots()
         gd = ctx.get("game_date") or _today_et()
         row = sn.make_row(res, ctx, stat_label, float(line), float(over), float(under), source, _now_et_text(),
-                          gd.isoformat() if hasattr(gd, "isoformat") else str(gd), links=links_for(res.get("player_name", ""), stat_label, line))
+                          gd.isoformat() if hasattr(gd, "isoformat") else str(gd), links=links_for(res.get("player_name", ""), stat_label, line),
+                          pin=pin_assessment(res, stat_label, line, over, under))
         ss["snapshots"] = save_snapshots(sn.upsert(ss["snapshots"], [row]), force=source != "scan")
     except Exception:
         pass
@@ -2745,16 +2773,19 @@ def main() -> None:
                     game_idx = st.selectbox("Step 2: Select Game", range(len(events_df)), format_func=lambda i: str(events_df.loc[i, "label"]), key="live_game_idx")
                     refresh = st.checkbox("Refresh odds (costs credits; otherwise a board fetched in the last 10 min is reused for free)",
                                           key="refresh_odds")
+                    use_pin = st.checkbox("Also pull Pinnacle to cross-check DraftKings (one request for both books; shown as information only)", value=True, key="use_pin")
                     if st.button(f"Step 3: Fetch {selected_stat_label} Odds", key="fetch_board_odds"):
                         ev_id = str(events_df.loc[game_idx, "id"])
                         (board_df, err), cached_age = odds_credits.fetch_cached(
-                            ("NBA", ev_id, market_key), lambda: fetch_nba_prop_board(ev_id, market_key, api_key),
+                            ("NBA", ev_id, market_key, bool(use_pin)), lambda: fetch_nba_prop_board(ev_id, market_key, api_key, bool(use_pin)),
                             lambda v: v[1] is None and not v[0].empty, refresh)
                         if err:
                             st.error(odds_credits.friendly_error(err))
                         else:
                             st.caption(odds_credits.cache_note(cached_age))
-                            ss["board_df"] = board_df
+                            ss["board_df"], pin_df = pin_check.split(board_df, "Book")
+                            ss["pin_summary"] = summarize_board(pin_df) if use_pin and not pin_df.empty else pd.DataFrame()
+                            ss["pin_stat"] = selected_stat_label if use_pin else ""
                             ss["board_token"], ss["board_scan"] = uuid.uuid4().hex, None
                             ss["board_stat"] = selected_stat_label
                             ss["board_teams"] = [str(events_df.loc[game_idx, "away"]), str(events_df.loc[game_idx, "home"])]
@@ -2787,6 +2818,9 @@ def main() -> None:
                         st.warning(f"Player positions couldn't be loaded: {_why}. Reload the page to retry.")
                     shown_pos = shown.copy()
                     shown_pos.insert(1, "Pos", shown_pos["Player"].map(lambda n: position_of(str(n)) or "—"))
+                    if ss.get("pin_stat"):
+                        shown_pos = pin_check.table(shown_pos, ss.get("pin_summary"))
+                        st.caption("Pin columns: Pinnacle's line, its no-vig Over %, and what a DraftKings Over / Under is worth if Pinnacle's price is right (same line only; — = Pinnacle has no price).")
                     st.dataframe(style_tags(shown_pos) if "Six-Point" in shown_pos else shown_pos, use_container_width=True)
                     st.caption(LEGEND)
                     if st.button("🔎 Scan board for 5/6 & 6/6 props", key="scan_board_btn"):
@@ -2858,6 +2892,7 @@ def main() -> None:
         if ss.get("last_err"):
             st.error(ss["last_err"])
         elif ss.get("last_res"):
+            render_pin_panel(ss["last_res"], ss["last_ctx"])
             _c = ss["last_res"].get("context") or {}
             if _c.get("from_game") and _c.get("opponent"):
                 st.caption(f"🎯 Opponent auto-selected from the game: **{_c['opponent']}**")
