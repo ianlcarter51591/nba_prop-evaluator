@@ -25,9 +25,9 @@ SNAP_PATH = os.environ.get("SNAPSHOT_PATH", "snapshots.csv")
 MIN_MISS_PCT = 0.25                 # minutes off by 25%+ of the projection counts as a minutes miss
 KEY_COLS: List[str] = ["PLAYER", "STAT", "LINE", "GAME_DATE"]
 TEXT_COLS: List[str] = ["SNAP_ID", "TS_ET", "GAME_DATE", "GAME", "PLAYER", "STAT", "OPPONENT", "SOURCE", "SHOWN_SIDE", "EV_SIDE",
-                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK"]
+                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK", "PIN_FLAG"]
 NUM_COLS: List[str] = ["SEASON", "WEEK", "LINE", "OVER_ODDS", "UNDER_ODDS", "MU", "PROJ_MEAN", "PROJ_MIN", "RAW_AVG", "OPP_MULT", "VEGAS_TOTAL", "MIN_EXTRA",
-                       "P_OVER", "P_UNDER", "PM_OVER", "PM_UNDER", "SIX_OVER", "SIX_UNDER", "ACTUAL", "ACTUAL_MIN", "STAT_ERR", "MIN_ERR", "MIN_ERR_PCT"]
+                       "P_OVER", "P_UNDER", "PM_OVER", "PM_UNDER", "SIX_OVER", "SIX_UNDER", "ACTUAL", "ACTUAL_MIN", "STAT_ERR", "MIN_ERR", "MIN_ERR_PCT", "PIN_LINE", "PIN_P_SIDE", "DK_P_SIDE", "PIN_EV"]
 COLS: List[str] = TEXT_COLS + NUM_COLS
 
 
@@ -41,7 +41,8 @@ def _failed(six_side: Optional[Mapping[str, Any]]) -> str:
 
 def make_row(res: Mapping[str, Any], ctx: Mapping[str, Any], stat_label: str, line: float, over: float, under: float,
              source: str, now_et: str, game_date: str, season: Optional[int] = None,
-             week: Optional[int] = None, links: Tuple[str, str] = ("", "")) -> Dict[str, Any]:
+             week: Optional[int] = None, links: Tuple[str, str] = ("", ""),
+             pin: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """One snapshot row from an evaluation result (a dict without 'error'). NFL passes season + week; NBA a game date."""
     six = res.get("six_point") or {}
     sides = res.get("sides") or {}
@@ -59,6 +60,8 @@ def make_row(res: Mapping[str, Any], ctx: Mapping[str, Any], stat_label: str, li
         "SIX_OVER": (six.get("Over") or {}).get("score"), "SIX_UNDER": (six.get("Under") or {}).get("score"),
         "FAILED_OVER": _failed(six.get("Over")), "FAILED_UNDER": _failed(six.get("Under")), "STATUS": "Pending",
         "OVER_LINK": links[0], "UNDER_LINK": links[1],
+        "PIN_FLAG": (pin or {}).get("FLAG", ""), "PIN_LINE": (pin or {}).get("PIN_LINE"), "PIN_P_SIDE": (pin or {}).get("PIN_P_SIDE"),
+        "DK_P_SIDE": (pin or {}).get("DK_P_SIDE"), "PIN_EV": (pin or {}).get("PIN_EV"),
     }
 
 
@@ -207,6 +210,16 @@ def by_tier(d: pd.DataFrame) -> pd.DataFrame:
                      "AVG_MIN_ERR": s["MIN_ERR"].mean(),
                      "MINUTES_MISSES_%_OF_MISSES": 100.0 * miss["WHY"].str.startswith("Minutes miss").mean() if len(miss) else np.nan})
     return pd.DataFrame(rows).sort_values("TIER").reset_index(drop=True)
+
+
+def by_pin(d: pd.DataFrame) -> pd.DataFrame:
+    """Graded hit rate of the shown side split by what Pinnacle said (Agrees / Disagrees / Flat / no usable line). Pushes excluded."""
+    g = d[(d["STATUS"] == "Graded") & d["SHOWN_RESULT"].isin(["Hit", "Miss"])]
+    if g.empty:
+        return pd.DataFrame(columns=["PINNACLE", "PICKS", "HIT_%"])
+    rows = [{"PINNACLE": k, "PICKS": len(s), "HIT_%": 100.0 * (s["SHOWN_RESULT"] == "Hit").mean()}
+            for k, s in g.groupby(g["PIN_FLAG"].replace("", "Not checked"))]
+    return pd.DataFrame(rows).sort_values("PINNACLE").reset_index(drop=True)
 
 
 def load(path: Optional[str] = None) -> pd.DataFrame:
