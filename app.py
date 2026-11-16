@@ -37,7 +37,8 @@ def _startup_problems() -> List[str]:
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
                        ("pin_check", ("split", "table", "for_player", "cross", "assess")),
-                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id")),
+                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many")),
+                       ("best_picks", ("render", "make_row", "rank_picks")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button"))):
         try:
             m = importlib.import_module(mod)
@@ -74,6 +75,7 @@ import io
 import cloud_store
 import odds_credits
 import pin_check
+import best_picks
 import shared_ui
 import snapshots as snaps_mod
 import vegas_env
@@ -2711,6 +2713,77 @@ def run_form_evaluation(player_name: str, stat_label: str, line: float, over: fl
     return evaluate_in_context(player_name, stat_label, line, over, under, ctx)
 
 
+def _bp_star(rows: pd.DataFrame) -> int:
+    """Favorite the given Best Picks rows (they were saved as snapshots by the scan); returns how many were starred."""
+    import favorites as fv
+    new, n = fv.star_many(_fav_snaps(), rows)
+    if n:
+        st.session_state["snapshots"] = _fav_save(new)
+    return n
+
+
+BP_DEFAULT_STATS = ["Points", "Rebounds", "Assists", "3-Pointers Made"]
+BP_KEEP_KEYS = ("board_teams", "board_spread", "board_date", "board_vegas", "pin_summary", "pin_stat")
+
+
+def _bp_games() -> pd.DataFrame:
+    """Upcoming NBA games for the Best Picks tab: id, label, day (ET date), home, away."""
+    events, err = list_nba_events(_secret("ODDS_API_KEY"))
+    if err:
+        raise RuntimeError(odds_credits.friendly_error(err))
+    return events.rename(columns={"game_date": "day"}) if not events.empty else pd.DataFrame(columns=["id", "label", "day", "home", "away"])
+
+
+def _bp_fetch_board(game: Any, stat: str) -> pd.DataFrame:
+    """One game's DraftKings board for a stat (10-min cache shared with the Evaluate tab); sets the game context the evaluation reads."""
+    ss = st.session_state
+    api_key, ev_id, market = _secret("ODDS_API_KEY"), str(game["id"]), ODDS_API_MARKETS[stat]
+    (board, err), _ = odds_credits.fetch_cached(("NBA", ev_id, market, True), lambda: fetch_nba_prop_board(ev_id, market, api_key, True),
+                                                lambda v: v[1] is None and not v[0].empty)
+    if err:
+        raise RuntimeError(odds_credits.friendly_error(err))
+    dk, pin_df = pin_check.split(board, "Book")
+    away, home, day = str(game["away"]), str(game["home"]), str(game.get("day", ""))
+    extras = ss.setdefault("bp_game_ctx", {})
+    if ev_id not in extras:                                   # spread (ESPN first, free) and Vegas total: once per game
+        extras[ev_id] = (fetch_game_spread(ev_id, api_key, away, home, day)[0], fetch_game_lines(away, home, day))
+    ss["board_teams"], ss["board_date"] = [away, home], _iso_to_date(day)
+    ss["board_spread"], ss["board_vegas"] = extras[ev_id]
+    ss["pin_summary"], ss["pin_stat"] = (summarize_board(pin_df) if not pin_df.empty else pd.DataFrame()), stat
+    summary = summarize_board(dk)
+    remember_links(summary, stat)
+    return summary
+
+
+def _bp_evaluate(game: Any, stat: str, name: str, line: float, over: float, under: float) -> Optional[Dict[str, Any]]:
+    """Evaluate one prop in its game (same path as the board scan) and return its Best Picks row."""
+    ss = st.session_state
+    day = ss.get("board_date") or _today_et()
+    ctx = resolve_context(name, None, day, ss["board_teams"], ss.get("board_spread"), day)
+    if ctx["opponent"] is None:
+        return None
+    res = evaluate_in_context(name, stat, line, over, under, ctx, source="scan")
+    if "error" in res:
+        return None
+    od = res.get("opp_detail") or {}
+    pos = od.get("pos") or {}
+    row = best_picks.make_row(res, stat, line, " @ ".join(ss["board_teams"]), position_of(name) or "", od.get("abbr") or str(ctx["opponent"]),
+                              pos.get("rank"), pos.get("n_teams"))
+    if row:
+        row["PIN"] = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"])["FLAG"]
+    return row
+
+
+def render_best_picks() -> None:
+    """🏆 Best Picks tab."""
+    if not _secret("ODDS_API_KEY"):
+        st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
+        return
+    best_picks.render(st, stats=list(ODDS_API_MARKETS), default_stats=BP_DEFAULT_STATS, list_games=_bp_games, fetch_board=_bp_fetch_board,
+                      evaluate=_bp_evaluate, keep_keys=BP_KEEP_KEYS, after_scan=cloud_store.flush, star=_bp_star,
+                      credits_note=lambda: odds_credits.credits_status()[0] or "")
+
+
 def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], spread: Optional[float],
                game_date: Optional[date], progress: Any = None) -> Dict[str, Any]:
     """Run the full evaluation (and six-point check) for every player on the odds board.
@@ -2772,7 +2845,9 @@ def main() -> None:
 
     if ss.get("snap_missing"):
         st.warning("snapshots.py is not uploaded to the app's GitHub repo, so predictions are NOT being saved. Upload it (it is in the zip).")
-    tab_eval, tab_log, tab_snap, tab_parlay, tab_bt = st.tabs(["⚡ Evaluate", "📒 Bet Log", "📸 Snapshots", "🎟️ Parlay", "🔬 B2B Backtest"])
+    tab_eval, tab_best, tab_log, tab_snap, tab_parlay, tab_bt = st.tabs(["⚡ Evaluate", "🏆 Best Picks", "📒 Bet Log", "📸 Snapshots", "🎟️ Parlay", "🔬 B2B Backtest"])
+    with tab_best:
+        render_best_picks()
     with tab_eval:
         with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
             if not api_key:
