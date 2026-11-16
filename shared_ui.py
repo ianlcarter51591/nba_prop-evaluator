@@ -126,24 +126,72 @@ def render_slip(st: Any, legs: List[Dict[str, Any]]) -> None:
                " Links are saved when you evaluate a prop, so a leg saved before this update opens the sportsbook home page.")
 
 
-def render_parlay(st: Any, snaps: Optional[pd.DataFrame]) -> None:
+def _apply_snapshots(st: Any, save: Any, new: pd.DataFrame) -> None:
+    """Save `new` snapshots (the app's save function returns what was stored) and remember them for this session."""
+    st.session_state["snapshots"] = save(new)
+
+
+def render_favorites(st: Any, snaps: Optional[pd.DataFrame], save: Any, stat: Optional[str] = None, title: str = "⭐ Favorite props") -> None:
+    """Multiselect of saved (pending) props; whatever is selected becomes a favorite and is what the parlay builder offers."""
+    import favorites as fv
+    opts = fv.option_table(snaps, stat)
+    if opts.empty:
+        st.caption("No saved props to star yet: evaluate a prop or scan a board first (every evaluated prop is saved).")
+        return
+    current = opts.loc[opts["FAV"] == "Y", "LABEL"].tolist()
+    picked = st.multiselect(title, opts["LABEL"].tolist(), default=current,
+                            help="Starred props are the only ones the Parlay tab offers. Only props from games that haven't been graded yet are listed.")
+    if picked is None or set(picked) == set(current):
+        return
+    _apply_snapshots(st, save, fv.set_flags(snaps, set(opts.loc[opts["LABEL"].isin(picked), "SNAP_ID"]), set(opts["SNAP_ID"])))
+    st.rerun()
+
+
+def render_star_button(st: Any, snaps: Optional[pd.DataFrame], player: str, stat: str, line: float, save: Any) -> None:
+    """☆ / ★ button for the prop on screen (it must already be saved, which every evaluation does)."""
+    import favorites as fv
+    sid = fv.find_id(snaps, player, stat, line)
+    if not sid:
+        return
+    on = fv.is_favorite(snaps, sid)
+    if st.button("★ Favorite (click to remove)" if on else "☆ Favorite this prop", key=f"star_{sid}",
+                 help="Favorites are the only props the Parlay tab offers."):
+        _apply_snapshots(st, save, fv.toggle(snaps, sid))
+        st.rerun()
+
+
+def render_parlay(st: Any, snaps: Optional[pd.DataFrame], save: Any = None) -> None:
     """Build a ticket from saved predictions or by hand, then price it."""
     ss = st.session_state
     legs = _legs(st)
-    st.markdown("Build a ticket from props you've already evaluated, or type legs in. The evaluator multiplies your legs' model "
+    import favorites as fv
+    st.markdown("Build a ticket from your ⭐ favorite props. The evaluator multiplies your legs' model "
                 "probabilities, adjusts legs from the same game for correlation, applies any boost, and compares that with the price.")
-    pool = pl.legs_from_snapshots(snaps) if snaps is not None else pd.DataFrame()
+    pool = fv.legs(snaps)
+
+    def _add(r: Any) -> bool:
+        return add_leg(st, r["LABEL"], r["P_MODEL"], None if pd.isna(r["ODDS"]) else float(r["ODDS"]),
+                       None if pd.isna(r["P_MARKET"]) else float(r["P_MARKET"]), r["GAME"], r.get("LINK", ""))
+
     if not pool.empty:
-        c1, c2 = st.columns([4, 1])
-        pick = c1.selectbox("Add a leg from your saved predictions (pending games)", pool["LABEL"].tolist(), key="parlay_pick")
-        c2.write("")
-        if c2.button("➕ Add leg", key="parlay_add") and pick in set(pool["LABEL"]):
-            r = pool[pool["LABEL"] == pick].iloc[0]
-            ok = add_leg(st, r["LABEL"], r["P_MODEL"], None if pd.isna(r["ODDS"]) else float(r["ODDS"]),
-                         None if pd.isna(r["P_MARKET"]) else float(r["P_MARKET"]), r["GAME"], r.get("LINK", ""))
-            (st.toast if ok else st.warning)("Leg added" if ok else "That leg is already on the ticket.")
+        st.markdown("**Your favorites** (both sides of each starred prop; ✓ = the side the app shows)")
+        st.dataframe(pd.DataFrame({"LEG": pool["LABEL"], "GAME": pool["GAME"], "YOUR_CHANCE_%": (pool["P_MODEL"] * 100).round(1),
+                                   "MARKET_%": (pool["P_MARKET"] * 100).round(1), "EDGE_PP": pool["EDGE_PP"].round(1), "ODDS": pool["ODDS"],
+                                   "APP_PICK": pool["APP_PICK"].map({True: "✓", False: ""})}), use_container_width=True, hide_index=True)
+        picks = st.multiselect("Add legs to the ticket", pool["LABEL"].tolist(), key="parlay_picks")
+        c1, c2 = st.columns(2)
+        if c1.button("➕ Add selected legs", key="parlay_add") and picks:
+            added = sum(_add(r) for _, r in pool[pool["LABEL"].isin(picks)].iterrows())
+            (st.toast if added else st.warning)(f"{added} leg(s) added" if added else "Those legs are already on the ticket.")
+        if c2.button("➕ Add the app's pick for every favorite", key="parlay_add_all"):
+            sub = pool[pool["APP_PICK"]] if pool["APP_PICK"].any() else pool
+            added = sum(_add(r) for _, r in sub.iterrows())
+            (st.toast if added else st.warning)(f"{added} leg(s) added" if added else "Those legs are already on the ticket.")
     else:
-        st.caption("No pending saved predictions yet: evaluate a prop or scan a board first, or add legs by hand below.")
+        st.info("No favorite props yet. Star a prop with the ☆ Favorite button under its evaluation, or pick favorites below or under the board, and it shows up here.")
+    if save is not None:
+        with st.expander("⭐ Manage favorites"):
+            render_favorites(st, snaps, save)
     with st.expander("Add a leg by hand"):
         m1, m2, m3, m4 = st.columns([3, 1, 1, 2])
         label = m1.text_input("Leg", key="parlay_m_label", placeholder="Player Over 22.5 Points")
