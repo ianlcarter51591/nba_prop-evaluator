@@ -99,3 +99,12 @@ def legs(snaps: Optional[pd.DataFrame]) -> pd.DataFrame:
         if "SHOWN_SIDE" in f.columns else set()
     out["APP_PICK"] = out["LABEL"].isin(shown)
     return out.sort_values(["APP_PICK", "LABEL"], ascending=[False, True]).reset_index(drop=True)[cols]
+
+
+def star_many(snaps: Optional[pd.DataFrame], rows: pd.DataFrame) -> Any:
+    """(snapshots with the props in `rows` starred, how many were found). `rows` needs PLAYER, STAT, LINE; props never saved are skipped."""
+    d = _with_fav(snaps)
+    ids = {find_id(d, r["PLAYER"], r["STAT"], r["LINE"]) for _, r in rows.iterrows()} - {None}
+    if ids:
+        d.loc[d["SNAP_ID"].isin(ids), "FAV"] = "Y"
+    return d, len(ids)
