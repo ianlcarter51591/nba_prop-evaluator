@@ -37,7 +37,8 @@ def _startup_problems() -> List[str]:
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
                        ("pin_check", ("split", "table", "for_player", "cross", "assess")),
-                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet"))):
+                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id")),
+                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button"))):
         try:
             m = importlib.import_module(mod)
         except ModuleNotFoundError as e:
@@ -2096,6 +2097,10 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
                                    links_for(res["player_name"], stat_category, line_val), info_["best"]["side"] if info_ else "")
     except Exception:
         pass       # the bet buttons are a convenience: never break the result screen
+    try:
+        shared_ui.render_star_button(st, _fav_snaps(), res["player_name"], stat_category, float(line_val), _fav_save)
+    except Exception:
+        pass       # the star is a convenience: never break the result screen
     st.markdown("---")
     render_matchup_injury(res, stat_category)
     for w in res["warnings"]:
@@ -2626,6 +2631,19 @@ def links_for(name: str, stat_label: str, line: float) -> Tuple[str, str]:
         return ("", "")
 
 
+def _fav_save(df: pd.DataFrame) -> pd.DataFrame:
+    """Save snapshots after a star change (used by the favorite controls)."""
+    return save_snapshots(df, force=True)
+
+
+def _fav_snaps() -> pd.DataFrame:
+    """The saved snapshots (loaded on first use) that favorites live in."""
+    ss = st.session_state
+    if "snapshots" not in ss:
+        ss["snapshots"] = load_snapshots()
+    return ss["snapshots"]
+
+
 def pin_assessment(res: Dict[str, Any], stat_label: str, line: float, over: float, under: float) -> Dict[str, Any]:
     """Pinnacle cross-check for the side the app shows ({} when no Pinnacle board was fetched for this stat)."""
     ss = st.session_state
@@ -2823,6 +2841,8 @@ def main() -> None:
                         st.caption("Pin columns: Pinnacle's line, its no-vig Over %, and what a DraftKings Over / Under is worth if Pinnacle's price is right (same line only; — = Pinnacle has no price).")
                     st.dataframe(style_tags(shown_pos) if "Six-Point" in shown_pos else shown_pos, use_container_width=True)
                     st.caption(LEGEND)
+                    shared_ui.render_favorites(st, _fav_snaps(), _fav_save, stat=ss.get("board_stat") or selected_stat_label,
+                                               title=f"⭐ Favorite {ss.get('board_stat') or selected_stat_label} props (scan the board first to list every player)")
                     if st.button("🔎 Scan board for 5/6 & 6/6 props", key="scan_board_btn"):
                         bar = st.progress(0.0, text="Starting scan...")
                         ss["board_scan"] = {"token": ss.get("board_token"),
@@ -2923,7 +2943,7 @@ def main() -> None:
     with tab_parlay:
         if "snapshots" not in ss:
             ss["snapshots"] = load_snapshots()
-        shared_ui.render_parlay(st, ss["snapshots"])
+        shared_ui.render_parlay(st, ss["snapshots"], _fav_save)
     with tab_bt:
         render_backtest()
         render_position_backtest()
