@@ -32,7 +32,7 @@ BOTH_EDGE = 2.0
 BOTH_MATCHUP = 200.0 / 3.0
 DEFAULT_WEIGHT = 0.60
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
-ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN"]
+ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID"]
 SHOW_COLS = ["PICK", "POS", "GAME", "ODDS", "MODEL_%", "MARKET_%", "BLEND_%", "EDGE_PP", "EV_%", "OPP_VS_POS", "MODEL", "MATCHUP", "SCORE", "BOTH", "SIX", "PIN"]
 
 
@@ -165,7 +165,7 @@ def scan(games: pd.DataFrame, stats: Sequence[str], fetch_board: Callable[[Mappi
                 cache[key] = row
                 evaluated += 1
             if row:
-                rows.append(row)
+                rows.append({**row, "EVENT_ID": str(g.get("id", ""))})
     if progress is not None:
         progress.progress(1.0, text="Scan complete")
     return {"rows": rows, "errors": errors, "evaluated": evaluated, "reused": reused}
@@ -180,14 +180,58 @@ def default_games(games: pd.DataFrame) -> List[str]:
     return games["label"].tolist() if known.empty else games.loc[days == known.min(), "label"].tolist()
 
 
+def selected_row(event: Any) -> Optional[int]:
+    """Index of the row picked in a st.dataframe selection event (None if nothing is selected)."""
+    sel = getattr(event, "selection", None)
+    if sel is None and isinstance(event, Mapping):
+        sel = event.get("selection")
+    rows = getattr(sel, "rows", None)
+    if rows is None and isinstance(sel, Mapping):
+        rows = sel.get("rows")
+    return int(rows[0]) if rows else None
+
+
+def _clickable_table(st: Any, shown: pd.DataFrame, ranked: pd.DataFrame, open_pick: Callable[[Mapping[str, Any]], str]) -> None:
+    """The picks table with single-row selection: picking a row loads it into the Evaluate tab (once per pick)."""
+    import zlib
+    ss = st.session_state
+    key = "bp_table_" + str(zlib.crc32("|".join(shown["PICK"]).encode()))      # new list -> fresh selection, so an old click never opens a different prop
+    st.caption("👆 Click a row (the box at its left edge) to load that prop into the **⚡ Evaluate** tab, then open that tab.")
+    try:
+        event = st.dataframe(shown, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=key)
+    except TypeError:                                                          # Streamlit too old for row selection: fall back to a picker
+        st.dataframe(shown, use_container_width=True, hide_index=True)
+        pick = st.selectbox("Open a pick in the Evaluate tab", [""] + shown["PICK"].tolist(), key="bp_open_pick")
+        event = {"selection": {"rows": [shown["PICK"].tolist().index(pick)] if pick else []}}
+    i = selected_row(event)
+    if i is None or i >= len(ranked):
+        return
+    token = (key, shown.iloc[i]["PICK"])
+    if ss.get("bp_opened") == token:
+        if ss.get("bp_open_msg"):
+            st.success(ss["bp_open_msg"])
+        return
+    ss["bp_opened"] = token
+    try:
+        ss["bp_open_msg"] = open_pick(ranked.iloc[i].to_dict())
+    except Exception as e:
+        ss["bp_open_msg"] = ""
+        st.warning(f"Couldn't load that prop: {str(e)[:120]}")
+        return
+    if ss["bp_open_msg"]:
+        st.success(ss["bp_open_msg"])
+
+
 def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_games: Callable[[], pd.DataFrame],
            fetch_board: Callable[[Mapping[str, Any], str], pd.DataFrame],
            evaluate: Callable[[Mapping[str, Any], str, str, float, float, float], Optional[Dict[str, Any]]],
            keep_keys: Iterable[str] = (), after_scan: Optional[Callable[[], None]] = None,
            star: Optional[Callable[[pd.DataFrame], int]] = None, credits_note: Optional[Callable[[], str]] = None,
-           blend_info: Optional[Callable[[], Mapping[str, Any]]] = None) -> None:
+           blend_info: Optional[Callable[[], Mapping[str, Any]]] = None,
+           open_pick: Optional[Callable[[Mapping[str, Any]], str]] = None) -> None:
     """The Best Picks tab. `keep_keys` are session-state keys the callbacks overwrite; they are restored after a scan.
-    `star(rows)` favorites the given ranked rows and returns how many it starred."""
+    `star(rows)` favorites the given ranked rows and returns how many it starred.
+    `open_pick(row)` loads a clicked row into the Evaluate form and returns a message for the user."""
     ss = st.session_state
     st.markdown("One ranked list across the slate: **MODEL** (your model's edge over DraftKings' no-vig price) and **MATCHUP** "
                 "(the opponent's rank against the player's position for that stat). ✓ in BOTH = a model edge *and* a top-third matchup.")
@@ -252,7 +296,10 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
             st.info("No prop clears the minimum edge right now. Lower it to see more.")
         else:
             shown = display(ranked, top)
-            st.dataframe(shown, use_container_width=True, hide_index=True)
+            if open_pick is None:
+                st.dataframe(shown, use_container_width=True, hide_index=True)
+            else:
+                _clickable_table(st, shown, ranked.head(top), open_pick)
             st.caption("OPP_VS_POS: opponent and its rank vs this position for this stat (#1 = allows the most). MATCHUP is high when that rank helps the side shown "
                        "(soft defense for an Over, tough defense for an Under). PIN = Pinnacle cross-check for that side.")
             if star is not None:
