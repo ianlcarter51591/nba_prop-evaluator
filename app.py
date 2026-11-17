@@ -39,6 +39,7 @@ def _startup_problems() -> List[str]:
                        ("pin_check", ("split", "table", "for_player", "cross", "assess")),
                        ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many")),
                        ("best_picks", ("render", "make_row", "rank_picks")),
+                       ("prop_review", ("fit_blend", "blend", "render_blend_banner", "render_calibration", "record_close", "compute_clv", "clv_summary", "render_clv", "render_daily", "day_counts", "graded_days")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button"))):
         try:
             m = importlib.import_module(mod)
@@ -76,6 +77,9 @@ import cloud_store
 import odds_credits
 import pin_check
 import best_picks
+import prop_review
+
+DATE_COL_CLV = "GAME_DATE"
 import shared_ui
 import snapshots as snaps_mod
 import vegas_env
@@ -254,7 +258,7 @@ def list_nba_events(api_key: str) -> Tuple[pd.DataFrame, Optional[str]]:
             et = _to_et_date(ev.get("commence_time", ""))
             when = et_label(ev.get("commence_time", "")) or str(ev.get("commence_time", ""))[:16].replace("T", " ") + " UTC"
             rows.append({"id": ev.get("id"), "label": f"{away} @ {home} ({when})", "home": home, "away": away,
-                         "game_date": et.isoformat() if et else ""})
+                         "game_date": et.isoformat() if et else "", "commence": str(ev.get("commence_time", ""))})
         return pd.DataFrame(rows), None
     except Exception as e:
         return pd.DataFrame(), f"Error fetching NBA events: {e}"
@@ -2401,6 +2405,18 @@ def render_snapshots() -> None:
     snaps = ss["snapshots"]
     st.caption("Saved automatically each time you press Evaluate or scan a board (latest snapshot per player, stat, line and game).")
     shared_ui.render_storage_status(st)
+
+    def _auto_grade() -> pd.DataFrame:
+        graded, _n, notes = sn.grade(ss["snapshots"], fetch_player_logs, STAT_COL_BY_LABEL, _today_et().isoformat())
+        ss["snapshots"] = save_snapshots(graded)
+        ss["snap_notes"] = notes[:5]
+        return ss["snapshots"]
+
+    try:
+        prop_review.render_daily(st, snaps, "GAME_DATE", _today_et().isoformat(), _auto_grade)
+    except Exception as e:
+        st.caption(f"Daily results unavailable ({str(e)[:80]}).")
+    snaps = ss["snapshots"]
     a, b = st.columns(2)
     if a.button("🏁 Grade finished games", key="grade_snaps"):
         graded, n, notes = sn.grade(snaps, fetch_player_logs, STAT_COL_BY_LABEL, _today_et().isoformat())
@@ -2431,6 +2447,14 @@ def render_snapshots() -> None:
     if not pins.empty:
         st.markdown("**Graded results by Pinnacle cross-check** (does agreeing with Pinnacle predict winning? Wait for 100+ graded picks before trusting this.)")
         st.dataframe(pins.round(1), use_container_width=True, hide_index=True)
+    try:
+        prop_review.render_calibration(st, snaps)
+    except Exception as e:
+        st.caption(f"Calibration report unavailable ({str(e)[:80]}).")
+    try:
+        prop_review.render_clv(st, snaps, DATE_COL_CLV, _today_et().isoformat() if hasattr(_today_et(), "isoformat") else str(_today_et()))
+    except Exception as e:
+        st.caption(f"Closing-line report unavailable ({str(e)[:80]}).")
     if not tiers.empty:
         st.markdown("**Graded results by tier shown**")
         st.dataframe(tiers.round(1), use_container_width=True, hide_index=True)
@@ -2633,6 +2657,26 @@ def links_for(name: str, stat_label: str, line: float) -> Tuple[str, str]:
         return ("", "")
 
 
+def _record_close(summary: pd.DataFrame, stat: str, game_date: str, commence: str, cached_age: Optional[float]) -> None:
+    """Use a freshly pulled DraftKings board as the latest 'close' of matching saved props (see prop_review.py). Never breaks the screen."""
+    try:
+        from zoneinfo import ZoneInfo as _Z
+        seen = (datetime.now(_Z("America/New_York")) - timedelta(seconds=float(cached_age or 0))).strftime("%Y-%m-%d %H:%M")
+        new, n = prop_review.record_close(_fav_snaps(), summary, stat, str(game_date), str(commence), seen, DATE_COL_CLV)
+        if n:
+            st.session_state["snapshots"] = save_snapshots(new, force=False)
+    except Exception:
+        pass
+
+
+def _blend_info() -> Dict[str, Any]:
+    """Market-blend weight fitted from the graded snapshots (see prop_review.py)."""
+    try:
+        return prop_review.fit_blend(_fav_snaps())
+    except Exception:
+        return prop_review.fit_blend(None)      # never let the blend break the screen: fall back to the starting assumption
+
+
 def _fav_save(df: pd.DataFrame) -> pd.DataFrame:
     """Save snapshots after a star change (used by the favorite controls)."""
     return save_snapshots(df, force=True)
@@ -2738,8 +2782,8 @@ def _bp_fetch_board(game: Any, stat: str) -> pd.DataFrame:
     """One game's DraftKings board for a stat (10-min cache shared with the Evaluate tab); sets the game context the evaluation reads."""
     ss = st.session_state
     api_key, ev_id, market = _secret("ODDS_API_KEY"), str(game["id"]), ODDS_API_MARKETS[stat]
-    (board, err), _ = odds_credits.fetch_cached(("NBA", ev_id, market, True), lambda: fetch_nba_prop_board(ev_id, market, api_key, True),
-                                                lambda v: v[1] is None and not v[0].empty)
+    (board, err), age = odds_credits.fetch_cached(("NBA", ev_id, market, True), lambda: fetch_nba_prop_board(ev_id, market, api_key, True),
+                                                  lambda v: v[1] is None and not v[0].empty)
     if err:
         raise RuntimeError(odds_credits.friendly_error(err))
     dk, pin_df = pin_check.split(board, "Book")
@@ -2752,6 +2796,7 @@ def _bp_fetch_board(game: Any, stat: str) -> pd.DataFrame:
     ss["pin_summary"], ss["pin_stat"] = (summarize_board(pin_df) if not pin_df.empty else pd.DataFrame()), stat
     summary = summarize_board(dk)
     remember_links(summary, stat)
+    _record_close(summary, stat, day, str(game.get("commence", "")), age)
     return summary
 
 
@@ -2781,7 +2826,7 @@ def render_best_picks() -> None:
         return
     best_picks.render(st, stats=list(ODDS_API_MARKETS), default_stats=BP_DEFAULT_STATS, list_games=_bp_games, fetch_board=_bp_fetch_board,
                       evaluate=_bp_evaluate, keep_keys=BP_KEEP_KEYS, after_scan=cloud_store.flush, star=_bp_star,
-                      credits_note=lambda: odds_credits.credits_status()[0] or "")
+                      credits_note=lambda: odds_credits.credits_status()[0] or "", blend_info=_blend_info)
 
 
 def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], spread: Optional[float],
@@ -2877,6 +2922,8 @@ def main() -> None:
                         else:
                             st.caption(odds_credits.cache_note(cached_age))
                             ss["board_df"], pin_df = pin_check.split(board_df, "Book")
+                            _record_close(summarize_board(ss["board_df"]), selected_stat_label, str(events_df.loc[game_idx].get("game_date", "")),
+                                          str(events_df.loc[game_idx].get("commence", "")), cached_age)
                             ss["pin_summary"] = summarize_board(pin_df) if use_pin and not pin_df.empty else pd.DataFrame()
                             ss["pin_stat"] = selected_stat_label if use_pin else ""
                             ss["board_token"], ss["board_scan"] = uuid.uuid4().hex, None
@@ -2988,6 +3035,7 @@ def main() -> None:
             st.error(ss["last_err"])
         elif ss.get("last_res"):
             render_pin_panel(ss["last_res"], ss["last_ctx"])
+            prop_review.render_blend_banner(st, ss["last_res"], _blend_info())
             _c = ss["last_res"].get("context") or {}
             if _c.get("from_game") and _c.get("opponent"):
                 st.caption(f"🎯 Opponent auto-selected from the game: **{_c['opponent']}**")
