@@ -85,7 +85,7 @@ def favorite_ids(snaps: Optional[pd.DataFrame]) -> Set[str]:
 def legs(snaps: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Parlay legs (Over and Under) of favorited pending props only. Adds EDGE_PP (model minus market, points) and APP_PICK (the side the app shows)."""
     import parlay as pl
-    cols = ["LABEL", "GAME", "P_MODEL", "P_MARKET", "ODDS", "LINK", "EDGE_PP", "APP_PICK"]
+    cols = ["LABEL", "GAME", "P_MODEL", "P_MARKET", "ODDS", "LINK", "EDGE_PP", "APP_PICK", "SNAP_ID"]
     d = _with_fav(snaps)
     if d.empty or "STATUS" not in d.columns:
         return pd.DataFrame(columns=cols)
@@ -98,6 +98,8 @@ def legs(snaps: Optional[pd.DataFrame]) -> pd.DataFrame:
     shown = {f"{r['PLAYER']} {r['SHOWN_SIDE']} {float(r['LINE']):g} {r['STAT']}" for _, r in f.iterrows() if str(r.get("SHOWN_SIDE", "")) in ("Over", "Under")} \
         if "SHOWN_SIDE" in f.columns else set()
     out["APP_PICK"] = out["LABEL"].isin(shown)
+    by_label = {f"{r['PLAYER']} {side} {float(r['LINE']):g} {r['STAT']}": r["SNAP_ID"] for _, r in f.iterrows() for side in ("Over", "Under")}
+    out["SNAP_ID"] = out["LABEL"].map(by_label).fillna("")
     return out.sort_values(["APP_PICK", "LABEL"], ascending=[False, True]).reset_index(drop=True)[cols]
 
 
