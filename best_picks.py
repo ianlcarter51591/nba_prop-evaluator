@@ -11,6 +11,11 @@ For each prop the app evaluates, the side kept is the one with the higher model 
     BOTH     = EDGE_PP >= BOTH_EDGE and MATCHUP >= BOTH_MATCHUP   (model edge AND a top-third matchup for that side)
 Rows are sorted BOTH first, then SCORE. Props whose best side has EDGE_PP below the minimum edge are dropped.
 
+Market blend (on by default, see prop_review.py): the model chance is first blended with the market in log-odds with weight w,
+    BLEND_% = blend(P_MODEL, P_MARKET, w),  EDGE_PP = BLEND_% - P_MARKET,  EV_% = BLEND_% * decimal(ODDS) - 100,
+MODEL = 100 * clip(EDGE_PP / (EDGE_CAP * max(w, 0.2)), 0, 1)   (blending shrinks edges by about w, so the cap shrinks with it), and
+BOTH needs a blended EV above 0 (still +EV once the market is respected) plus the top-third matchup.
+
 The UI part (render) is the same in both apps; each app passes callbacks that fetch a board and evaluate one prop.
 Auto-refresh only runs while the app is open in a browser, and every refresh of a (game, stat) board costs Odds API credits.
 """
@@ -28,7 +33,7 @@ BOTH_MATCHUP = 200.0 / 3.0
 DEFAULT_WEIGHT = 0.60
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
 ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN"]
-SHOW_COLS = ["PICK", "POS", "GAME", "ODDS", "MODEL_%", "MARKET_%", "EDGE_PP", "EV_%", "OPP_VS_POS", "MODEL", "MATCHUP", "SCORE", "BOTH", "SIX", "PIN"]
+SHOW_COLS = ["PICK", "POS", "GAME", "ODDS", "MODEL_%", "MARKET_%", "BLEND_%", "EDGE_PP", "EV_%", "OPP_VS_POS", "MODEL", "MATCHUP", "SCORE", "BOTH", "SIX", "PIN"]
 
 
 def make_row(res: Mapping[str, Any], stat: str, line: float, game: str, pos: Optional[str], opp: Optional[str],
@@ -55,24 +60,42 @@ def matchup_score(side: pd.Series, rank: pd.Series, n_teams: pd.Series) -> pd.Se
     return pd.Series(np.where(ok, 100.0 * np.clip(val, 0.0, 1.0), 50.0), index=side.index, dtype=float)
 
 
-def rank_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGHT, min_edge: float = 0.0) -> pd.DataFrame:
-    """Score and sort candidate rows (see module docstring). Returns ROW_COLS plus MODEL, MATCHUP, SCORE, BOTH."""
-    extra = ["MODEL", "MATCHUP", "SCORE", "BOTH"]
+def _decimal(odds: pd.Series) -> pd.Series:
+    o = pd.to_numeric(odds, errors="coerce")
+    return pd.Series(np.where(o > 0, 1.0 + o / 100.0, 1.0 + 100.0 / -o), index=odds.index).where(o.abs() >= 100)
+
+
+def rank_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGHT, min_edge: float = 0.0,
+               w_blend: Optional[float] = None) -> pd.DataFrame:
+    """Score and sort candidate rows (see module docstring). Returns ROW_COLS plus BLEND_%, MODEL, MATCHUP, SCORE, BOTH.
+    With `w_blend` the edge, EV and BOTH use the market-blended chance; otherwise BLEND_% equals the model chance."""
+    import prop_review as cal
+    extra = ["BLEND_%", "MODEL", "MATCHUP", "SCORE", "BOTH"]
     d = pd.DataFrame(list(rows))
     if d.empty:
         return pd.DataFrame(columns=ROW_COLS + extra)
     for c in ROW_COLS:
         if c not in d.columns:
             d[c] = np.nan
+    pmod, pmkt = pd.to_numeric(d["P_MODEL"], errors="coerce"), pd.to_numeric(d["P_MARKET"], errors="coerce")
+    if w_blend is None:
+        d["BLEND_%"] = pmod
+    else:
+        d["BLEND_%"] = cal.blend(pmod.to_numpy(), pmkt.to_numpy(), float(w_blend))
+        d["EDGE_PP"] = d["BLEND_%"] - pmkt
+        d["EV_%"] = (d["BLEND_%"] / 100.0 * _decimal(d["ODDS"]) - 1.0) * 100.0
     edge = pd.to_numeric(d["EDGE_PP"], errors="coerce")
     d = d[edge.notna() & (edge >= float(min_edge))].copy()
     if d.empty:
         return pd.DataFrame(columns=ROW_COLS + extra)
     w = float(np.clip(w_model, 0.0, 1.0))
-    d["MODEL"] = 100.0 * np.clip(pd.to_numeric(d["EDGE_PP"], errors="coerce") / EDGE_CAP, 0.0, 1.0)
+    cap = EDGE_CAP if w_blend is None else EDGE_CAP * max(float(w_blend), 0.2)
+    e = pd.to_numeric(d["EDGE_PP"], errors="coerce")
+    d["MODEL"] = 100.0 * np.clip(e / cap, 0.0, 1.0)
     d["MATCHUP"] = matchup_score(d["SIDE"], d["OPP_RANK"], d["N_TEAMS"])
     d["SCORE"] = w * d["MODEL"] + (1.0 - w) * d["MATCHUP"]
-    d["BOTH"] = (pd.to_numeric(d["EDGE_PP"], errors="coerce") >= BOTH_EDGE) & (d["MATCHUP"] >= BOTH_MATCHUP) & pd.to_numeric(d["OPP_RANK"], errors="coerce").notna()
+    model_ok = (e >= BOTH_EDGE) if w_blend is None else ((pd.to_numeric(d["EV_%"], errors="coerce") > 0) & (e > 0))
+    d["BOTH"] = model_ok & (d["MATCHUP"] >= BOTH_MATCHUP) & pd.to_numeric(d["OPP_RANK"], errors="coerce").notna()
     return d.sort_values(["BOTH", "SCORE", "EV_%"], ascending=[False, False, False]).reset_index(drop=True)[ROW_COLS + extra]
 
 
@@ -86,7 +109,8 @@ def display(ranked: pd.DataFrame, top: int = 25) -> pd.DataFrame:
     return pd.DataFrame({
         "PICK": d["PLAYER"].astype(str) + " " + d["SIDE"].astype(str) + " " + d["LINE"].map(lambda x: f"{x:g}") + " " + d["STAT"].astype(str),
         "POS": d["POS"], "GAME": d["GAME"], "ODDS": d["ODDS"].map(lambda x: "" if pd.isna(x) else f"{int(x):+d}"),
-        "MODEL_%": d["P_MODEL"].round(1), "MARKET_%": d["P_MARKET"].round(1), "EDGE_PP": d["EDGE_PP"].round(1), "EV_%": d["EV_%"].round(1),
+        "MODEL_%": d["P_MODEL"].round(1), "MARKET_%": d["P_MARKET"].round(1),
+        "BLEND_%": pd.to_numeric(d["BLEND_%"], errors="coerce").round(1) if "BLEND_%" in d else d["P_MODEL"].round(1), "EDGE_PP": d["EDGE_PP"].round(1), "EV_%": d["EV_%"].round(1),
         "OPP_VS_POS": vs, "MODEL": d["MODEL"].round(0), "MATCHUP": d["MATCHUP"].round(0), "SCORE": d["SCORE"].round(1),
         "BOTH": d["BOTH"].map({True: "✓", False: ""}), "SIX": d["SIX"].map(lambda x: "" if x is None or pd.isna(x) else f"{int(x)}/6"), "PIN": d["PIN"]},
         columns=SHOW_COLS).reset_index(drop=True)
@@ -160,7 +184,8 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
            fetch_board: Callable[[Mapping[str, Any], str], pd.DataFrame],
            evaluate: Callable[[Mapping[str, Any], str, str, float, float, float], Optional[Dict[str, Any]]],
            keep_keys: Iterable[str] = (), after_scan: Optional[Callable[[], None]] = None,
-           star: Optional[Callable[[pd.DataFrame], int]] = None, credits_note: Optional[Callable[[], str]] = None) -> None:
+           star: Optional[Callable[[pd.DataFrame], int]] = None, credits_note: Optional[Callable[[], str]] = None,
+           blend_info: Optional[Callable[[], Mapping[str, Any]]] = None) -> None:
     """The Best Picks tab. `keep_keys` are session-state keys the callbacks overwrite; they are restored after a scan.
     `star(rows)` favorites the given ranked rows and returns how many it starred."""
     ss = st.session_state
@@ -181,7 +206,10 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     pick_games = c2.multiselect("Games to scan", games["label"].tolist(), default=default_games(games), key="bp_games_pick")
     c3, c4, c5, c6 = st.columns(4)
     w = float(c3.slider("Model weight % (rest = matchup)", 0, 100, int(DEFAULT_WEIGHT * 100), 5, key="bp_w")) / 100.0
-    min_edge = float(c4.number_input("Minimum model edge (points)", value=1.0, step=0.5, key="bp_min_edge"))
+    use_blend = blend_info is not None and bool(st.checkbox("Respect the market (rank by the market-blended chance)", value=True, key="bp_blend",
+                                                             help="Blends your model with DraftKings' no-vig price using the weight fitted from your graded props (Snapshots tab)."))
+    info = blend_info() if use_blend else None
+    min_edge = float(c4.number_input("Minimum edge (points)", value=0.5, step=0.5, key="bp_min_edge"))
     top = int(c5.number_input("Show top", min_value=5, max_value=200, value=25, step=5, key="bp_top"))
     timer_label = c6.selectbox("Auto-refresh", list(TIMER_CHOICES), key="bp_timer")
     minutes = TIMER_CHOICES.get(timer_label, 0)
@@ -212,7 +240,10 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     if rows is None:
         st.info("Press **Refresh now** to build the list. The first scan loads every player's game log, so it can take a few minutes.")
     else:
-        ranked = rank_picks(rows, w, min_edge)
+        ranked = rank_picks(rows, w, min_edge, None if info is None else float(info["w"]))
+        if info is not None:
+            import prop_review as cal
+            st.caption(f"Edges and EV use the market-blended chance: {cal.weight_note(info)}. BOTH ✓ = still +EV after the blend and a top-third matchup.")
         age = int((time.time() - float(ss.get("bp_time", time.time()))) // 60)
         st.caption(f"Last scan {age} min ago. {ss.get('bp_note', '')} {len(ranked)} of {len(rows)} props clear the minimum edge.")
         for e in (ss.get("bp_errors") or [])[:5]:
