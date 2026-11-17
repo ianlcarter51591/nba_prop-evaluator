@@ -160,7 +160,49 @@ def render_star_button(st: Any, snaps: Optional[pd.DataFrame], player: str, stat
         st.rerun()
 
 
-def render_parlay(st: Any, snaps: Optional[pd.DataFrame], save: Any = None) -> None:
+def clickable_table(st: Any, shown: Any, payload: pd.DataFrame, open_fn: Any, key: str, hint: str = "", **kwargs: Any) -> None:
+    """A st.dataframe whose rows can be clicked: the clicked row of `payload` (same order as `shown`) goes to `open_fn(row) -> message`,
+    then the page reruns so the Evaluate tab picks it up. Each table remembers its own last click, so an old selection never re-opens."""
+    import zlib
+    ss = st.session_state
+    try:
+        ident = key + "_" + str(zlib.crc32(payload.to_csv(index=False).encode()))      # new rows -> fresh selection
+    except Exception:
+        ident = key
+    if hint:
+        st.caption(hint)
+    try:
+        event = st.dataframe(shown, on_select="rerun", selection_mode="single-row", key=ident, **kwargs)
+    except TypeError:                                    # Streamlit older than 1.35: no row clicks, plain table
+        st.dataframe(shown, **kwargs)
+        return
+    sel = getattr(event, "selection", None)
+    if sel is None and isinstance(event, dict):
+        sel = event.get("selection")
+    rows = getattr(sel, "rows", None)
+    if rows is None and isinstance(sel, dict):
+        rows = sel.get("rows")
+    if not rows or int(rows[0]) >= len(payload):
+        return
+    token = (ident, int(rows[0]))
+    if ss.get("clicked_" + key) == token:
+        if ss.get("clicked_msg_" + key):
+            st.success(ss["clicked_msg_" + key])
+        return
+    ss["clicked_" + key] = token
+    try:
+        ss["clicked_msg_" + key] = open_fn(payload.iloc[int(rows[0])].to_dict())
+    except Exception as e:
+        ss["clicked_msg_" + key] = ""
+        st.warning(f"Couldn't load that prop: {str(e)[:120]}")
+        return
+    st.rerun()
+
+
+CLICK_HINT = "👆 Click a row (the box at its left edge) to load that prop into the **⚡ Evaluate** tab."
+
+
+def render_parlay(st: Any, snaps: Optional[pd.DataFrame], save: Any = None, open_prop: Any = None) -> None:
     """Build a ticket from saved predictions or by hand, then price it."""
     ss = st.session_state
     legs = _legs(st)
@@ -175,9 +217,14 @@ def render_parlay(st: Any, snaps: Optional[pd.DataFrame], save: Any = None) -> N
 
     if not pool.empty:
         st.markdown("**Your favorites** (both sides of each starred prop; ✓ = the side the app shows)")
-        st.dataframe(pd.DataFrame({"LEG": pool["LABEL"], "GAME": pool["GAME"], "YOUR_CHANCE_%": (pool["P_MODEL"] * 100).round(1),
-                                   "MARKET_%": (pool["P_MARKET"] * 100).round(1), "EDGE_PP": pool["EDGE_PP"].round(1), "ODDS": pool["ODDS"],
-                                   "APP_PICK": pool["APP_PICK"].map({True: "✓", False: ""})}), use_container_width=True, hide_index=True)
+        fav_table = pd.DataFrame({"LEG": pool["LABEL"], "GAME": pool["GAME"], "YOUR_CHANCE_%": (pool["P_MODEL"] * 100).round(1),
+                                  "MARKET_%": (pool["P_MARKET"] * 100).round(1), "EDGE_PP": pool["EDGE_PP"].round(1), "ODDS": pool["ODDS"],
+                                  "APP_PICK": pool["APP_PICK"].map({True: "✓", False: ""})})
+        if open_prop is not None and snaps is not None and "SNAP_ID" in snaps.columns:
+            rows = snaps.drop_duplicates("SNAP_ID").set_index("SNAP_ID").reindex(pool["SNAP_ID"]).reset_index()
+            clickable_table(st, fav_table, rows, open_prop, "parlay_favs", CLICK_HINT, use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(fav_table, use_container_width=True, hide_index=True)
         picks = st.multiselect("Add legs to the ticket", pool["LABEL"].tolist(), key="parlay_picks")
         c1, c2 = st.columns(2)
         if c1.button("➕ Add selected legs", key="parlay_add") and picks:
