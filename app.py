@@ -37,8 +37,8 @@ def _startup_problems() -> List[str]:
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
                        ("pin_check", ("split", "table", "for_player", "cross", "assess")),
-                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many", "mark_placed", "snap_id_for_leg")),
-                       ("best_picks", ("render", "make_row", "rank_picks", "selected_row")),
+                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many", "mark_placed", "snap_id_for_leg", "tag_best_picks")),
+                       ("best_picks", ("render", "make_row", "rank_picks", "selected_row", "cap_per_game")),
                        ("prop_review", ("fit_blend", "blend", "render_blend_banner", "render_calibration", "record_close", "compute_clv", "clv_summary", "render_clv", "render_daily", "day_counts", "graded_days")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button", "clickable_table", "render_tracked_place_bet"))):
         try:
@@ -2760,6 +2760,12 @@ def run_form_evaluation(player_name: str, stat_label: str, line: float, over: fl
     return evaluate_in_context(player_name, stat_label, line, over, under, ctx)
 
 
+def _bp_tag(rows: pd.DataFrame) -> None:
+    """Save the Best Picks list just scanned (rank, side, ✓) on the props' snapshots, so Daily results can grade it."""
+    import favorites as fv
+    st.session_state["snapshots"] = _fav_save(fv.tag_best_picks(_fav_snaps(), rows))
+
+
 def _bp_star(rows: pd.DataFrame) -> int:
     """Favorite the given Best Picks rows (they were saved as snapshots by the scan); returns how many were starred."""
     import favorites as fv
@@ -2914,7 +2920,7 @@ def render_best_picks() -> None:
         return
     _call_supported(best_picks.render, "best_picks.py", st=st, stats=list(ODDS_API_MARKETS), default_stats=BP_DEFAULT_STATS, list_games=_bp_games, fetch_board=_bp_fetch_board,
                       evaluate=_bp_evaluate, keep_keys=BP_KEEP_KEYS, after_scan=cloud_store.flush, star=_bp_star,
-                      credits_note=lambda: odds_credits.credits_status()[0] or "", blend_info=_blend_info, open_pick=_bp_open)
+                      credits_note=lambda: odds_credits.credits_status()[0] or "", blend_info=_blend_info, open_pick=_bp_open, tag=_bp_tag)
 
 
 def scan_board(summary: pd.DataFrame, stat_label: str, game_teams: List[str], spread: Optional[float],
