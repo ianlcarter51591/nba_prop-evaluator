@@ -37,10 +37,10 @@ def _startup_problems() -> List[str]:
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
                        ("pin_check", ("split", "table", "for_player", "cross", "assess")),
-                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many")),
+                       ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many", "mark_placed", "snap_id_for_leg")),
                        ("best_picks", ("render", "make_row", "rank_picks", "selected_row")),
                        ("prop_review", ("fit_blend", "blend", "render_blend_banner", "render_calibration", "record_close", "compute_clv", "clv_summary", "render_clv", "render_daily", "day_counts", "graded_days")),
-                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button", "clickable_table"))):
+                       ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button", "clickable_table", "render_tracked_place_bet"))):
         try:
             m = importlib.import_module(mod)
         except ModuleNotFoundError as e:
@@ -2099,8 +2099,9 @@ def render_results(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
     render_final_assessment(res)
     try:
         info_ = assessment_summary(res)
-        shared_ui.render_place_bet(st, res["player_name"], stat_category, float(line_val), {"Over": ctx.get("over"), "Under": ctx.get("under")},
-                                   links_for(res["player_name"], stat_category, line_val), info_["best"]["side"] if info_ else "")
+        _call_supported(shared_ui.render_place_bet, "shared_ui.py", st=st, player=res["player_name"], stat=stat_category, line=float(line_val),
+                        odds={"Over": ctx.get("over"), "Under": ctx.get("under")}, links=links_for(res["player_name"], stat_category, line_val),
+                        best_side=info_["best"]["side"] if info_ else "", snaps=_fav_snaps(), save=_fav_save)
     except Exception:
         pass       # the bet buttons are a convenience: never break the result screen
     try:
