@@ -52,6 +52,7 @@ Math
 ----
 For the chosen day and filter, using the side the app showed (SHOWN_RESULT = Hit / Miss / Push):
     WIN_% = hits / (hits + misses)        pushes are refunds and left out of the rate
+"Best Picks top 10" / "Best Picks ✓ BOTH" use the list saved by the last Best Picks scan before each game, graded on the side it ranked.
 "Placed bets" / "Placed parlay legs" use only props you recorded with Place Bet / "I placed this ticket", graded on the side YOU bet
 (PLACED_SIDE vs ACTUAL and LINE) at the price you recorded (parlay legs: win % only).
     BREAK_EVEN_% = 52.38                  the win rate a -110 bet needs (110 / 210)
@@ -382,7 +383,34 @@ def render_clv(st: Any, snaps: Optional[pd.DataFrame], date_col: str = "GAME_DAT
 # ====================================================================================================
 
 BREAK_EVEN = 100.0 * 110.0 / 210.0
-FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only", "Placed bets", "Placed parlay legs"]
+FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only", "Best Picks top 10", "Best Picks ✓ BOTH", "Placed bets", "Placed parlay legs"]
+
+
+def _regrade(p: pd.DataFrame, side: pd.Series, price: Any) -> pd.DataFrame:
+    """`p` re-graded on `side` ('Over'/'Under'/'Yes'/'No') from ACTUAL vs LINE, priced at `price` (NaN = no units)."""
+    p = p.copy()
+    over = side.astype(str).str.lower().isin(["over", "yes"])
+    act, line = pd.to_numeric(p["ACTUAL"], errors="coerce"), pd.to_numeric(p["LINE"], errors="coerce")
+    graded = (p["STATUS"] == "Graded") & act.notna() & line.notna()
+    won = np.where(over, act > line, act < line)
+    p["SHOWN_RESULT"] = np.where(graded, np.where(act == line, "Push", np.where(won, "Hit", "Miss")), "")
+    p["SHOWN_SIDE"] = np.where(over, "Over", "Under")
+    p["OVER_ODDS"], p["UNDER_ODDS"] = price, price
+    return p
+
+
+def as_best_picks(d: pd.DataFrame, both_only: bool, top: int = 10) -> pd.DataFrame:
+    """Props from the latest saved Best Picks list (BP_RANK <= top, or ✓ BOTH), graded on the side Best Picks ranked (BP_SIDE)
+    at that side's saved DraftKings price."""
+    if "BP_RANK" not in d.columns:
+        return d.iloc[0:0]
+    rank = pd.to_numeric(d["BP_RANK"], errors="coerce")
+    p = d[(d["BP_BOTH"].fillna("").astype(str) == "Y") & rank.notna()] if both_only else d[rank.notna() & (rank <= top)]
+    if p.empty:
+        return p
+    over = p["BP_SIDE"].astype(str).str.lower().isin(["over", "yes"])
+    price = np.where(over, pd.to_numeric(p["OVER_ODDS"], errors="coerce"), pd.to_numeric(p["UNDER_ODDS"], errors="coerce"))
+    return _regrade(p, p["BP_SIDE"], price)
 
 
 def as_placed(d: pd.DataFrame, kind: str) -> pd.DataFrame:
@@ -390,21 +418,17 @@ def as_placed(d: pd.DataFrame, kind: str) -> pd.DataFrame:
     Solo bets are priced at PLACED_ODDS; parlay legs get no price (one leg's 'profit' isn't the ticket's), so they show win % only."""
     if "PLACED_KIND" not in d.columns:
         return d.iloc[0:0]
-    p = d[d["PLACED_KIND"].fillna("").astype(str) == kind].copy()
+    p = d[d["PLACED_KIND"].fillna("").astype(str) == kind]
     if p.empty:
         return p
-    over = p["PLACED_SIDE"].astype(str).str.lower().isin(["over", "yes"])
-    act, line = pd.to_numeric(p["ACTUAL"], errors="coerce"), pd.to_numeric(p["LINE"], errors="coerce")
-    graded = (p["STATUS"] == "Graded") & act.notna() & line.notna()
-    won = np.where(over, act > line, act < line)
-    p["SHOWN_RESULT"] = np.where(graded, np.where(act == line, "Push", np.where(won, "Hit", "Miss")), "")
-    p["SHOWN_SIDE"] = np.where(over, "Over", "Under")
-    price = pd.to_numeric(p["PLACED_ODDS"], errors="coerce") if kind == "Solo" else np.nan
-    p["OVER_ODDS"], p["UNDER_ODDS"] = price, price
-    return p
+    return _regrade(p, p["PLACED_SIDE"], pd.to_numeric(p["PLACED_ODDS"], errors="coerce") if kind == "Solo" else np.nan)
 
 
 def _filter_picks(d: pd.DataFrame, how: str) -> pd.DataFrame:
+    if how == "Best Picks top 10":
+        return as_best_picks(d, False)
+    if how == "Best Picks ✓ BOTH":
+        return as_best_picks(d, True)
     if how == "Placed bets":
         return as_placed(d, "Solo")
     if how == "Placed parlay legs":
@@ -556,7 +580,11 @@ def render_daily(st: Any, snaps: Optional[pd.DataFrame], date_col: str, today: s
         if c["units"] is not None:
             right.metric("Profit (1 unit per pick)", f"{c['units']:+.2f} u", delta=f"ROI {c['roi_pct']:+.1f}%")
         right.write(f"**{c['hits']}** hit · **{c['misses']}** missed · {c['pushes']} push" + (f" · {c['pending']} not graded yet" if c["pending"] else ""))
-        right.caption({"Placed bets": "Your recorded solo bets, graded on the side you bet, 1 unit each at the price you recorded. Pushes are refunds.",
+        right.caption({"Best Picks top 10": "The top 10 of the last Best Picks scan before the games, graded on the side it ranked, 1 unit each at "
+                                            "the saved DraftKings price.",
+                       "Best Picks ✓ BOTH": "Every ✓ BOTH pick of the last Best Picks scan before the games (still +EV and a top-third matchup), "
+                                            "graded on the side it ranked, 1 unit each at the saved price.",
+                       "Placed bets": "Your recorded solo bets, graded on the side you bet, 1 unit each at the price you recorded. Pushes are refunds.",
                        "Placed parlay legs": "Each leg of the tickets you recorded, graded on the side you took. Win % only: a leg's result isn't "
                                              "your ticket's profit."}.get(how, "Side the app showed for each prop, 1 unit on each at the DraftKings price saved "
                                                                                 "with it. Pushes are refunds.")
