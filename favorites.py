@@ -110,3 +110,50 @@ def star_many(snaps: Optional[pd.DataFrame], rows: pd.DataFrame) -> Any:
     if ids:
         d.loc[d["SNAP_ID"].isin(ids), "FAV"] = "Y"
     return d, len(ids)
+
+
+def mark_placed(snaps: Optional[pd.DataFrame], snap_id: str, side: str, odds: Any, kind: str = "Solo", ts: str = "") -> pd.DataFrame:
+    """Record that a bet was placed on `side` of this snapshot at `odds` ('Solo' or 'Parlay leg')."""
+    d = _with_fav(snaps)
+    for c in ("PLACED_KIND", "PLACED_SIDE", "PLACED_TS"):
+        if c not in d.columns:
+            d[c] = ""
+    if "PLACED_ODDS" not in d.columns:
+        d["PLACED_ODDS"] = np.nan
+    on = d["SNAP_ID"] == snap_id
+    price = pd.to_numeric(pd.Series([odds]), errors="coerce").iloc[0]
+    d.loc[on, ["PLACED_KIND", "PLACED_SIDE", "PLACED_TS"]] = [kind, side, ts]
+    d.loc[on, "PLACED_ODDS"] = price
+    return d
+
+
+def unmark_placed(snaps: Optional[pd.DataFrame], snap_id: str) -> pd.DataFrame:
+    """Remove the placed-bet record from one snapshot."""
+    d = mark_placed(snaps, snap_id, "", np.nan, "", "")
+    return d
+
+
+def placed(snaps: Optional[pd.DataFrame], snap_id: Optional[str]) -> Dict[str, Any]:
+    """{'kind','side','odds'} of a placed bet on this snapshot ({} when none)."""
+    d = _with_fav(snaps)
+    if not snap_id or d.empty or "PLACED_KIND" not in d.columns:
+        return {}
+    r = d[(d["SNAP_ID"] == snap_id) & (d["PLACED_KIND"].fillna("").astype(str) != "")]
+    if r.empty:
+        return {}
+    r = r.iloc[-1]
+    return {"kind": str(r["PLACED_KIND"]), "side": str(r["PLACED_SIDE"]), "odds": pd.to_numeric(r.get("PLACED_ODDS"), errors="coerce")}
+
+
+def snap_id_for_leg(snaps: Optional[pd.DataFrame], label: str) -> Optional[str]:
+    """SNAP_ID of the pending prop behind a parlay leg label like 'Ann Guard Over 22.5 Points' (None for typed-in legs)."""
+    d = _with_fav(snaps)
+    if d.empty or not {"PLAYER", "STAT", "LINE", "SNAP_ID", "STATUS"} <= set(d.columns):
+        return None
+    p = d[d["STATUS"] == "Pending"]
+    for side in ("Over", "Under"):
+        lab = p["PLAYER"].astype(str) + f" {side} " + pd.to_numeric(p["LINE"], errors="coerce").map(lambda x: f"{x:g}") + " " + p["STAT"].astype(str)
+        hit = p[lab == label]
+        if not hit.empty:
+            return str(hit.iloc[-1]["SNAP_ID"])
+    return None
