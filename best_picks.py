@@ -3,18 +3,18 @@ Best Picks: one ranked list of the slate's props, by the model AND by the oppone
 
 Math
 ----
-For each prop the app evaluates, the side kept is the one with the higher model EV. Then, on a 0-100 scale:
-    MODEL    = 100 * clip(EDGE_PP / EDGE_CAP, 0, 1)        EDGE_PP = model % - DraftKings no-vig % (points), EDGE_CAP = 10
+For each prop the app evaluates, the side kept is the one with the higher model EV. With the market blend on (default, see
+prop_review.py) the model chance is first blended with DraftKings' no-vig chance in log-odds:
+    BLEND_% = blend(P_MODEL, P_MARKET, w_blend),  EDGE_PP = BLEND_% - P_MARKET,  EV_% = 100 * (BLEND_% / 100 * decimal(ODDS) - 1)
+(without the blend BLEND_% = P_MODEL and EV_% is the model's own EV). Then, on a 0-100 scale:
+    MODEL    = 100 * clip(EV_% / EV_CAP, 0, 1)              EV_CAP = 8: 0% EV -> 0, 8%+ EV -> 100 (so a 6% EV pick outranks a 1% one)
     MATCHUP  = 100 * (N - R) / (N - 1)   for an Over       R = opponent's rank vs the player's position for this stat (1 = softest,
              = 100 * (R - 1) / (N - 1)   for an Under          allows the most), N = teams ranked.  No rank -> 50 (neutral).
-    SCORE    = w * MODEL + (1 - w) * MATCHUP               w = the "model weight" slider (default 0.60)
-    BOTH     = EDGE_PP >= BOTH_EDGE and MATCHUP >= BOTH_MATCHUP   (model edge AND a top-third matchup for that side)
-Rows are sorted BOTH first, then SCORE. Props whose best side has EDGE_PP below the minimum edge are dropped.
-
-Market blend (on by default, see prop_review.py): the model chance is first blended with the market in log-odds with weight w,
-    BLEND_% = blend(P_MODEL, P_MARKET, w),  EDGE_PP = BLEND_% - P_MARKET,  EV_% = BLEND_% * decimal(ODDS) - 100,
-MODEL = 100 * clip(EDGE_PP / (EDGE_CAP * max(w, 0.2)), 0, 1)   (blending shrinks edges by about w, so the cap shrinks with it), and
-BOTH needs a blended EV above 0 (still +EV once the market is respected) plus the top-third matchup.
+    SCORE    = w * MODEL + (1 - w) * MATCHUP               w = the "model weight" slider, default 0.85: EV ranks, the matchup breaks ties
+    BOTH ✓   = EV_% > 0 and EDGE_PP > 0 (EDGE_PP >= 2 without the blend) and MATCHUP >= 66.7 (a top-third matchup for that side)
+Rows are sorted by SCORE, then EV_%. Props whose EDGE_PP is below the minimum edge are dropped, and at most `per_game` picks
+are kept from any one game (props from the same game tend to win or lose together). The matchup weight stays low until your
+graded snapshots show BOTH ✓ picks actually win more (Snapshots -> Daily results -> "Best Picks ✓ BOTH").
 
 The UI part (render) is the same in both apps; each app passes callbacks that fetch a board and evaluate one prop.
 Auto-refresh only runs while the app is open in a browser, and every refresh of a (game, stat) board costs Odds API credits.
@@ -27,13 +27,15 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import numpy as np
 import pandas as pd
 
-EDGE_CAP = 10.0
+EV_CAP = 8.0
 BOTH_EDGE = 2.0
 BOTH_MATCHUP = 200.0 / 3.0
-DEFAULT_WEIGHT = 0.60
+DEFAULT_WEIGHT = 0.85
+DEFAULT_PER_GAME = 2
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
 ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID"]
-SHOW_COLS = ["PICK", "POS", "GAME", "ODDS", "MODEL_%", "MARKET_%", "BLEND_%", "EDGE_PP", "EV_%", "OPP_VS_POS", "MODEL", "MATCHUP", "SCORE", "BOTH", "SIX", "PIN"]
+SHOW_COLS = ["PICK", "GAME", "ODDS", "BLEND_%", "EV_%", "OPP_VS_POS", "SIX", "PIN", "BOTH"]
+DETAIL_COLS = ["POS", "MODEL_%", "MARKET_%", "EDGE_PP", "MODEL", "MATCHUP", "SCORE"]
 
 
 def make_row(res: Mapping[str, Any], stat: str, line: float, game: str, pos: Optional[str], opp: Optional[str],
@@ -89,21 +91,28 @@ def rank_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGH
     if d.empty:
         return pd.DataFrame(columns=ROW_COLS + extra)
     w = float(np.clip(w_model, 0.0, 1.0))
-    cap = EDGE_CAP if w_blend is None else EDGE_CAP * max(float(w_blend), 0.2)
-    e = pd.to_numeric(d["EDGE_PP"], errors="coerce")
-    d["MODEL"] = 100.0 * np.clip(e / cap, 0.0, 1.0)
+    e, ev = pd.to_numeric(d["EDGE_PP"], errors="coerce"), pd.to_numeric(d["EV_%"], errors="coerce")
+    d["MODEL"] = 100.0 * np.clip(ev.fillna(0.0) / EV_CAP, 0.0, 1.0)
     d["MATCHUP"] = matchup_score(d["SIDE"], d["OPP_RANK"], d["N_TEAMS"])
     d["SCORE"] = w * d["MODEL"] + (1.0 - w) * d["MATCHUP"]
-    model_ok = (e >= BOTH_EDGE) if w_blend is None else ((pd.to_numeric(d["EV_%"], errors="coerce") > 0) & (e > 0))
+    model_ok = (ev > 0) & ((e >= BOTH_EDGE) if w_blend is None else (e > 0))
     d["BOTH"] = model_ok & (d["MATCHUP"] >= BOTH_MATCHUP) & pd.to_numeric(d["OPP_RANK"], errors="coerce").notna()
-    return d.sort_values(["BOTH", "SCORE", "EV_%"], ascending=[False, False, False]).reset_index(drop=True)[ROW_COLS + extra]
+    return d.sort_values(["SCORE", "EV_%"], ascending=[False, False]).reset_index(drop=True)[ROW_COLS + extra]
 
 
-def display(ranked: pd.DataFrame, top: int = 25) -> pd.DataFrame:
-    """The table shown on screen (SHOW_COLS), top `top` rows."""
+def cap_per_game(ranked: pd.DataFrame, per_game: int) -> pd.DataFrame:
+    """Keep at most `per_game` picks from each game, in ranked order (0 = no limit)."""
+    if ranked.empty or int(per_game) <= 0:
+        return ranked
+    return ranked[ranked.groupby("GAME", sort=False).cumcount() < int(per_game)].reset_index(drop=True)
+
+
+def display(ranked: pd.DataFrame, top: int = 25, details: bool = False) -> pd.DataFrame:
+    """The table shown on screen, top `top` rows: SHOW_COLS (what you decide with), plus DETAIL_COLS (the scoring parts) when `details`."""
+    cols = SHOW_COLS + (DETAIL_COLS if details else [])
     d = ranked.head(int(top))
     if d.empty:
-        return pd.DataFrame(columns=SHOW_COLS)
+        return pd.DataFrame(columns=cols)
     rk, n = pd.to_numeric(d["OPP_RANK"], errors="coerce"), pd.to_numeric(d["N_TEAMS"], errors="coerce")
     vs = np.where(rk.notna(), d["OPP"].astype(str) + " #" + rk.fillna(0).astype(int).astype(str) + " of " + n.fillna(0).astype(int).astype(str), "no rank")
     return pd.DataFrame({
@@ -113,7 +122,7 @@ def display(ranked: pd.DataFrame, top: int = 25) -> pd.DataFrame:
         "BLEND_%": pd.to_numeric(d["BLEND_%"], errors="coerce").round(1) if "BLEND_%" in d else d["P_MODEL"].round(1), "EDGE_PP": d["EDGE_PP"].round(1), "EV_%": d["EV_%"].round(1),
         "OPP_VS_POS": vs, "MODEL": d["MODEL"].round(0), "MATCHUP": d["MATCHUP"].round(0), "SCORE": d["SCORE"].round(1),
         "BOTH": d["BOTH"].map({True: "✓", False: ""}), "SIX": d["SIX"].map(lambda x: "" if x is None or pd.isna(x) else f"{int(x)}/6"), "PIN": d["PIN"]},
-        columns=SHOW_COLS).reset_index(drop=True)
+        columns=cols).reset_index(drop=True)
 
 
 def due(last_ts: Optional[float], minutes: float, now: Optional[float] = None) -> bool:
@@ -198,9 +207,9 @@ def _clickable_table(st: Any, shown: pd.DataFrame, ranked: pd.DataFrame, open_pi
     key = "bp_table_" + str(zlib.crc32("|".join(shown["PICK"]).encode()))      # new list -> fresh selection, so an old click never opens a different prop
     st.caption("👆 Click a row (the box at its left edge) to load that prop into the **⚡ Evaluate** tab, then open that tab.")
     try:
-        event = st.dataframe(shown, use_container_width=True, hide_index=True, on_select="rerun", selection_mode="single-row", key=key)
+        event = st.dataframe(shown.set_index("PICK"), use_container_width=True, on_select="rerun", selection_mode="single-row", key=key)
     except TypeError:                                                          # Streamlit too old for row selection: fall back to a picker
-        st.dataframe(shown, use_container_width=True, hide_index=True)
+        st.dataframe(shown.set_index("PICK"), use_container_width=True)
         pick = st.selectbox("Open a pick in the Evaluate tab", [""] + shown["PICK"].tolist(), key="bp_open_pick")
         event = {"selection": {"rows": [shown["PICK"].tolist().index(pick)] if pick else []}}
     i = selected_row(event)
@@ -228,13 +237,15 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
            keep_keys: Iterable[str] = (), after_scan: Optional[Callable[[], None]] = None,
            star: Optional[Callable[[pd.DataFrame], int]] = None, credits_note: Optional[Callable[[], str]] = None,
            blend_info: Optional[Callable[[], Mapping[str, Any]]] = None,
-           open_pick: Optional[Callable[[Mapping[str, Any]], str]] = None) -> None:
+           open_pick: Optional[Callable[[Mapping[str, Any]], str]] = None,
+           tag: Optional[Callable[[pd.DataFrame], None]] = None) -> None:
     """The Best Picks tab. `keep_keys` are session-state keys the callbacks overwrite; they are restored after a scan.
     `star(rows)` favorites the given ranked rows and returns how many it starred.
-    `open_pick(row)` loads a clicked row into the Evaluate form and returns a message for the user."""
+    `open_pick(row)` loads a clicked row into the Evaluate form and returns a message for the user.
+    `tag(rows)` saves the list right after each scan (rank, side, ✓) on the props' snapshots, so Daily results can grade it."""
     ss = st.session_state
-    st.markdown("One ranked list across the slate: **MODEL** (your model's edge over DraftKings' no-vig price) and **MATCHUP** "
-                "(the opponent's rank against the player's position for that stat). ✓ in BOTH = a model edge *and* a top-third matchup.")
+    st.markdown("One ranked list across the slate, ranked mainly by **EV** at DraftKings' price (your model blended with the market), with the "
+                "opponent's rank against the player's position as the tiebreaker. ✓ in BOTH = still +EV *and* a top-third matchup.")
     if st.button("Load / reload the game list", key="bp_load") or "bp_games" not in ss:
         try:
             ss["bp_games"] = list_games()
@@ -249,13 +260,17 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     pick_stats = c1.multiselect("Stats to scan", list(stats), default=[s for s in default_stats if s in stats], key="bp_stats")
     pick_games = c2.multiselect("Games to scan", games["label"].tolist(), default=default_games(games), key="bp_games_pick")
     c3, c4, c5, c6 = st.columns(4)
-    w = float(c3.slider("Model weight % (rest = matchup)", 0, 100, int(DEFAULT_WEIGHT * 100), 5, key="bp_w")) / 100.0
+    w = float(c3.slider("EV weight % (rest = matchup)", 0, 100, int(DEFAULT_WEIGHT * 100), 5, key="bp_w")) / 100.0
     use_blend = blend_info is not None and bool(st.checkbox("Respect the market (rank by the market-blended chance)", value=True, key="bp_blend",
                                                              help="Blends your model with DraftKings' no-vig price using the weight fitted from your graded props (Snapshots tab)."))
     info = blend_info() if use_blend else None
     min_edge = float(c4.number_input("Minimum edge (points)", value=0.5, step=0.5, key="bp_min_edge"))
     top = int(c5.number_input("Show top", min_value=5, max_value=200, value=25, step=5, key="bp_top"))
     timer_label = c6.selectbox("Auto-refresh", list(TIMER_CHOICES), key="bp_timer")
+    c7, c8 = st.columns(2)
+    per_game = int(c7.number_input("Max picks per game (0 = no limit)", min_value=0, max_value=20, value=DEFAULT_PER_GAME, step=1, key="bp_per_game",
+                                   help="Props from the same game tend to win or lose together, so a list full of one game is riskier than it looks."))
+    details = bool(c8.checkbox("Show scoring details (model %, market %, MODEL / MATCHUP / SCORE)", value=False, key="bp_details"))
     minutes = TIMER_CHOICES.get(timer_label, 0)
     sel = games[games["label"].isin(pick_games or [])]
     cost = credit_estimate(len(sel), len(pick_stats or []))
@@ -263,7 +278,9 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
                "Auto-refresh runs only while this app is open in your browser." + (f" {credits_note()}" if credits_note else ""))
     manual = st.button("🔄 Refresh now", key="bp_refresh")
     timed = due(ss.get("bp_time"), minutes) and bool(len(sel)) and bool(pick_stats)
+    just_scanned = False
     if (manual or timed) and len(sel) and pick_stats:
+        just_scanned = True
         saved = {k: ss[k] for k in keep_keys if k in ss}
         missing = [k for k in keep_keys if k not in ss]
         bar = st.progress(0.0, text="Starting scan...")
@@ -284,7 +301,7 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     if rows is None:
         st.info("Press **Refresh now** to build the list. The first scan loads every player's game log, so it can take a few minutes.")
     else:
-        ranked = rank_picks(rows, w, min_edge, None if info is None else float(info["w"]))
+        ranked = cap_per_game(rank_picks(rows, w, min_edge, None if info is None else float(info["w"])), per_game)
         if info is not None:
             import prop_review as cal
             st.caption(f"Edges and EV use the market-blended chance: {cal.weight_note(info)}. BOTH ✓ = still +EV after the blend and a top-third matchup.")
@@ -295,13 +312,19 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
         if ranked.empty:
             st.info("No prop clears the minimum edge right now. Lower it to see more.")
         else:
-            shown = display(ranked, top)
+            shown = display(ranked, top, details)
+            if just_scanned and tag is not None:
+                try:
+                    tag(ranked.head(top))
+                except Exception as e:
+                    st.caption(f"Couldn't save this list for grading ({str(e)[:80]}).")
             if open_pick is None:
-                st.dataframe(shown, use_container_width=True, hide_index=True)
+                st.dataframe(shown.set_index("PICK"), use_container_width=True)
             else:
                 _clickable_table(st, shown, ranked.head(top), open_pick)
-            st.caption("OPP_VS_POS: opponent and its rank vs this position for this stat (#1 = allows the most). MATCHUP is high when that rank helps the side shown "
-                       "(soft defense for an Over, tough defense for an Under). PIN = Pinnacle cross-check for that side.")
+            st.caption("BLEND_% = your model's chance blended with the market; EV_% = what a bet at DraftKings' price is worth at that chance. "
+                       "OPP_VS_POS: opponent and its rank vs this position for this stat (#1 = allows the most). PIN = Pinnacle cross-check for that side."
+                       + (f" At most {per_game} pick(s) per game." if per_game else ""))
             if star is not None:
                 picks = st.multiselect("⭐ Favorite picks for the Parlay tab", shown["PICK"].tolist(), key="bp_star_pick")
                 s1, s2 = st.columns(2)
@@ -313,8 +336,9 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
                 if chosen is not None:
                     n = star(chosen) if len(chosen) else 0
                     (st.success if n else st.warning)(f"{n} pick(s) starred: they are now in the Parlay tab." if n else "Nothing to star.")
-    st.caption("Limits: MODEL is your own model's edge, so the list is only as good as the model. The position rank is context the model does not "
-               "use directly, and it has not been shown to predict results on its own (see the backtest tab). Check the price on DraftKings before betting.")
+    st.caption("Limits: the list is only as good as your model, even blended. The position rank is context the model does not use directly and "
+               "hasn't been shown to predict results on its own, which is why it only breaks ties by default. Each scan's list is saved, so "
+               "Snapshots -> Daily results can show how the top 10 and the ✓ BOTH picks actually did. Check the price on DraftKings before betting.")
     if minutes and hasattr(st, "fragment"):
         @st.fragment(run_every=60)
         def _tick() -> None:
