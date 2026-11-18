@@ -84,8 +84,56 @@ def _link_button(st: Any, label: str, url: str, primary: bool) -> None:
         st.markdown(f"[{label}]({url})")
 
 
-def render_place_bet(st: Any, player: str, stat: str, line: float, odds: Dict[str, Optional[float]], links: Any, best_side: str = "") -> None:
-    """Solo-bet buttons under an evaluation: one per side that has a saved DraftKings link. The app only opens DraftKings; you confirm the bet there."""
+def _now_text() -> str:
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def render_tracked_place_bet(st: Any, snaps: Optional[pd.DataFrame], save: Any, player: str, stat: str, line: float,
+                             odds: Dict[str, Optional[float]], links: Any, best_side: str = "") -> bool:
+    """Two-tap Place Bet that records the bet: tap 1 saves 'placed' (side, price, time) on the prop's snapshot, then the DraftKings
+    link appears for tap 2. Streamlit can't see clicks on links, so recording happens on the app's own button.
+    Returns False when the prop isn't saved (the caller then shows plain links)."""
+    import favorites as fv
+    sid = fv.find_id(snaps, player, stat, line)
+    if not sid or save is None:
+        return False
+    over_link, under_link = (links or ("", ""))[:2]
+    done = fv.placed(snaps, sid)
+    st.markdown("### 🎯 Place Bet")
+    cols = st.columns(2)
+    for col, side, url in ((cols[0], "Over", over_link), (cols[1], "Under", under_link)):
+        price = odds.get(side)
+        ptxt = f" ({price:+.0f})" if price is not None and not pd.isna(price) else ""
+        with col:
+            if done.get("side") == side and done.get("kind") == "Solo":
+                st.success(f"✅ Placed: {side} {line:g}{ptxt}")
+                if url:
+                    _link_button(st, "Open on DraftKings ↗", url, primary=True)
+                if st.button("Undo placed", key=f"unplace_{sid}_{side}"):
+                    _apply_snapshots(st, save, fv.unmark_placed(snaps, sid))
+                    st.rerun()
+            elif st.button(f"🎯 Place Bet: {side} {line:g} {stat}{ptxt}", key=f"place_{sid}_{side}", type="primary" if side == best_side else "secondary",
+                           use_container_width=True):
+                _apply_snapshots(st, save, fv.mark_placed(snaps, sid, side, price, "Solo", _now_text()))
+                st.rerun()
+            elif not url:
+                st.caption(f"{side}: no DraftKings link saved; the button still records the bet if you place it yourself.")
+    st.caption(f"{player}: tap Place Bet to record it in your Snapshots (Placed bets), then tap Open on DraftKings to add it to your slip. "
+               "Confirm the line and price on DraftKings; the app never places the bet. Undo removes the record.")
+    return True
+
+
+def render_place_bet(st: Any, player: str, stat: str, line: float, odds: Dict[str, Optional[float]], links: Any, best_side: str = "",
+                     snaps: Optional[pd.DataFrame] = None, save: Any = None) -> None:
+    """Solo-bet buttons under an evaluation. With the saved snapshots (and a save function) they also record placed bets;
+    otherwise one link per side that has a saved DraftKings link. The app only opens DraftKings; you confirm the bet there."""
+    if snaps is not None and render_tracked_place_bet(st, snaps, save, player, stat, line, odds, links, best_side):
+        return
     over_link, under_link = (links or ("", ""))[:2]
     st.markdown("### 🎯 Place Bet")
     if not (over_link or under_link):
@@ -102,6 +150,23 @@ def render_place_bet(st: Any, player: str, stat: str, line: float, odds: Dict[st
                 st.caption(f"{side}: no DraftKings link (that price is an estimate, not a listed bet).")
     st.caption(f"{player}: opens DraftKings with the pick added to your bet slip when DraftKings provides that link, otherwise the game page. "
                "Check the line and price on the slip before you confirm; the app never places the bet.")
+
+
+def render_mark_ticket(st: Any, legs: List[Dict[str, Any]], snaps: Optional[pd.DataFrame], save: Any) -> None:
+    """'I placed this ticket' button: records every leg that comes from a saved prop as a placed parlay leg (side and leg price)."""
+    import favorites as fv
+    if snaps is None or save is None or not legs:
+        return
+    ids = [(fv.snap_id_for_leg(snaps, l["label"]), l) for l in legs]
+    found = [(sid, l) for sid, l in ids if sid]
+    if st.button(f"✅ I placed this ticket (record its {len(found)} saved leg(s))", key="parlay_mark_placed", disabled=not found):
+        d, now = snaps, _now_text()
+        for sid, l in found:
+            side = "Under" if " Under " in f" {l['label']} " else "Over"
+            d = fv.mark_placed(d, sid, side, l.get("odds"), "Parlay leg", now)
+        _apply_snapshots(st, save, d)
+        st.success(f"Recorded {len(found)} leg(s) under Placed parlay legs in the Snapshots tab."
+                   + (f" {len(legs) - len(found)} typed-in leg(s) have no saved prop and weren't recorded." if len(found) < len(legs) else ""))
 
 
 def render_slip(st: Any, legs: List[Dict[str, Any]]) -> None:
@@ -266,6 +331,7 @@ def render_parlay(st: Any, snaps: Optional[pd.DataFrame], save: Any = None, open
         ss["parlay_legs"] = []
         st.rerun()
     render_slip(st, legs)
+    render_mark_ticket(st, legs, snaps, save)
     p1, p2, p3 = st.columns(3)
     offered = _num(p1.number_input("Parlay odds offered, before any boost (0 = multiply the leg odds)", value=0, step=5, key="parlay_offered"), 0.0)
     boost = _num(p2.number_input("Boost %", min_value=0.0, max_value=200.0, value=0.0, step=5.0, key="parlay_boost"), 0.0)
