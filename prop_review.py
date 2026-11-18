@@ -52,7 +52,15 @@ Math
 ----
 For the chosen day and filter, using the side the app showed (SHOWN_RESULT = Hit / Miss / Push):
     WIN_% = hits / (hits + misses)        pushes are refunds and left out of the rate
+"Placed bets" / "Placed parlay legs" use only props you recorded with Place Bet / "I placed this ticket", graded on the side YOU bet
+(PLACED_SIDE vs ACTUAL and LINE) at the price you recorded (parlay legs: win % only).
     BREAK_EVEN_% = 52.38                  the win rate a -110 bet needs (110 / 210)
+Profit, staking 1 unit on each pick at the DraftKings price the app showed for that side (OVER_ODDS or UNDER_ODDS):
+    hit  -> + (decimal odds - 1)          e.g. -110 wins 0.909 u, +120 wins 1.20 u
+    miss -> - 1 u                         push -> 0 (refund)
+    ROI_%          = 100 * units / picks staked (hits + misses + pushes)
+    PRICE_BE_%     = 100 * mean(1 / decimal odds) over the decided picks: the win rate those exact prices needed
+Picks with no saved price are counted in the win % but left out of units and ROI.
 Default day = the latest game day before today that has graded props (yesterday's slate for the NBA, the last game day for the NFL).
 Grading runs once per session when the tab opens and props from earlier days are still pending.
 """
@@ -374,10 +382,33 @@ def render_clv(st: Any, snaps: Optional[pd.DataFrame], date_col: str = "GAME_DAT
 # ====================================================================================================
 
 BREAK_EVEN = 100.0 * 110.0 / 210.0
-FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only"]
+FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only", "Placed bets", "Placed parlay legs"]
+
+
+def as_placed(d: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """Rows with a placed bet of `kind` ('Solo' / 'Parlay leg'), re-graded on the side YOU bet (PLACED_SIDE) from ACTUAL vs LINE.
+    Solo bets are priced at PLACED_ODDS; parlay legs get no price (one leg's 'profit' isn't the ticket's), so they show win % only."""
+    if "PLACED_KIND" not in d.columns:
+        return d.iloc[0:0]
+    p = d[d["PLACED_KIND"].fillna("").astype(str) == kind].copy()
+    if p.empty:
+        return p
+    over = p["PLACED_SIDE"].astype(str).str.lower().isin(["over", "yes"])
+    act, line = pd.to_numeric(p["ACTUAL"], errors="coerce"), pd.to_numeric(p["LINE"], errors="coerce")
+    graded = (p["STATUS"] == "Graded") & act.notna() & line.notna()
+    won = np.where(over, act > line, act < line)
+    p["SHOWN_RESULT"] = np.where(graded, np.where(act == line, "Push", np.where(won, "Hit", "Miss")), "")
+    p["SHOWN_SIDE"] = np.where(over, "Over", "Under")
+    price = pd.to_numeric(p["PLACED_ODDS"], errors="coerce") if kind == "Solo" else np.nan
+    p["OVER_ODDS"], p["UNDER_ODDS"] = price, price
+    return p
 
 
 def _filter_picks(d: pd.DataFrame, how: str) -> pd.DataFrame:
+    if how == "Placed bets":
+        return as_placed(d, "Solo")
+    if how == "Placed parlay legs":
+        return as_placed(d, "Parlay leg")
     tier = d.get("TIER_SHOWN", pd.Series("", index=d.index)).astype(str).str.upper()
     if how == "Favorites":
         return d[d.get("FAV", pd.Series("", index=d.index)).astype(str) == "Y"]
@@ -397,9 +428,33 @@ def graded_days(snaps: Optional[pd.DataFrame], date_col: str, today: str) -> Lis
     return sorted({x for x in days if x and x != "nan" and x < today}, reverse=True)
 
 
+def pick_units(d: pd.DataFrame) -> pd.DataFrame:
+    """Per graded pick: PRICE (American, side shown), DEC (decimal), UNITS (1-unit stake; NaN when the price is missing)."""
+    side = d.get("SHOWN_SIDE", pd.Series("", index=d.index)).astype(str).str.lower()
+    over = pd.to_numeric(d.get("OVER_ODDS", pd.Series(np.nan, index=d.index)), errors="coerce")
+    under = pd.to_numeric(d.get("UNDER_ODDS", pd.Series(np.nan, index=d.index)), errors="coerce")
+    price = pd.Series(np.where(side.isin(["over", "yes"]), over, np.where(side.isin(["under", "no"]), under, np.nan)), index=d.index)
+    price = price.where(price.abs() >= 100)
+    dec = pd.Series(np.where(price > 0, 1.0 + price / 100.0, 1.0 + 100.0 / -price), index=d.index).where(price.notna())
+    res = d["SHOWN_RESULT"].astype(str)
+    units = pd.Series(np.select([res == "Hit", res == "Miss", res == "Push"], [dec - 1.0, -1.0, 0.0], np.nan), index=d.index).where(dec.notna())
+    return pd.DataFrame({"PRICE": price, "DEC": dec, "UNITS": units}, index=d.index)
+
+
+def _money(d: pd.DataFrame) -> dict:
+    """units, roi_pct, price_be_pct and how many decided picks had no price, for graded picks `d`."""
+    u = pick_units(d)
+    staked = u["UNITS"].notna()
+    decided = d["SHOWN_RESULT"].isin(["Hit", "Miss"])
+    be = 100.0 * (1.0 / u.loc[decided & staked, "DEC"]).mean() if (decided & staked).any() else None
+    total = float(u["UNITS"].sum()) if staked.any() else None
+    return {"units": total, "roi_pct": 100.0 * total / int(staked.sum()) if staked.any() else None, "price_be_pct": be,
+            "no_price": int((decided & ~staked).sum()), "staked": int(staked.sum())}
+
+
 def day_counts(snaps: Optional[pd.DataFrame], day: str, date_col: str, how: str = "All props") -> dict:
-    """{'hits','misses','pushes','pending','win_pct'} for one day and filter (win_pct None with no decided picks)."""
-    out = {"hits": 0, "misses": 0, "pushes": 0, "pending": 0, "win_pct": None}
+    """{'hits','misses','pushes','pending','win_pct','units','roi_pct','price_be_pct','no_price','staked'} for one day and filter."""
+    out = {"hits": 0, "misses": 0, "pushes": 0, "pending": 0, "win_pct": None, "units": None, "roi_pct": None, "price_be_pct": None, "no_price": 0, "staked": 0}
     if snaps is None or snaps.empty:
         return out
     d = _filter_picks(snaps[snaps[date_col].astype(str) == str(day)], how)
@@ -408,30 +463,44 @@ def day_counts(snaps: Optional[pd.DataFrame], day: str, date_col: str, how: str 
                pending=int((d["STATUS"] == "Pending").sum()))
     dec = out["hits"] + out["misses"]
     out["win_pct"] = 100.0 * out["hits"] / dec if dec else None
+    out.update(_money(d[res.isin(["Hit", "Miss", "Push"])]))
     return out
 
 
 def by_stat(snaps: pd.DataFrame, day: str, date_col: str, how: str = "All props") -> pd.DataFrame:
     """Win % per stat for one day."""
-    d = _filter_picks(snaps[(snaps[date_col].astype(str) == str(day)) & snaps["SHOWN_RESULT"].isin(["Hit", "Miss"])], how)
+    cols = ["STAT", "PICKS", "HITS", "WIN_%", "UNITS", "ROI_%"]
+    d = _filter_picks(snaps[snaps[date_col].astype(str) == str(day)], how)
+    d = d[d["SHOWN_RESULT"].isin(["Hit", "Miss"])]
     if d.empty:
-        return pd.DataFrame(columns=["STAT", "PICKS", "HITS", "WIN_%"])
-    g = d.groupby("STAT")["SHOWN_RESULT"].agg(PICKS="size", HITS=lambda s: int((s == "Hit").sum())).reset_index()
+        return pd.DataFrame(columns=cols)
+    d = d.assign(_U=pick_units(d)["UNITS"])
+    g = d.groupby("STAT").agg(PICKS=("SHOWN_RESULT", "size"), HITS=("SHOWN_RESULT", lambda s: int((s == "Hit").sum())),
+                              UNITS=("_U", "sum"), _N=("_U", "count")).reset_index()
     g["WIN_%"] = (100.0 * g["HITS"] / g["PICKS"]).round(1)
-    return g.sort_values("PICKS", ascending=False).reset_index(drop=True)
+    g["ROI_%"] = (100.0 * g["UNITS"] / g["_N"].replace(0, np.nan)).round(1)
+    g["UNITS"] = g["UNITS"].where(g["_N"] > 0).round(2)
+    return g.sort_values("PICKS", ascending=False).reset_index(drop=True)[cols]
 
 
 def recent(snaps: pd.DataFrame, date_col: str, today: str, how: str = "All props", n_days: int = 7) -> pd.DataFrame:
     """Win % for each of the last `n_days` graded game days, plus a running total row."""
-    rows = []
+    cols = ["DAY", "PICKS", "HITS", "WIN_%", "UNITS", "ROI_%"]
+    rows, staked = [], []
     for day in graded_days(snaps, date_col, today)[:n_days]:
         c = day_counts(snaps, day, date_col, how)
         if c["hits"] + c["misses"]:
-            rows.append({"DAY": day, "PICKS": c["hits"] + c["misses"], "HITS": c["hits"], "WIN_%": round(c["win_pct"], 1)})
-    t = pd.DataFrame(rows, columns=["DAY", "PICKS", "HITS", "WIN_%"])
+            rows.append({"DAY": day, "PICKS": c["hits"] + c["misses"], "HITS": c["hits"], "WIN_%": round(c["win_pct"], 1),
+                         "UNITS": None if c["units"] is None else round(c["units"], 2), "ROI_%": None if c["roi_pct"] is None else round(c["roi_pct"], 1)})
+            staked.append(c["staked"])
+    t = pd.DataFrame(rows, columns=cols)
     if len(t) > 1:
+        u = pd.to_numeric(t["UNITS"], errors="coerce")
+        n = float(sum(staked))
         tot = pd.DataFrame([{"DAY": f"Last {len(t)} days", "PICKS": int(t["PICKS"].sum()), "HITS": int(t["HITS"].sum()),
-                             "WIN_%": round(100.0 * t["HITS"].sum() / t["PICKS"].sum(), 1)}])
+                             "WIN_%": round(100.0 * t["HITS"].sum() / t["PICKS"].sum(), 1),
+                             "UNITS": round(float(u.sum()), 2) if u.notna().any() else None,
+                             "ROI_%": round(100.0 * float(u.sum()) / n, 1) if n > 0 else None}])
         t = pd.concat([t, tot], ignore_index=True)
     return t
 
@@ -477,13 +546,21 @@ def render_daily(st: Any, snaps: Optional[pd.DataFrame], date_col: str, today: s
     how = c2.selectbox("Picks", FILTERS, key="daily_filter")
     c = day_counts(snaps, day, date_col, how)
     if c["win_pct"] is None:
-        st.info(f"No decided {how.lower()} on {day}.")
+        st.info(f"No decided {how.lower()} on {day}." + (" Record bets with the 🎯 Place Bet buttons (or ✅ I placed this ticket in the Parlay tab) "
+                                                        "and they show up here after the games are graded." if how.startswith("Placed") else ""))
     else:
         left, right = st.columns([1, 1])
         left.plotly_chart(_daily_donut(c, f"{how} · {day}"), use_container_width=True)
-        right.metric("Win %", f"{c['win_pct']:.1f}%", delta=f"{c['win_pct'] - BREAK_EVEN:+.1f} vs break-even (52.4%)")
+        be = c["price_be_pct"] if c["price_be_pct"] is not None else BREAK_EVEN
+        right.metric("Win %", f"{c['win_pct']:.1f}%", delta=f"{c['win_pct'] - be:+.1f} vs the {be:.1f}% these prices needed")
+        if c["units"] is not None:
+            right.metric("Profit (1 unit per pick)", f"{c['units']:+.2f} u", delta=f"ROI {c['roi_pct']:+.1f}%")
         right.write(f"**{c['hits']}** hit · **{c['misses']}** missed · {c['pushes']} push" + (f" · {c['pending']} not graded yet" if c["pending"] else ""))
-        right.caption("Side the app showed for each prop. Pushes are refunds and left out of the %.")
+        right.caption({"Placed bets": "Your recorded solo bets, graded on the side you bet, 1 unit each at the price you recorded. Pushes are refunds.",
+                       "Placed parlay legs": "Each leg of the tickets you recorded, graded on the side you took. Win % only: a leg's result isn't "
+                                             "your ticket's profit."}.get(how, "Side the app showed for each prop, 1 unit on each at the DraftKings price saved "
+                                                                                "with it. Pushes are refunds.")
+                      + (f" {c['no_price']} pick(s) had no saved price and are left out of units." if c["no_price"] and how != "Placed parlay legs" else ""))
         t = by_stat(snaps, day, date_col, how)
         if len(t) > 1:
             st.dataframe(t, use_container_width=True, hide_index=True)
@@ -491,4 +568,6 @@ def render_daily(st: Any, snaps: Optional[pd.DataFrame], date_col: str, today: s
     if len(trend) > 1:
         st.markdown("**Recent game days**")
         st.dataframe(trend, use_container_width=True, hide_index=True)
-    st.caption("One day is a small sample: 10 picks at a true 55% will often show anywhere from 30% to 80%. Judge the model on the running total and the CLV panel.")
+    st.caption("One day is a small sample: 10 picks at a true 55% will often show anywhere from 30% to 80%, and props from the same games win and lose "
+               "together. Judge the model on the running units and ROI over weeks, and on the CLV panel. Units are what flat 1-unit bets would have "
+               "made at the saved prices, not your actual bets.")
