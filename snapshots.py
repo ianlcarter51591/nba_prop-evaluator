@@ -25,10 +25,10 @@ SNAP_PATH = os.environ.get("SNAPSHOT_PATH", "snapshots.csv")
 MIN_MISS_PCT = 0.25                 # minutes off by 25%+ of the projection counts as a minutes miss
 KEY_COLS: List[str] = ["PLAYER", "STAT", "LINE", "GAME_DATE"]
 TEXT_COLS: List[str] = ["SNAP_ID", "TS_ET", "GAME_DATE", "GAME", "PLAYER", "STAT", "OPPONENT", "SOURCE", "SHOWN_SIDE", "EV_SIDE",
-                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK", "PIN_FLAG", "FAV", "CLOSE_TS"]
+                        "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK", "PIN_FLAG", "FAV", "CLOSE_TS", "PLACED_KIND", "PLACED_SIDE", "PLACED_TS"]
 NUM_COLS: List[str] = ["SEASON", "WEEK", "LINE", "OVER_ODDS", "UNDER_ODDS", "MU", "PROJ_MEAN", "PROJ_MIN", "RAW_AVG", "OPP_MULT", "VEGAS_TOTAL", "MIN_EXTRA",
                        "P_OVER", "P_UNDER", "PM_OVER", "PM_UNDER", "SIX_OVER", "SIX_UNDER", "ACTUAL", "ACTUAL_MIN", "STAT_ERR", "MIN_ERR", "MIN_ERR_PCT", "PIN_LINE", "PIN_P_SIDE", "DK_P_SIDE", "PIN_EV",
-                       "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER", "CLOSE_MIN"]
+                       "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER", "CLOSE_MIN", "PLACED_ODDS"]
 COLS: List[str] = TEXT_COLS + NUM_COLS
 
 
@@ -90,6 +90,20 @@ def _row_key(d: pd.DataFrame) -> pd.Series:
             + "|" + pd.Series(day, index=d.index))
 
 
+PLACED_COLS = ["PLACED_KIND", "PLACED_SIDE", "PLACED_ODDS", "PLACED_TS"]
+
+
+def _carry_placed(allr: pd.DataFrame, key: pd.Series, out: pd.DataFrame, out_key: pd.Series) -> pd.DataFrame:
+    """A re-evaluated prop keeps its 'placed bet' record (kind, side, price, time) from the row it replaces."""
+    placed = allr[allr["PLACED_KIND"].astype(str) != ""].assign(_K=key).drop_duplicates("_K", keep="last").set_index("_K")
+    if placed.empty:
+        return out
+    blank = (out["PLACED_KIND"].astype(str) == "") & out_key.isin(placed.index)
+    for c in PLACED_COLS:
+        out.loc[blank, c] = placed.loc[out_key[blank], c].to_numpy()
+    return out
+
+
 def upsert(existing: pd.DataFrame, rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """Add rows; a newer snapshot of the same prop replaces an older PENDING one. Graded rows stay."""
     new = normalize(pd.DataFrame(rows)) if rows else normalize(pd.DataFrame(columns=COLS))
@@ -98,9 +112,10 @@ def upsert(existing: pd.DataFrame, rows: List[Dict[str, Any]]) -> pd.DataFrame:
     key = _row_key(allr)
     starred = set(key[allr["FAV"] == "Y"])                       # a re-evaluated prop keeps its favorite star
     allr = allr[~(key.isin(set(key[allr["STATUS"] == "Graded"])) & (allr["STATUS"] == "Pending"))]
-    out = allr[~_row_key(allr).duplicated(keep="last")].reset_index(drop=True)
+    key = _row_key(allr)
+    out = allr[~key.duplicated(keep="last")].reset_index(drop=True)
     out["FAV"] = np.where(_row_key(out).isin(starred), "Y", out["FAV"])
-    return out
+    return _carry_placed(allr, key, out, _row_key(out))
 
 
 def _num(x: Any) -> pd.Series:
