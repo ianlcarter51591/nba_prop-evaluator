@@ -266,7 +266,13 @@ def style_tags(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
         color = ROW_COLORS.get((tier, side))
         return [f"background-color:{color};color:#ffffff;font-weight:700" if color else ""] * len(row)
 
-    return df.style.apply(row_style, axis=1)
+    def fmt(v: Any) -> Any:
+        """Short numbers on screen (24.5, not 24.500000); text and blanks unchanged."""
+        if isinstance(v, (float, np.floating)):
+            return "" if np.isnan(v) else f"{v:g}"
+        return v
+
+    return df.style.apply(row_style, axis=1).format(fmt)
 
 
 def assessment_summary(res: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
