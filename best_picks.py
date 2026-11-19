@@ -12,7 +12,13 @@ prop_review.py) the model chance is first blended with DraftKings' no-vig chance
              = 100 * (R - 1) / (N - 1)   for an Under          allows the most), N = teams ranked.  No rank -> 50 (neutral).
     SCORE    = w * MODEL + (1 - w) * MATCHUP               w = the "model weight" slider, default 0.85: EV ranks, the matchup breaks ties
     BOTH ✓   = EV_% > 0 and EDGE_PP > 0 (EDGE_PP >= 2 without the blend) and MATCHUP >= 66.7 (a top-third matchup for that side)
-Rows are sorted by SCORE, then EV_%. Props whose EDGE_PP is below the minimum edge are dropped, and at most `per_game` picks
+    SHARP    = SIX >= 5 (5/6 or 6/6 on the six-point checklist) and a top-third matchup (MATCHUP >= 66.7) for that side
+The default view lists EVERY SHARP prop (no minimum edge, top-N or per-game limit), sorted by SIX, then SCORE. "Hide negative-EV
+picks" (on by default) hides the ones with EV_% <= 0 from the table only: every SHARP prop is still saved for grading with its EV,
+so Daily results can show whether the hidden ones would have lost money.
+Side: when the six-point checklist rates a side 5/6 or 6/6, that side is used (the same side the board's tag names);
+otherwise the side with the higher model EV.
+"All ranked picks" view: rows are sorted by SCORE, then EV_%. Props whose EDGE_PP is below the minimum edge are dropped, and at most `per_game` picks
 are kept from any one game (props from the same game tend to win or lose together). The matchup weight stays low until your
 graded snapshots show BOTH ✓ picks actually win more (Snapshots -> Daily results -> "Best Picks ✓ BOTH").
 
@@ -32,6 +38,8 @@ BOTH_EDGE = 2.0
 BOTH_MATCHUP = 200.0 / 3.0
 DEFAULT_WEIGHT = 0.85
 DEFAULT_PER_GAME = 2
+SHARP_SIX = 5
+VIEWS = ["5/6 & 6/6 with a matchup edge", "All ranked picks"]
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
 ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID"]
 SHOW_COLS = ["PICK", "GAME", "ODDS", "BLEND_%", "EV_%", "OPP_VS_POS", "SIX", "PIN", "BOTH"]
@@ -40,11 +48,17 @@ DETAIL_COLS = ["POS", "MODEL_%", "MARKET_%", "EDGE_PP", "MODEL", "MATCHUP", "SCO
 
 def make_row(res: Mapping[str, Any], stat: str, line: float, game: str, pos: Optional[str], opp: Optional[str],
              rank: Optional[float], n_teams: Optional[float], pin: str = "") -> Optional[Dict[str, Any]]:
-    """One candidate row from an evaluation result: the side with the higher model EV. None when the result has no sides."""
+    """One candidate row from an evaluation result: the six-point side when it scores 5/6 or 6/6, otherwise the side with the
+    higher model EV. None when the result has no sides."""
     sides = res.get("sides") or {}
     if not {"Over", "Under"} <= set(sides):
         return None
-    side = max(("Over", "Under"), key=lambda s: float(sides[s].get("ev_pct", -1e9)))
+    six_all = res.get("six_point") or {}
+    best = six_all.get("best")
+    if best in sides and float((six_all.get(best) or {}).get("score") or 0) >= SHARP_SIX:
+        side = best
+    else:
+        side = max(("Over", "Under"), key=lambda s: float(sides[s].get("ev_pct", -1e9)))
     s = sides[side]
     six = (res.get("six_point") or {}).get(side) or {}
     return {"PLAYER": str(res.get("player_name", "")), "POS": pos or "", "STAT": str(stat), "SIDE": side, "LINE": float(line), "ODDS": float(s.get("odds", np.nan)),
@@ -72,7 +86,7 @@ def rank_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGH
     """Score and sort candidate rows (see module docstring). Returns ROW_COLS plus BLEND_%, MODEL, MATCHUP, SCORE, BOTH.
     With `w_blend` the edge, EV and BOTH use the market-blended chance; otherwise BLEND_% equals the model chance."""
     import prop_review as cal
-    extra = ["BLEND_%", "MODEL", "MATCHUP", "SCORE", "BOTH"]
+    extra = ["BLEND_%", "MODEL", "MATCHUP", "SCORE", "BOTH", "SHARP", "RANK"]
     d = pd.DataFrame(list(rows))
     if d.empty:
         return pd.DataFrame(columns=ROW_COLS + extra)
@@ -96,8 +110,22 @@ def rank_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGH
     d["MATCHUP"] = matchup_score(d["SIDE"], d["OPP_RANK"], d["N_TEAMS"])
     d["SCORE"] = w * d["MODEL"] + (1.0 - w) * d["MATCHUP"]
     model_ok = (ev > 0) & ((e >= BOTH_EDGE) if w_blend is None else (e > 0))
-    d["BOTH"] = model_ok & (d["MATCHUP"] >= BOTH_MATCHUP) & pd.to_numeric(d["OPP_RANK"], errors="coerce").notna()
-    return d.sort_values(["SCORE", "EV_%"], ascending=[False, False]).reset_index(drop=True)[ROW_COLS + extra]
+    has_rank = pd.to_numeric(d["OPP_RANK"], errors="coerce").notna()
+    d["BOTH"] = model_ok & (d["MATCHUP"] >= BOTH_MATCHUP) & has_rank
+    d["SHARP"] = (pd.to_numeric(d["SIX"], errors="coerce") >= SHARP_SIX) & (d["MATCHUP"] >= BOTH_MATCHUP) & has_rank
+    d = d.sort_values(["SCORE", "EV_%"], ascending=[False, False]).reset_index(drop=True)
+    d["RANK"] = np.arange(1, len(d) + 1)
+    return d[ROW_COLS + extra]
+
+
+def sharp_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGHT, w_blend: Optional[float] = None) -> pd.DataFrame:
+    """Every 5/6 or 6/6 prop with a top-third matchup for its side (no minimum edge), sorted by SIX, then SCORE."""
+    r = rank_picks(rows, w_model, -1e9, w_blend)
+    if r.empty:
+        return r
+    s = r[r["SHARP"]].copy()
+    s["_SIX"] = pd.to_numeric(s["SIX"], errors="coerce")
+    return s.sort_values(["_SIX", "SCORE"], ascending=[False, False]).drop(columns="_SIX").reset_index(drop=True)
 
 
 def cap_per_game(ranked: pd.DataFrame, per_game: int) -> pd.DataFrame:
@@ -267,6 +295,13 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     min_edge = float(c4.number_input("Minimum edge (points)", value=0.5, step=0.5, key="bp_min_edge"))
     top = int(c5.number_input("Show top", min_value=5, max_value=200, value=25, step=5, key="bp_top"))
     timer_label = c6.selectbox("Auto-refresh", list(TIMER_CHOICES), key="bp_timer")
+    view_name = st.radio("Show", VIEWS, horizontal=True, key="bp_view",
+                         help="5/6 & 6/6 with a matchup edge: every prop that passes 5 or 6 of the six checks AND faces a top-third defense matchup "
+                              "for that side (soft defense for an Over, tough for an Under). The edge, top-N and per-game limits don't apply to it.")
+    sharp_view = view_name == VIEWS[0]
+    hide_neg = sharp_view and bool(st.checkbox("Hide negative-EV picks", value=True, key="bp_hide_neg",
+                                               help="Hides 5/6 and 6/6 props whose price at DraftKings is too short to profit even if the pick is right. "
+                                                    "They are still saved for grading (Daily results → Best Picks 5/6+ & matchup, negative EV)."))
     c7, c8 = st.columns(2)
     per_game = int(c7.number_input("Max picks per game (0 = no limit)", min_value=0, max_value=20, value=DEFAULT_PER_GAME, step=1, key="bp_per_game",
                                    help="Props from the same game tend to win or lose together, so a list full of one game is riskier than it looks."))
@@ -301,30 +336,48 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     if rows is None:
         st.info("Press **Refresh now** to build the list. The first scan loads every player's game log, so it can take a few minutes.")
     else:
-        ranked = cap_per_game(rank_picks(rows, w, min_edge, None if info is None else float(info["w"])), per_game)
+        wb = None if info is None else float(info["w"])
+        ranked = cap_per_game(rank_picks(rows, w, min_edge, wb), per_game)
+        sharp = sharp_picks(rows, w, wb)
+        if just_scanned and tag is not None:
+            listed = pd.concat([ranked.head(top), sharp[~sharp.set_index(["PLAYER", "STAT", "LINE"]).index.isin(
+                ranked.head(top).set_index(["PLAYER", "STAT", "LINE"]).index)]], ignore_index=True)
+            try:
+                tag(listed)
+            except Exception as e:
+                st.caption(f"Couldn't save this list for grading ({str(e)[:80]}).")
+        n_hidden = 0
+        if sharp_view:
+            ev_ok = pd.to_numeric(sharp["EV_%"], errors="coerce") > 0
+            n_hidden = int((~ev_ok).sum()) if hide_neg else 0
+            ranked = sharp[ev_ok].reset_index(drop=True) if hide_neg else sharp
+            top = max(len(ranked), 1)
         if info is not None:
             import prop_review as cal
             st.caption(f"Edges and EV use the market-blended chance: {cal.weight_note(info)}. BOTH ✓ = still +EV after the blend and a top-third matchup.")
         age = int((time.time() - float(ss.get("bp_time", time.time()))) // 60)
-        st.caption(f"Last scan {age} min ago. {ss.get('bp_note', '')} {len(ranked)} of {len(rows)} props clear the minimum edge.")
+        st.caption(f"Last scan {age} min ago. {ss.get('bp_note', '')} "
+                   + (f"{len(ranked) + n_hidden} of {len(rows)} props are 5/6 or 6/6 with a top-third matchup"
+                      + (f"; {n_hidden} with negative EV hidden." if n_hidden else ".") if sharp_view
+                      else f"{len(ranked)} of {len(rows)} props clear the minimum edge."))
         for e in (ss.get("bp_errors") or [])[:5]:
             st.warning(e)
         if ranked.empty:
-            st.info("No prop clears the minimum edge right now. Lower it to see more.")
+            st.info((f"All {n_hidden} props that are 5/6 or 6/6 with a top-third matchup have negative EV, so they're hidden. Untick "
+                     "Hide negative-EV picks to see them." if n_hidden else
+                     "No prop is 5/6 or 6/6 with a top-third matchup right now. Scan more stats or games, or switch to All ranked picks.")
+                    if sharp_view else "No prop clears the minimum edge right now. Lower it to see more.")
         else:
             shown = display(ranked, top, details)
-            if just_scanned and tag is not None:
-                try:
-                    tag(ranked.head(top))
-                except Exception as e:
-                    st.caption(f"Couldn't save this list for grading ({str(e)[:80]}).")
             if open_pick is None:
                 st.dataframe(shown.set_index("PICK"), use_container_width=True)
             else:
                 _clickable_table(st, shown, ranked.head(top), open_pick)
             st.caption("BLEND_% = your model's chance blended with the market; EV_% = what a bet at DraftKings' price is worth at that chance. "
                        "OPP_VS_POS: opponent and its rank vs this position for this stat (#1 = allows the most). PIN = Pinnacle cross-check for that side."
-                       + (f" At most {per_game} pick(s) per game." if per_game else ""))
+                       + (" Showing every 5/6 and 6/6 prop with a top-third matchup" + (" and positive EV." if hide_neg else
+                          "; EV_% below 0 means DraftKings' price is too short even so.")
+                          if sharp_view else (f" At most {per_game} pick(s) per game." if per_game else "")))
             if star is not None:
                 picks = st.multiselect("⭐ Favorite picks for the Parlay tab", shown["PICK"].tolist(), key="bp_star_pick")
                 s1, s2 = st.columns(2)
