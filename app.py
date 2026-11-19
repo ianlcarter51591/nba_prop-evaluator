@@ -7,7 +7,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,9 +36,9 @@ def _startup_problems() -> List[str]:
                        ("parlay", ("Leg", "evaluate", "legs_from_snapshots")),
                        ("vegas_env", ("find_espn_lines", "implied_team_total", "team_environment")),
                        ("snapshots", ("make_row", "upsert", "grade", "normalize", "by_tier", "by_pin")),
-                       ("pin_check", ("split", "table", "for_player", "cross", "assess")),
+                       ("pin_check", ("split", "table", "for_player", "cross", "assess", "convert_over")),
                        ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many", "mark_placed", "snap_id_for_leg", "tag_best_picks")),
-                       ("best_picks", ("render", "make_row", "rank_picks", "selected_row", "cap_per_game")),
+                       ("best_picks", ("render", "make_row", "rank_picks", "selected_row", "cap_per_game", "sharp_picks")),
                        ("prop_review", ("fit_blend", "blend", "render_blend_banner", "render_calibration", "record_close", "compute_clv", "clv_summary", "render_clv", "render_daily", "day_counts", "graded_days")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button", "clickable_table", "render_tracked_place_bet"))):
         try:
@@ -1167,19 +1167,34 @@ def load_team_profile(tid: str) -> pd.DataFrame:
     return prof
 
 
-def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, absorb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+POS_AFFINITY: Dict[Tuple[str, str], float] = {("G", "G"): 3.0, ("F", "F"): 3.0, ("C", "C"): 3.0,
+                                              ("G", "F"): 1.5, ("F", "G"): 1.5, ("F", "C"): 1.5, ("C", "F"): 1.5}
+
+
+def position_affinity(groups: Sequence[Optional[str]]) -> np.ndarray:
+    """(K, K) weight for absent j -> receiver k: 3 for the same position group (the likely replacement), 1.5 for a neighbouring group
+    (G-F, F-C), 1 otherwise or when a position is unknown."""
+    g = list(groups)
+    return np.array([[POS_AFFINITY.get((a, b), 1.0) if a and b else 1.0 for b in g] for a in g], dtype=float)
+
+
+def absence_effects(M: np.ndarray, R: np.ndarray, W: np.ndarray, a: np.ndarray, absorb: np.ndarray,
+                    affinity: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     For every candidate-absent player j (rows) and receiver k (cols):
     dM[j,k] minutes shifted to k, dR[j,k,s] fractional per-minute rate lift for stat s. Shapes: M (K,), R (K,S), W (K,S), a (K,).
+    `affinity` (K, K) steers an absent player's minutes (weight x affinity) and shots (weight x sqrt(affinity)) toward teammates
+    at his position, since the next man up at that spot takes most of them; None = spread across the roster by playing time only.
     """
     K = len(M)
     off = 1.0 - np.eye(K)
+    aff = np.ones((K, K)) if affinity is None else np.asarray(affinity, dtype=float)
     wmin = a * M * np.maximum(MIN_CAP - M, HEADROOM_FLOOR)
-    omega = wmin[None, :] * off
+    omega = wmin[None, :] * off * aff
     omega = omega / np.maximum(omega.sum(1, keepdims=True), 1e-9)
     dM = np.minimum(M[:, None] * omega, np.maximum(MIN_CAP - M, 0.0)[None, :])
     leftover = np.maximum(R * M[:, None] - dM @ R, 0.0)
-    wshare = (a[:, None] * W)[None, :, :] * off[:, :, None]
+    wshare = (a[:, None] * W)[None, :, :] * (off * np.sqrt(aff))[:, :, None]
     share = wshare / np.maximum(wshare.sum(1, keepdims=True), 1e-9)
     dX = absorb[None, None, :] * leftover[:, None, :] * share
     dR = dX / np.maximum((M[None, :] + dM)[:, :, None] * np.maximum(R, 1e-4)[None, :, :], 1e-9)
@@ -1273,7 +1288,8 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     poss = (prof["R_POSS"].to_numpy(float) * M)[:, None]
     W = np.where(np.array([s in USAGE_BASED for s in USAGE_STATS])[None, :], poss, R * M[:, None])
     absorb = np.minimum(np.array([ABSORB[s] for s in USAGE_STATS]) * float(cfg.get("absorb_scale", 1.0)), 1.0)
-    dM, dR = absence_effects(M, R, W, a, absorb)
+    groups = _profile_groups(prof["NAME"])
+    dM, dR = absence_effects(M, R, W, a, absorb, position_affinity(groups))
 
     w = ewma_weights(n) if n else np.array([])
     f_core = absent_fractions(present, w)
@@ -1294,8 +1310,10 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
     per_j = (dR[:, i, :][:, pidx] * base[None, :]).sum(1)
     lift = float((net_rate * per_j).sum())
     minutes_extra = float(np.clip((net_min * dM[:, i]).sum(), -MAX_MIN_SHIFT, MAX_MIN_SHIFT))
-    out.update(minutes_extra=minutes_extra, usage_mult=float(np.clip(1.0 + lift, *USAGE_MULT_BOUNDS)),
-               usg=float(prof.loc[i, "USG"]))
+    usage_mult = float(np.clip(1.0 + lift, *USAGE_MULT_BOUNDS))
+    out.update(minutes_extra=minutes_extra, usage_mult=usage_mult, usg=float(prof.loc[i, "USG"]),
+               effect_pct=usage_mult * (1.0 + minutes_extra / max(float(M[i]), 1.0)) - 1.0)
+    out["key_out"] = key_absence(prof, i, q, M, cur, present, stat_col, status)
     show = np.flatnonzero((np.abs(net_rate) > 0.02) | (np.abs(net_min) > 0.02))
     for j in show[np.argsort(-np.abs(net_rate[show] * per_j[show]))]:
         if q[j] >= 0.99:
@@ -1311,6 +1329,77 @@ def injury_adjustment(player_name: str, stat_col: str, cur: pd.DataFrame, cfg: D
                              "Minutes effect": round(float(net_min[j] * dM[j, i]), 2),
                              "Stat effect %": round(float(net_rate[j] * per_j[j]) * 100.0, 1)})
     return out
+
+
+KEY_OUT_P, KEY_OUT_USG, KEY_OUT_MIN = 0.75, 20.0, 24.0     # who counts as a key absence (likely out, real role)
+WITHOUT_K = 4.0                                            # pseudo-games of the model's view when blending the "without him" split
+
+
+def _profile_groups(names: pd.Series) -> List[Optional[str]]:
+    """Position group (G / F / C) of each roster name; None when ESPN doesn't list it."""
+    import nba_matchups as nm
+    return [nm.position_group(position_of(str(n))) for n in names]
+
+
+def key_absence(prof: pd.DataFrame, i: int, q: np.ndarray, M: np.ndarray, cur: pd.DataFrame, present: np.ndarray, stat_col: str,
+                status: List[str]) -> Optional[Dict[str, Any]]:
+    """The most important teammate likely out tonight (P(out) >= 75% and USG >= 20% or 24+ mpg), with the evaluated player's own
+    "without him" split this season: games since that teammate's first game this season in which he didn't play.
+    None when no such teammate is out."""
+    usg = prof["USG"].to_numpy(float)
+    cand = [j for j in range(len(prof)) if j != i and q[j] >= KEY_OUT_P and (usg[j] >= KEY_OUT_USG or M[j] >= KEY_OUT_MIN)]
+    if not cand:
+        return None
+    j = max(cand, key=lambda k: q[k] * usg[k] * M[k])
+    dates = cur["DATE"].astype(str).to_numpy()
+    mine = sorted(d for d in prof.loc[j, "DATES"] if dates.size and d >= dates.min())
+    without = np.zeros(len(cur), dtype=bool)
+    if mine and present.shape[1] == len(cur):
+        without = (~present[j]) & (dates > mine[0])
+    elif not mine and present.shape[1] == len(cur):
+        without = ~present[j]                                   # he hasn't played at all this season
+    w, x, m = cur[without], cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float)
+    n_w = int(without.sum())
+    split = {"n": n_w, "avg": float(x[without].mean()) if n_w else None, "minutes": float(m[without].mean()) if n_w else None,
+             "rate": float(x[without].sum() / max(m[without].sum(), 1e-9)) if n_w else None,
+             "with_avg": float(x[~without].mean()) if (~without).any() else None, "dates": list(w["DATE"].astype(str))}
+    return {"name": str(prof.loc[j, "NAME"]), "status": status[j] or "OUT", "p_out": float(q[j]), "usg": float(usg[j]),
+            "mpg": float(M[j]), "without": split}
+
+
+def this_season_avg(played: pd.DataFrame, stat_col: str) -> Optional[float]:
+    vals = played[played["SEASON"] == "current"][stat_col].to_numpy(float)
+    return float(np.mean(vals)) if len(vals) else None
+
+
+def role_change_warning(player: str, inj: Mapping[str, Any], side: Optional[str], line: float, season_avg: Optional[float]) -> str:
+    """A loud note when the app leans Under on a player whose role grows tonight: a key teammate is out and the line sits
+    well above (10%+) his season average, i.e. the market has already priced the bigger role. '' otherwise."""
+    key = inj.get("key_out")
+    if not key or side != "Under" or season_avg is None or line < 1.10 * season_avg:
+        return ""
+    w = key.get("without") or {}
+    split = (f" In {w['n']} game(s) without him this season he averaged {w['avg']:.1f}." if w.get("n") else
+             " He hasn't played a game without him this season, so the model has no direct evidence for the new role.")
+    return (f"⚠️ Role change: {key['name']} ({key['status']}) is out, and DraftKings' line ({line:g}) is well above {player}'s season "
+            f"average ({season_avg:.1f}): the market expects a bigger role. Be careful with the Under.{split}")
+
+
+def blend_without(proj: "Projection", key: Optional[Mapping[str, Any]], context_mult: float) -> Tuple["Projection", Optional[Dict[str, Any]]]:
+    """Blend the projection with the player's own games WITHOUT the key absent teammate:
+        mu = (WITHOUT_K * mu_model + n * mu_without) / (WITHOUT_K + n),  mu_without = rate_without * minutes_without * context_mult
+    (same blend for minutes; the spread is scaled with the mean). No change when there are no such games."""
+    w = (key or {}).get("without") or {}
+    n = int(w.get("n") or 0)
+    if n == 0 or not w.get("rate") or not w.get("minutes"):
+        return proj, None
+    from dataclasses import replace
+    mu_w = float(w["rate"]) * float(w["minutes"]) * context_mult
+    wt = n / (n + WITHOUT_K)
+    mu = max((1.0 - wt) * proj.mu + wt * mu_w, 0.05)
+    minutes = (1.0 - wt) * proj.minutes + wt * float(w["minutes"])
+    info = {"n": n, "weight": wt, "mu_model": proj.mu, "mu_without": mu_w, "mu": mu, "minutes": minutes}
+    return replace(proj, mu=mu, sigma=proj.sigma * mu / max(proj.mu, 1e-9), minutes=minutes), info
 
 
 def compute_opp_allowed(games: pd.DataFrame, stat_cols: List[str], min_games: int = 3) -> pd.DataFrame:
@@ -1592,6 +1681,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                                 pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult,
                                 *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)),
                                 extra_min=inj_out["minutes_extra"], usage_mult=inj_out["usage_mult"])
+        proj, without_info = blend_without(proj, inj_out.get("key_out"), opp_mult * b2b_mult * own_mult)
+        inj_out["without_blend"] = without_info
         sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
@@ -1638,6 +1729,9 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         if opp_note:
             warnings.append(opp_note)
         warnings.extend(inj_out["notes"])
+        role = role_change_warning(player_name, inj_out, six.get("best") if six else None, float(line), this_season_avg(played, stat_col))
+        if role:
+            warnings.insert(0, role)
         if b2b_note:
             warnings.append(b2b_note)
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
@@ -2047,6 +2141,19 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
         _metric(n[1], "USAGE ADJ", f"x{inj['usage_mult']:.3f}", _tone(inj["usage_mult"] - 1))
         _metric(n[2], "MINUTES SHIFT", f"{inj['minutes_extra']:+.1f}", _tone(inj["minutes_extra"]))
         _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
+        key = inj.get("key_out")
+        if key:
+            w, b = key.get("without") or {}, inj.get("without_blend")
+            text = (f"**Key absence: {with_pos(key['name'])}** ({key['status']}, {key['usg']:.0f}% usage, {key['mpg']:.0f} mpg). "
+                    f"His minutes and shots go mostly to teammates at his position. ")
+            if w.get("n"):
+                text += (f"Without him this season: **{w['avg']:.1f}** in {w['minutes']:.0f} min over {w['n']} game(s)"
+                         + (f" (with him: {w['with_avg']:.1f})" if w.get("with_avg") is not None else "") + ". ")
+                if b:
+                    text += (f"Projection blended {b['weight']:.0%} toward those games: {b['mu_model']:.1f} → **{b['mu']:.1f}**.")
+            else:
+                text += "No games without him yet this season, so the role change rests on the minutes/usage shift above alone."
+            st.info(text)
         if inj.get("listed"):
             st.caption("🩺 Injury report for " + str(inj.get("team") or "this team") + ": " + " · ".join(
                 f"{with_pos(x['name'])} ({x['status']})" for x in inj["listed"]))
@@ -2699,7 +2806,7 @@ def pin_assessment(res: Dict[str, Any], stat_label: str, line: float, over: floa
     if str(ss.get("pin_stat", "")).upper() != str(stat_label).upper():
         return {}
     side = (res.get("six_point") or {}).get("best") or res.get("best_side") or "Over"
-    return pin_check.for_player(ss.get("pin_summary"), str(res.get("player_name", "")), float(line), float(over), float(under), str(side))
+    return pin_check.for_player(ss.get("pin_summary"), str(res.get("player_name", "")), float(line), float(over), float(under), str(side), stat=stat_label)
 
 
 def render_pin_panel(res: Dict[str, Any], ctx: Dict[str, Any]) -> None:
@@ -2824,7 +2931,7 @@ def _bp_evaluate(game: Any, stat: str, name: str, line: float, over: float, unde
     row = best_picks.make_row(res, stat, line, " @ ".join(ss["board_teams"]), position_of(name) or "", od.get("abbr") or str(ctx["opponent"]),
                               pos.get("rank"), pos.get("n_teams"))
     if row:
-        row["PIN"] = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"])["FLAG"]
+        row["PIN"] = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"], stat=stat)["FLAG"]
     return row
 
 
@@ -3054,7 +3161,7 @@ def main() -> None:
                     shown_pos = shown.copy()
                     shown_pos.insert(1, "Pos", shown_pos["Player"].map(lambda n: position_of(str(n)) or "—"))
                     if ss.get("pin_stat"):
-                        shown_pos = pin_check.table(shown_pos, ss.get("pin_summary"))
+                        shown_pos = pin_check.table(shown_pos, ss.get("pin_summary"), ss.get("pin_stat"))
                         st.caption("Pin columns: Pinnacle's line, its no-vig Over %, and what a DraftKings Over / Under is worth if Pinnacle's price is right (same line only; — = Pinnacle has no price).")
                     shared_ui.clickable_table(st, style_tags(shown_pos) if "Six-Point" in shown_pos else shown_pos,
                                               shown_pos[["Player", "Line", "Over", "Under"]].reset_index(drop=True), _open_board_row, "board_table",
