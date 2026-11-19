@@ -160,23 +160,27 @@ def snap_id_for_leg(snaps: Optional[pd.DataFrame], label: str) -> Optional[str]:
 
 
 def tag_best_picks(snaps: Optional[pd.DataFrame], rows: pd.DataFrame) -> pd.DataFrame:
-    """Save the latest Best Picks list on the props' snapshots: BP_RANK (1 = top), BP_SIDE (the side ranked) and BP_BOTH ('Y' for ✓).
+    """Save the latest Best Picks list on the props' snapshots: BP_RANK (1 = top; the row's RANK when given), BP_SIDE (the side ranked),
+    BP_BOTH ('Y' for ✓), BP_SHARP ('Y' for 5/6 or 6/6 with a top-third matchup) and BP_EV (the EV % shown).
     Tags on other pending props are cleared, so pending tags always describe the latest list; graded props keep theirs."""
     d = _with_fav(snaps)
     if d.empty or "SNAP_ID" not in d.columns:
         return d
-    for c in ("BP_SIDE", "BP_BOTH"):
+    for c in ("BP_SIDE", "BP_BOTH", "BP_SHARP"):
         if c not in d.columns:
             d[c] = ""
-    if "BP_RANK" not in d.columns:
-        d["BP_RANK"] = np.nan
+    for c in ("BP_RANK", "BP_EV"):
+        if c not in d.columns:
+            d[c] = np.nan
     pend = d["STATUS"] == "Pending"
-    d.loc[pend, ["BP_SIDE", "BP_BOTH"]] = ""
-    d.loc[pend, "BP_RANK"] = np.nan
+    d.loc[pend, ["BP_SIDE", "BP_BOTH", "BP_SHARP"]] = ""
+    d.loc[pend, ["BP_RANK", "BP_EV"]] = np.nan
     for i, (_, r) in enumerate(rows.iterrows(), start=1):
         sid = find_id(d, r["PLAYER"], r["STAT"], r["LINE"])
         if sid:
             on = d["SNAP_ID"] == sid
-            d.loc[on, ["BP_SIDE", "BP_BOTH"]] = [str(r["SIDE"]), "Y" if bool(r.get("BOTH")) else ""]
-            d.loc[on, "BP_RANK"] = float(i)
+            d.loc[on, ["BP_SIDE", "BP_BOTH", "BP_SHARP"]] = [str(r["SIDE"]), "Y" if bool(r.get("BOTH")) else "", "Y" if bool(r.get("SHARP")) else ""]
+            rk = pd.to_numeric(pd.Series([r.get("RANK")]), errors="coerce").iloc[0]
+            d.loc[on, "BP_RANK"] = float(rk) if pd.notna(rk) else float(i)
+            d.loc[on, "BP_EV"] = pd.to_numeric(pd.Series([r.get("EV_%")]), errors="coerce").iloc[0]
     return d
