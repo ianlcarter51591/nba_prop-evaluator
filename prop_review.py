@@ -383,7 +383,7 @@ def render_clv(st: Any, snaps: Optional[pd.DataFrame], date_col: str = "GAME_DAT
 # ====================================================================================================
 
 BREAK_EVEN = 100.0 * 110.0 / 210.0
-FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only", "Best Picks top 10", "Best Picks ✓ BOTH", "Placed bets", "Placed parlay legs"]
+FILTERS = ["All props", "Favorites", "SHARP and LEAN", "SHARP only", "Best Picks 5/6+ & matchup", "Best Picks 5/6+ & matchup, +EV", "Best Picks 5/6+ & matchup, negative EV", "Best Picks top 10", "Best Picks ✓ BOTH", "Placed bets", "Placed parlay legs"]
 
 
 def _regrade(p: pd.DataFrame, side: pd.Series, price: Any) -> pd.DataFrame:
@@ -399,13 +399,20 @@ def _regrade(p: pd.DataFrame, side: pd.Series, price: Any) -> pd.DataFrame:
     return p
 
 
-def as_best_picks(d: pd.DataFrame, both_only: bool, top: int = 10) -> pd.DataFrame:
+def as_best_picks(d: pd.DataFrame, both_only: bool, top: int = 10, sharp_only: bool = False, ev: str = "") -> pd.DataFrame:
     """Props from the latest saved Best Picks list (BP_RANK <= top, or ✓ BOTH), graded on the side Best Picks ranked (BP_SIDE)
     at that side's saved DraftKings price."""
     if "BP_RANK" not in d.columns:
         return d.iloc[0:0]
     rank = pd.to_numeric(d["BP_RANK"], errors="coerce")
-    p = d[(d["BP_BOTH"].fillna("").astype(str) == "Y") & rank.notna()] if both_only else d[rank.notna() & (rank <= top)]
+    if sharp_only:
+        flag = d["BP_SHARP"] if "BP_SHARP" in d.columns else pd.Series("", index=d.index)
+        p = d[(flag.fillna("").astype(str) == "Y") & rank.notna()]
+        if ev:
+            bev = pd.to_numeric(p["BP_EV"], errors="coerce") if "BP_EV" in p.columns else pd.Series(np.nan, index=p.index)
+            p = p[bev > 0] if ev == "+" else p[bev <= 0]
+    else:
+        p = d[(d["BP_BOTH"].fillna("").astype(str) == "Y") & rank.notna()] if both_only else d[rank.notna() & (rank <= top)]
     if p.empty:
         return p
     over = p["BP_SIDE"].astype(str).str.lower().isin(["over", "yes"])
@@ -425,6 +432,12 @@ def as_placed(d: pd.DataFrame, kind: str) -> pd.DataFrame:
 
 
 def _filter_picks(d: pd.DataFrame, how: str) -> pd.DataFrame:
+    if how == "Best Picks 5/6+ & matchup":
+        return as_best_picks(d, False, sharp_only=True)
+    if how == "Best Picks 5/6+ & matchup, +EV":
+        return as_best_picks(d, False, sharp_only=True, ev="+")
+    if how == "Best Picks 5/6+ & matchup, negative EV":
+        return as_best_picks(d, False, sharp_only=True, ev="-")
     if how == "Best Picks top 10":
         return as_best_picks(d, False)
     if how == "Best Picks ✓ BOTH":
@@ -580,7 +593,13 @@ def render_daily(st: Any, snaps: Optional[pd.DataFrame], date_col: str, today: s
         if c["units"] is not None:
             right.metric("Profit (1 unit per pick)", f"{c['units']:+.2f} u", delta=f"ROI {c['roi_pct']:+.1f}%")
         right.write(f"**{c['hits']}** hit · **{c['misses']}** missed · {c['pushes']} push" + (f" · {c['pending']} not graded yet" if c["pending"] else ""))
-        right.caption({"Best Picks top 10": "The top 10 of the last Best Picks scan before the games, graded on the side it ranked, 1 unit each at "
+        right.caption({"Best Picks 5/6+ & matchup": "Every 5/6 or 6/6 prop with a top-third matchup in the last Best Picks scan before the games, "
+                                                    "graded on that side, 1 unit each at the saved DraftKings price.",
+                       "Best Picks 5/6+ & matchup, +EV": "The 5/6 and 6/6 matchup picks Best Picks showed by default (EV above 0 at the scan), "
+                                                         "graded on that side, 1 unit each at the saved price.",
+                       "Best Picks 5/6+ & matchup, negative EV": "The 5/6 and 6/6 matchup picks hidden for negative EV: if these lose money, hiding "
+                                                                 "them is right; if they win, the EV numbers are off.",
+                       "Best Picks top 10": "The top 10 of the last Best Picks scan before the games, graded on the side it ranked, 1 unit each at "
                                             "the saved DraftKings price.",
                        "Best Picks ✓ BOTH": "Every ✓ BOTH pick of the last Best Picks scan before the games (still +EV and a top-third matchup), "
                                             "graded on the side it ranked, 1 unit each at the saved price.",
