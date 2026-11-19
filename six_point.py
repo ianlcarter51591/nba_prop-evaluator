@@ -77,11 +77,37 @@ def flagged_players(inj: Mapping[str, Any], rotation_min: float) -> List[str]:
     return out
 
 
-def check_injury(inj: Mapping[str, Any], rotation_min: float) -> Check:
-    """5. Injury: nobody in the rotation carries an active flag (feed must have been read)."""
+ROLE_EFFECT_MIN = 0.03       # injuries that move this player's projection by 3%+ point the check one way
+UNCERTAIN_P_OUT = 0.75       # a teammate below this chance of sitting is a real "might play, might not" risk
+
+
+def check_injury(inj: Mapping[str, Any], rotation_min: float, side: Optional[str] = None) -> Check:
+    """5. Injury (feed must have been read). Without `side`: nobody in the rotation carries an active flag.
+    With `side` it is directional, because a teammate being OUT is good for this player's Over and bad for his Under:
+      fails both sides  - the player himself is flagged, or a rotation teammate is uncertain (0 < P(out) < 75%)
+      fails the Under   - teammates sitting raise this player's projection by 3%+ (more minutes / shots for him)
+      fails the Over    - teammates returning (or the injury mix) cut his projection by 3%+
+      passes otherwise  - including a teammate surely out whose role barely touches this player."""
     if not inj.get("checked") or not inj.get("feed_ok", False):
         return core.check_injury(None)
-    return core.check_injury(flagged_players(inj, rotation_min))
+    flagged = flagged_players(inj, rotation_min)
+    if side is None:
+        return core.check_injury(flagged)
+    label = "5. Injury"
+    if inj.get("self_status"):
+        return Check("injury", label, False, f"The player himself is listed ({inj['self_status']}).")
+    unsure = [f"{x['name']} ({x['status']})" for x in inj.get("listed", [])
+              if 0.0 < x.get("p_out", 0.0) < UNCERTAIN_P_OUT and x.get("mpg", rotation_min) >= rotation_min]
+    if unsure:
+        return Check("injury", label, False, "Uncertain teammate status: " + ", ".join(unsure))
+    eff = float(inj.get("effect_pct") or 0.0)
+    if side == "Under" and eff >= ROLE_EFFECT_MIN:
+        return Check("injury", label, False, f"Teammates out raise this player's projection {eff:+.0%} (bigger role): against the Under.")
+    if side == "Over" and eff <= -ROLE_EFFECT_MIN:
+        return Check("injury", label, False, f"Teammates returning cut this player's projection {eff:+.0%}: against the Over.")
+    if flagged:
+        return Check("injury", label, True, f"Flagged: {', '.join(flagged)}; net effect on this player {eff:+.0%}, which suits the {side}.")
+    return Check("injury", label, True, "No active injury flags on the team")
 
 
 def check_game_script(spread: Optional[float]) -> Check:
@@ -96,7 +122,7 @@ def score_prop(side: str, stat_col: str, line: float, proj: float, p_market: flo
     """Run all six checks for one side and return the score and tier."""
     return core.result_from_checks(side, (
         check_line(stat_col, line), check_edge(side, stat_col, line, proj), check_implied(side, p_market),
-        check_defense(side, season_rank, recent_rank, n_teams), check_injury(inj, rotation_min), check_game_script(spread),
+        check_defense(side, season_rank, recent_rank, n_teams), check_injury(inj, rotation_min, side), check_game_script(spread),
     ))
 
 
