@@ -3018,7 +3018,8 @@ def _bp_evaluate(game: Any, stat: str, name: str, line: float, over: float, unde
     row = best_picks.make_row(res, stat, line, " @ ".join(ss["board_teams"]), position_of(name) or "", od.get("abbr") or str(ctx["opponent"]),
                               pos.get("rank"), pos.get("n_teams"))
     if row:
-        row["PIN"] = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"], stat=stat)["FLAG"]
+        a = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"], stat=stat)
+        row.update(PIN=a["FLAG"], PIN_GAP=a.get("GAP_PP"), PIN_LINE=a.get("PIN_LINE"))
     return row
 
 
@@ -3365,3 +3366,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
