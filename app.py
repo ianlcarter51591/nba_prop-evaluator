@@ -1554,6 +1554,78 @@ def simulate(mu: float, sigma: float, count_stat: bool, n_sims: int = N_SIMS, se
     return np.maximum(np.rint(rng.normal(mu, sigma, n_sims)), 0.0)
 
 
+MIN_CV_PRIOR = ((28.0, 0.12), (20.0, 0.20), (0.0, 0.30))   # minutes CV by role: starter 28+ mpg, rotation 20-28, bench
+MIN_SD_N0 = 5.0                                              # pseudo-games of the role prior in the minutes spread
+MIN_SD_UNSEEN_ROLE = 3.0                                     # extra minutes spread when a key teammate is out and there are no games without him
+MIN_DRAW_CAP = 44.0
+RATE_CV_BOUNDS = (0.12, 1.20)
+
+
+def minutes_sd(cur_m: np.ndarray, pri_m: np.ndarray, proj_min: float, extra_min: float = 0.0, unseen_role: bool = False) -> float:
+    """
+    How much tonight's minutes can swing (sd, minutes):
+        s_obs  = EWMA-weighted sd of his recent minutes (this season; last season's last 20 when he has < 3 games)
+        s_role = MIN_CV_PRIOR(role) * projected minutes          (bench minutes swing far more than a starter's)
+        s      = sqrt((n * s_obs^2 + MIN_SD_N0 * s_role^2) / (n + MIN_SD_N0)) + 0.5 * |injury minutes shift|
+                 + MIN_SD_UNSEEN_ROLE when a key teammate is out and he has no games without him yet
+    clipped to [1.5, 45% of projected minutes]."""
+    hist = np.asarray(cur_m, float)
+    hist = hist[hist > 0]
+    if len(hist) < 3:
+        hist = np.asarray(pri_m, float)[-20:]
+        hist = hist[hist > 0]
+    n = len(hist)
+    cv_role = next(cv for floor, cv in MIN_CV_PRIOR if proj_min >= floor)
+    s_role = cv_role * proj_min
+    if n >= 2:
+        w = ewma_weights(n)
+        mean = float(np.sum(w * hist))
+        s_obs2 = float(np.sum(w * (hist - mean) ** 2)) * n / (n - 1)
+    else:
+        s_obs2 = s_role ** 2
+    s = float(np.sqrt((n * s_obs2 + MIN_SD_N0 * s_role ** 2) / (n + MIN_SD_N0)))
+    s += 0.5 * abs(float(extra_min)) + (MIN_SD_UNSEEN_ROLE if unseen_role else 0.0)
+    return float(np.clip(s, 1.5, 0.45 * max(proj_min, 1.0)))
+
+
+def rate_cv(cur_x: np.ndarray, cur_m: np.ndarray, pri_x: np.ndarray, pri_m: np.ndarray, n0: float = N_PRIOR_RATE) -> float:
+    """Game-to-game spread of his PER-MINUTE rate (games with 10+ minutes), this season blended with last season's last 40 by
+    sample size like the rate itself. This is the noise left once minutes are known; minutes noise is simulated separately."""
+    def cv_of(x: np.ndarray, m: np.ndarray) -> Tuple[float, Optional[float]]:
+        x, m = np.asarray(x, float), np.asarray(m, float)
+        ok = m >= 10
+        r = x[ok] / m[ok]
+        return float(len(r)), (float(np.std(r, ddof=1) / np.mean(r)) if len(r) >= 3 and np.mean(r) > 0 else None)
+    parts = [(w, c) for w, c in (cv_of(cur_x, cur_m), (min(float(n0), float(len(pri_x[-40:]))), cv_of(pri_x[-40:], pri_m[-40:])[1]))
+             if c is not None and w > 0]
+    cv = sum(w * c for w, c in parts) / sum(w for w, _ in parts) if parts else DEFAULT_CV
+    return float(np.clip(cv, *RATE_CV_BOUNDS))
+
+
+def simulate_with_minutes(mu: float, proj_min: float, min_sd: float, cv_rate: float, est_factor: float, count_stat: bool,
+                          n_sims: int = N_SIMS, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Two-stage simulation, so a minutes spike or a short night is part of the odds:
+        minutes_i ~ Gamma(mean = projected minutes, sd = min_sd), capped at MIN_DRAW_CAP
+        mean_i    = mu * minutes_i / projected minutes            (same per-minute rate, more or fewer minutes)
+        stat_i    ~ NegBin / Poisson (counts) or Normal (continuous) with mean mean_i and sd = cv_rate * mean_i * est_factor
+    Returns (stat draws, minutes draws)."""
+    rng = np.random.default_rng(seed)
+    m0 = max(float(proj_min), 1.0)
+    k = (m0 / max(min_sd, 1e-6)) ** 2
+    mins = np.minimum(rng.gamma(k, m0 / k, n_sims), MIN_DRAW_CAP)
+    mean = np.maximum(float(mu) * mins / m0, 1e-6)
+    sd = np.maximum(float(cv_rate) * mean * float(est_factor), 1e-6)
+    var = sd ** 2
+    if count_stat:
+        over = var > mean * 1.0001
+        n_nb = np.where(over, mean ** 2 / np.maximum(var - mean, 1e-9), 1.0)
+        p_nb = np.where(over, mean / np.maximum(var, 1e-9), 0.5)
+        draws = np.where(over, rng.negative_binomial(n_nb, np.clip(p_nb, 1e-9, 1.0)), rng.poisson(mean))
+        return draws.astype(float), mins
+    return np.maximum(np.rint(rng.normal(mean, sd)), 0.0), mins
+
+
 def implied_prob(odds: float) -> float:
     o = float(odds)
     return -o / (-o + 100.0) if o < 0 else 100.0 / (o + 100.0)
@@ -1683,7 +1755,18 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                                 extra_min=inj_out["minutes_extra"], usage_mult=inj_out["usage_mult"])
         proj, without_info = blend_without(proj, inj_out.get("key_out"), opp_mult * b2b_mult * own_mult)
         inj_out["without_blend"] = without_info
-        sims = simulate(proj.mu, proj.sigma, stat_col not in CONTINUOUS_STATS)
+        count_stat = stat_col not in CONTINUOUS_STATS
+        if cfg.get("minutes_uncertainty", True):
+            key = inj_out.get("key_out") or {}
+            unseen = bool(key) and not (key.get("without") or {}).get("n")
+            m_sd = minutes_sd(cur["MINUTES"].to_numpy(float), pri["MINUTES"].to_numpy(float), proj.minutes, inj_out["minutes_extra"], unseen)
+            cv_r = rate_cv(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float), pri[stat_col].to_numpy(float),
+                           pri["MINUTES"].to_numpy(float), (prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN))[0])
+            est = float(np.sqrt(1.0 + 1.0 / max(proj.n_current + (N_PRIOR_RATE if proj.n_prior else 0.0), 1.0)))
+            sims, min_draws = simulate_with_minutes(proj.mu, proj.minutes, m_sd, cv_r, est, count_stat)
+            minutes_range = {"sd": m_sd, "p10": float(np.percentile(min_draws, 10)), "p90": float(np.percentile(min_draws, 90)), "rate_cv": cv_r}
+        else:
+            sims, minutes_range = simulate(proj.mu, proj.sigma, count_stat), None
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
         dv_over, dv_under = devig(over_odds, under_odds)
@@ -1736,7 +1819,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             warnings.append(b2b_note)
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
         return {
-            "player_name": player_name, "mean": float(np.mean(sims)), "median": float(np.median(sims)),
+            "player_name": player_name, "mean": float(np.mean(sims)), "median": float(np.median(sims)), "minutes_range": minutes_range,
             "verdict": "PLAY" if ev > 0 else "PASS", "best_side": side_txt, "ev_pct": ev * 100.0,
             "edge_pp": (p_cond - dv_side) * 100.0, "p_model": p_cond * 100.0, "p_market": dv_side * 100.0,
             "fair_odds": prob_to_american(p_cond), "kelly_pct": kelly_fraction(p_w, p_l, odds_side) * 100.0,
@@ -2140,7 +2223,11 @@ def render_matchup_injury(res: Dict[str, Any], stat_category: str) -> None:
         _metric(n[0], "PLAYER USG%", f"{inj['usg']:.1f}%")
         _metric(n[1], "USAGE ADJ", f"x{inj['usage_mult']:.3f}", _tone(inj["usage_mult"] - 1))
         _metric(n[2], "MINUTES SHIFT", f"{inj['minutes_extra']:+.1f}", _tone(inj["minutes_extra"]))
-        _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}")
+        mr = res.get("minutes_range")
+        _metric(n[3], "PROJ MINUTES", f"{res['proj_minutes']:.1f}" + (f" ({mr['p10']:.0f}–{mr['p90']:.0f})" if mr else ""))
+        if mr:
+            st.caption(f"Minutes can swing: the odds are simulated over a minutes range (80% of nights between {mr['p10']:.0f} and {mr['p90']:.0f} min, "
+                       f"sd {mr['sd']:.1f}), not one fixed number, so a big-minutes night or a short one is part of the Over/Under chance.")
         key = inj.get("key_out")
         if key:
             w, b = key.get("without") or {}, inj.get("without_blend")
