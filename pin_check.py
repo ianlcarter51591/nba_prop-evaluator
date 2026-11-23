@@ -31,6 +31,8 @@ import pandas as pd
 
 FLAG_PP = 1.0
 CONVERTED_FLAG_PP = 2.0
+BIG_GAP_PP = 3.5             # Pinnacle vs DraftKings gaps this big lost money in the graded props: usually news, a stale line or a rough conversion
+BIG_GAP_NOTE = "⚠️ big gap: check news"
 POISSON_MAX_LINE = 7.5
 # Typical spread (standard deviation / mean) of one game's result, by stat; matched on words in the stat name, first match wins.
 STAT_CV = (("PASS YARDS", 0.28), ("PASSING YARDS", 0.28), ("RUSH YARDS", 0.45), ("RUSHING YARDS", 0.45), ("RECEIVING YARDS", 0.55),
@@ -170,6 +172,8 @@ def table(summary: pd.DataFrame, pin_summary: Optional[pd.DataFrame], stat: Opti
             rows.append([f"{c['PIN_LINE']:g} (differs)", "", "", ""])
         else:
             where = f"{c['PIN_LINE']:g}" + (f" → {c['DK_LINE']:g} (converted)" if c["STATUS"] == "Converted line" else "")
+            if c.get("DK_P_OVER") is not None and abs(c["PIN_P_OVER"] - c["DK_P_OVER"]) > BIG_GAP_PP:
+                where += f" {BIG_GAP_NOTE}"
             rows.append([where, _r(c["PIN_P_OVER"]), _r(c["PIN_EV_OVER"]), _r(c["PIN_EV_UNDER"])])
     for i, col in enumerate(PIN_COLUMNS):
         out[col] = [x[i] for x in rows]
@@ -204,7 +208,9 @@ def assess(side: str, c: Mapping[str, Any]) -> Dict[str, Any]:
              "Flat": "Pinnacle and DraftKings price this side about the same"}[flag]
     base["TEXT"] = (f"Pinnacle's line is {c['PIN_LINE']:g}; converted to DraftKings' {c['DK_LINE']:g} (approximate). " if conv else "") + \
         (f"{words}: Pinnacle {pin_p:.1f}% vs DraftKings {dk_p:.1f}% (no-vig)" if dk_p is not None else f"Pinnacle {pin_p:.1f}% (no-vig)") + \
-        (f"; at DraftKings' price that side is worth {ev:+.1f}% if Pinnacle is right." if ev is not None else ".")
+        (f"; at DraftKings' price that side is worth {ev:+.1f}% if Pinnacle is right." if ev is not None else ".") + \
+        (f" ⚠️ A gap over {BIG_GAP_PP:g} points usually means news, a stale line or a rough conversion, and these lost money in your graded "
+         "props: check for news before betting." if gap is not None and abs(gap) > BIG_GAP_PP else "")
     return base
 
 
