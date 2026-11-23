@@ -168,8 +168,13 @@ BT_TAU = 0.02
 EFFECTS_PATH = "b2b_effects.json"
 # Last-season weight, in pseudo-games. Per-minute production is stable year to year (high weight); minutes and roles
 # change more (lower weight). Defaults are informed assumptions: run the Backtest tab to estimate them from data.
-N_PRIOR_RATE = 12.0
-N_PRIOR_MIN = 6.0
+N_PRIOR_RATE = 6.0             # fallback for stats without their own weight below
+N_PRIOR_MIN = 2.0              # calibrated 2026-11-23: 2 beat the old 6 by 9% on minutes
+# Calibrated 2026-11-23 (B2B Backtest -> last-season weight, 2024-2026, 2,265 player-games). Noisy stats lean on last season more.
+N_PRIOR_RATE_BY_STAT: Dict[str, float] = {
+    "POINTS": 6.0, "PTS + REB + AST": 6.0, "REBOUNDS": 8.0, "ASSISTS": 8.0, "3-POINTERS MADE": 2.0,
+    "STEALS": 24.0, "BLOCKS": 32.0, "PTS + AST": 4.0, "PTS + REB": 6.0, "REB + AST": 6.0,
+}
 PRIOR_GRID: List[float] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 80]
 EARLY_GAMES = 15
 # Role change: when his recent minutes moved this far from last season's, last season describes a different job.
@@ -840,7 +845,8 @@ def estimate_prior_weights(frame: pd.DataFrame, grid: Optional[List[float]] = No
         r_curve, m_curve, cnt = _prior_loss_curves(*arrays, grid)
         if min_curve is None:
             min_curve, min_cnt = m_curve, cnt
-        rows.append({"STAT": stat, "TARGET": "per-minute rate", "curve": r_curve, "N": cnt, "default": N_PRIOR_RATE})
+        rows.append({"STAT": stat, "TARGET": "per-minute rate", "curve": r_curve, "N": cnt,
+                     "default": N_PRIOR_RATE_BY_STAT.get(stat, N_PRIOR_RATE)})
     if min_curve is not None:
         rows.append({"STAT": "MINUTES", "TARGET": "minutes", "curve": min_curve, "N": min_cnt, "default": N_PRIOR_MIN})
     out: List[Dict[str, Any]] = []
@@ -957,7 +963,8 @@ MAX_CELL_LIFT = 0.60
 ABBR_ALIAS: Dict[str, str] = {"GS": "GSW", "NY": "NYK", "SA": "SAS", "NO": "NOP", "UTAH": "UTA", "WSH": "WAS", "PHO": "PHX", "BKLN": "BKN"}
 OPP_SHRINK_G, OPP_STAT_BOUNDS, OPP_BLEND = 12.0, (0.88, 1.12), 0.5
 DEFAULT_ADJ: Dict[str, Any] = {"injuries": True, "opp_stat": True, "vegas": True, "absorb_scale": 1.0,
-                               "manual_out": [], "manual_q": [], "manual_in": [], "role_auto": True, "role_changed": []}
+                               "manual_out": [], "manual_q": [], "manual_in": [], "role_auto": True, "role_changed": [],
+                               "per_stat_prior": True, "n0_by_stat": None}
 
 
 def _status_to_p_out(status: str, text: str) -> float:
@@ -1377,6 +1384,18 @@ def this_season_avg(played: pd.DataFrame, stat_col: str) -> Optional[float]:
     return float(np.mean(vals)) if len(vals) else None
 
 
+def stat_prior_weights(stat_col: str, prior_weights: Optional[Tuple[float, float]], cfg: Mapping[str, Any]) -> Tuple[float, float]:
+    """
+    Last-season weights (rate, minutes) for this stat, in pseudo-games:
+        rate    = per-stat calibrated weight (cfg['n0_by_stat'] or N_PRIOR_RATE_BY_STAT) when per-stat weights are on,
+                  else the slider value; stats without their own weight use the slider value
+        minutes = the slider value (one weight for minutes)"""
+    rate, minutes = (float(x) for x in (prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)))
+    if cfg.get("per_stat_prior", True):
+        rate = float((cfg.get("n0_by_stat") or N_PRIOR_RATE_BY_STAT).get(stat_col, rate))
+    return rate, minutes
+
+
 def role_shift(cur_m: np.ndarray, pri_m: np.ndarray) -> Optional[Dict[str, float]]:
     """
     Detect a new role from minutes:
@@ -1785,7 +1804,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_state = own_b2b_status(prev_date, game_day)
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
-        base_w = tuple(float(x) for x in (prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)))
+        base_w = stat_prior_weights(stat_col, prior_weights, cfg)
         manual_role = _clean_name(player_name) in {_clean_name(x) for x in cfg.get("role_changed", [])}
         shift = role_shift(cur["MINUTES"].to_numpy(float), pri["MINUTES"].to_numpy(float)) if cfg.get("role_auto", True) else None
         pw = role_adjusted_weights(base_w, shift, manual_role)
@@ -2785,10 +2804,16 @@ def render_backtest() -> None:
         rate_rows, min_rows = pw[pw["TARGET"] == "per-minute rate"], pw[pw["TARGET"] == "minutes"]
         if not rate_rows.empty and not min_rows.empty:
             rate_pick, min_pick = int(round(float(rate_rows["N0_BEST"].median()))), int(round(float(min_rows["N0_BEST"].iloc[0])))
-            if st.button(f"✅ Apply: rate {rate_pick} / minutes {min_pick} pseudo-games", key="apply_pw"):
+            by_stat = {str(r.STAT): float(r.N0_BEST) for r in rate_rows.itertuples()}
+            if st.button(f"✅ Apply: each stat's own weight, minutes {min_pick} pseudo-games", key="apply_pw"):
                 ss["pw_pending"] = (rate_pick, min_pick)
-                save_prior_file({"rate": rate_pick, "minutes": min_pick})
+                ss["n0_by_stat"] = by_stat
+                save_prior_file({"rate": rate_pick, "minutes": min_pick, "by_stat": by_stat})
                 st.rerun()
+            st.caption("Streamlit Cloud forgets applied weights when the app restarts. To keep them, paste this over the matching "
+                       "lines near the top of app.py:")
+            st.code(f"N_PRIOR_RATE = {float(rate_pick)}\nN_PRIOR_MIN = {float(min_pick)}\n"
+                    f"N_PRIOR_RATE_BY_STAT: Dict[str, float] = {json.dumps(by_stat)}", language="python")
     elif pw is not None:
         st.warning("Not enough player-seasons with a prior season. Select at least two completed seasons (e.g. 2025 and 2024) and more players per team.")
     active = ss.get("b2b_effects")
@@ -2811,7 +2836,8 @@ def _adj_cfg() -> Dict[str, Any]:
             "absorb_scale": float(ss["adj_absorb"]),
             "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
             "manual_in": _split_names(ss["adj_in"]),
-            "role_auto": bool(ss.get("adj_role_auto", True)), "role_changed": _split_names(ss.get("adj_role", ""))}
+            "role_auto": bool(ss.get("adj_role_auto", True)), "role_changed": _split_names(ss.get("adj_role", "")),
+            "per_stat_prior": bool(ss.get("adj_per_stat", True)), "n0_by_stat": ss.get("n0_by_stat")}
 
 
 def player_team_name(player_name: str) -> Optional[str]:
@@ -3217,7 +3243,7 @@ def main() -> None:
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
                          ("under", -110), ("opp", AUTO_OPP), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et()),
                          ("adj_inj", True), ("adj_opp", True), ("adj_absorb", 1.0), ("adj_out", ""), ("adj_q", ""), ("adj_in", ""),
-                         ("adj_vegas", True), ("board_vegas", None), ("adj_role_auto", True), ("adj_role", "")):
+                         ("adj_vegas", True), ("board_vegas", None), ("adj_role_auto", True), ("adj_role", ""), ("adj_per_stat", True)):
         ss.setdefault(key, default)
     _apply_open_request()
     if "b2b_effects" not in ss:
@@ -3225,6 +3251,7 @@ def main() -> None:
     if "n0_rate" not in ss:
         saved = load_prior_file() or {}
         ss["n0_rate"], ss["n0_min"] = int(saved.get("rate", N_PRIOR_RATE)), int(saved.get("minutes", N_PRIOR_MIN))
+        ss["n0_by_stat"] = saved.get("by_stat") or None
     if ss.get("pw_pending"):                       # applied from the backtest tab; must be set before the sliders exist
         ss["n0_rate"], ss["n0_min"] = ss.pop("pw_pending")
     if "bet_log" not in ss:
@@ -3337,6 +3364,12 @@ def main() -> None:
             st.caption("Weight w means last season counts like w extra games next to this season's n games, so its share is w / (n + w). "
                        "0 = trust this season only. Rates are stable year to year (higher weight); minutes and roles change more (lower). "
                        "Press Evaluate to apply. Use the B2B Backtest tab to estimate these from data.")
+            st.checkbox("Use each stat's own calibrated rate weight (recommended)", key="adj_per_stat",
+                        help="Threes lean almost fully on this season (2); steals and blocks lean on last season (24-32). "
+                             "Untick to use the rate slider for every stat.")
+            st.caption("Per-stat rate weights in use: " + ", ".join(
+                f"{k.title()} {v:g}" for k, v in (ss.get("n0_by_stat") or N_PRIOR_RATE_BY_STAT).items())
+                + ". The rate slider applies only to stats not listed (or to all when unticked); the minutes slider always applies.")
             st.checkbox("Detect role changes automatically (his last 5 games' minutes moved 6+ min or 25%+ from last season)", key="adj_role_auto",
                         help="When it fires, last season's minutes are ignored and its per-minute rate counts half, because last season "
                              "describes a different job.")
