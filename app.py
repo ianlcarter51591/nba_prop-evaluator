@@ -172,6 +172,11 @@ N_PRIOR_RATE = 12.0
 N_PRIOR_MIN = 6.0
 PRIOR_GRID: List[float] = [0, 2, 4, 6, 8, 12, 16, 24, 32, 48, 80]
 EARLY_GAMES = 15
+# Role change: when his recent minutes moved this far from last season's, last season describes a different job.
+ROLE_SHIFT_MIN, ROLE_SHIFT_FRAC = 6.0, 0.25     # minutes change >= max(6, 25% of last season's minutes)
+ROLE_RECENT_N, ROLE_MIN_GAMES = 5, 3            # compare his last 5 games this season (needs 3+) ...
+ROLE_PRIOR_N = 20                               # ... with his last 20 games last season
+ROLE_RATE_CUT = 0.5                             # on a role change: last season's minutes weight -> 0, per-minute weight halved
 PRIOR_PATH = "prior_weights.json"
 WINDOW = 10
 DECAY = 0.8
@@ -952,7 +957,7 @@ MAX_CELL_LIFT = 0.60
 ABBR_ALIAS: Dict[str, str] = {"GS": "GSW", "NY": "NYK", "SA": "SAS", "NO": "NOP", "UTAH": "UTA", "WSH": "WAS", "PHO": "PHX", "BKLN": "BKN"}
 OPP_SHRINK_G, OPP_STAT_BOUNDS, OPP_BLEND = 12.0, (0.88, 1.12), 0.5
 DEFAULT_ADJ: Dict[str, Any] = {"injuries": True, "opp_stat": True, "vegas": True, "absorb_scale": 1.0,
-                               "manual_out": [], "manual_q": [], "manual_in": []}
+                               "manual_out": [], "manual_q": [], "manual_in": [], "role_auto": True, "role_changed": []}
 
 
 def _status_to_p_out(status: str, text: str) -> float:
@@ -1372,6 +1377,44 @@ def this_season_avg(played: pd.DataFrame, stat_col: str) -> Optional[float]:
     return float(np.mean(vals)) if len(vals) else None
 
 
+def role_shift(cur_m: np.ndarray, pri_m: np.ndarray) -> Optional[Dict[str, float]]:
+    """
+    Detect a new role from minutes:
+        recent = mean of his last ROLE_RECENT_N games this season (needs ROLE_MIN_GAMES+)
+        before = mean of his last ROLE_PRIOR_N games last season
+        role change if |recent - before| >= max(ROLE_SHIFT_MIN, ROLE_SHIFT_FRAC * before)
+    Returns {"recent", "before", "shift"} or None."""
+    cur = np.asarray(cur_m, float)
+    cur = cur[cur > 0]
+    pri = np.asarray(pri_m, float)[-ROLE_PRIOR_N:]
+    pri = pri[pri > 0]
+    if len(cur) < ROLE_MIN_GAMES or len(pri) < ROLE_MIN_GAMES:
+        return None
+    recent, before = float(np.mean(cur[-ROLE_RECENT_N:])), float(np.mean(pri))
+    shift = recent - before
+    if abs(shift) < max(ROLE_SHIFT_MIN, ROLE_SHIFT_FRAC * before):
+        return None
+    return {"recent": recent, "before": before, "shift": shift}
+
+
+def role_adjusted_weights(n0: Tuple[float, float], shift: Optional[Mapping[str, float]], manual: bool) -> Tuple[float, float]:
+    """Last-season weights (rate, minutes) after a role change: minutes weight 0, rate weight x ROLE_RATE_CUT. Unchanged otherwise."""
+    if not (shift or manual):
+        return float(n0[0]), float(n0[1])
+    return float(n0[0]) * ROLE_RATE_CUT, 0.0
+
+
+def role_override_note(player: str, shift: Optional[Mapping[str, float]], manual: bool, n0: Tuple[float, float],
+                       used: Tuple[float, float]) -> str:
+    """Plain-English warning for the role-change override ('' when it didn't fire)."""
+    if not (shift or manual):
+        return ""
+    why = (f"{player} is averaging {shift['recent']:.0f} min over his last games this season vs {shift['before']:.0f} last season"
+           if shift else f"{player} is on your 'Role changed' list")
+    return (f"🔄 New role: {why}, so last season's minutes are ignored and its per-minute rate counts half "
+            f"({n0[0]:g} → {used[0]:g} pseudo-games). The projection leans on this season only.")
+
+
 def role_change_warning(player: str, inj: Mapping[str, Any], side: Optional[str], line: float, season_avg: Optional[float]) -> str:
     """A loud note when the app leans Under on a player whose role grows tonight: a key teammate is out and the line sits
     well above (10%+) his season average, i.e. the market has already priced the bigger role. '' otherwise."""
@@ -1742,16 +1785,21 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         own_state = own_b2b_status(prev_date, game_day)
         own_mult = own_b2b_multiplier(own_state, stat_col, (b2b_effects or {}).get("own"))
 
+        base_w = tuple(float(x) for x in (prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)))
+        manual_role = _clean_name(player_name) in {_clean_name(x) for x in cfg.get("role_changed", [])}
+        shift = role_shift(cur["MINUTES"].to_numpy(float), pri["MINUTES"].to_numpy(float)) if cfg.get("role_auto", True) else None
+        pw = role_adjusted_weights(base_w, shift, manual_role)
+        role_note = role_override_note(player_name, shift, manual_role, base_w, pw)
         inj_out: Dict[str, Any] = {"minutes_extra": 0.0, "usage_mult": 1.0, "table": [], "notes": [], "usg": None, "team": None,
                                    "listed": [], "feed_ok": True, "checked": False, "self_status": ""}
         if cfg["injuries"]:
             try:
-                inj_out = injury_adjustment(player_name, stat_col, cur, cfg, tuple(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)), len(pri) > 0)
+                inj_out = injury_adjustment(player_name, stat_col, cur, cfg, pw, len(pri) > 0)
             except Exception as e:
                 inj_out["notes"].append(f"Injury adjustment unavailable ({e}); none applied.")
         proj = build_projection(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float),
                                 pri[stat_col].to_numpy(float), pri["MINUTES"].to_numpy(float), opp_mult * b2b_mult * own_mult,
-                                *(prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN)),
+                                *pw,
                                 extra_min=inj_out["minutes_extra"], usage_mult=inj_out["usage_mult"])
         proj, without_info = blend_without(proj, inj_out.get("key_out"), opp_mult * b2b_mult * own_mult)
         inj_out["without_blend"] = without_info
@@ -1761,8 +1809,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             unseen = bool(key) and not (key.get("without") or {}).get("n")
             m_sd = minutes_sd(cur["MINUTES"].to_numpy(float), pri["MINUTES"].to_numpy(float), proj.minutes, inj_out["minutes_extra"], unseen)
             cv_r = rate_cv(cur[stat_col].to_numpy(float), cur["MINUTES"].to_numpy(float), pri[stat_col].to_numpy(float),
-                           pri["MINUTES"].to_numpy(float), (prior_weights or (N_PRIOR_RATE, N_PRIOR_MIN))[0])
-            est = float(np.sqrt(1.0 + 1.0 / max(proj.n_current + (N_PRIOR_RATE if proj.n_prior else 0.0), 1.0)))
+                           pri["MINUTES"].to_numpy(float), pw[0])
+            est = float(np.sqrt(1.0 + 1.0 / max(proj.n_current + (pw[0] if proj.n_prior else 0.0), 1.0)))
             sims, min_draws = simulate_with_minutes(proj.mu, proj.minutes, m_sd, cv_r, est, count_stat)
             minutes_range = {"sd": m_sd, "p10": float(np.percentile(min_draws, 10)), "p90": float(np.percentile(min_draws, 90)), "rate_cv": cv_r}
         else:
@@ -1815,6 +1863,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
         role = role_change_warning(player_name, inj_out, six.get("best") if six else None, float(line), this_season_avg(played, stat_col))
         if role:
             warnings.insert(0, role)
+        if role_note:
+            warnings.insert(0, role_note)
         if b2b_note:
             warnings.append(b2b_note)
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
@@ -1828,6 +1878,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "hit5": int(np.sum(vals[-5:] > line)), "n5": len(vals[-5:]),
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
             "context_checks": context_checks, "this_season": this_season, "six_point": six,
+            "role_shift": {"auto": shift, "manual": manual_role, "weights": pw} if role_note else None,
             "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
@@ -2759,7 +2810,8 @@ def _adj_cfg() -> Dict[str, Any]:
     return {"injuries": ss["adj_inj"], "opp_stat": ss["adj_opp"], "vegas": bool(ss.get("adj_vegas", True)),
             "absorb_scale": float(ss["adj_absorb"]),
             "manual_out": _split_names(ss["adj_out"]), "manual_q": _split_names(ss["adj_q"]),
-            "manual_in": _split_names(ss["adj_in"])}
+            "manual_in": _split_names(ss["adj_in"]),
+            "role_auto": bool(ss.get("adj_role_auto", True)), "role_changed": _split_names(ss.get("adj_role", ""))}
 
 
 def player_team_name(player_name: str) -> Optional[str]:
@@ -3165,7 +3217,7 @@ def main() -> None:
     for key, default in (("player", "Jayson Tatum"), ("stat", STATS[0]), ("line", 26.5), ("over", -110),
                          ("under", -110), ("opp", AUTO_OPP), ("board_teams", []), ("editor_ver", 0), ("game_date", _today_et()),
                          ("adj_inj", True), ("adj_opp", True), ("adj_absorb", 1.0), ("adj_out", ""), ("adj_q", ""), ("adj_in", ""),
-                         ("adj_vegas", True), ("board_vegas", None)):
+                         ("adj_vegas", True), ("board_vegas", None), ("adj_role_auto", True), ("adj_role", "")):
         ss.setdefault(key, default)
     _apply_open_request()
     if "b2b_effects" not in ss:
@@ -3285,6 +3337,12 @@ def main() -> None:
             st.caption("Weight w means last season counts like w extra games next to this season's n games, so its share is w / (n + w). "
                        "0 = trust this season only. Rates are stable year to year (higher weight); minutes and roles change more (lower). "
                        "Press Evaluate to apply. Use the B2B Backtest tab to estimate these from data.")
+            st.checkbox("Detect role changes automatically (his last 5 games' minutes moved 6+ min or 25%+ from last season)", key="adj_role_auto",
+                        help="When it fires, last season's minutes are ignored and its per-minute rate counts half, because last season "
+                             "describes a different job.")
+            st.text_input("Role changed (comma-separated players: traded, new starter, minutes limit)", key="adj_role",
+                          help="Forces the same override for these players even when minutes haven't moved yet, e.g. a trade or "
+                               "a promotion announced today.")
         with st.expander("🩺 Injuries, usage & matchup settings", expanded=False):
             st.checkbox("Adjust for injured / returning teammates (usage + minutes redistribution)", key="adj_inj")
             st.checkbox("Stat-specific opponent factors (loads league logs: about 30-60s the first time, then cached)", key="adj_opp")
@@ -3366,4 +3424,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
