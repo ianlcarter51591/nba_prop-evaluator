@@ -47,6 +47,7 @@ SHARP_SIX = 5
 VIEW_ALL, VIEW_SHARP, VIEW_PIN, VIEW_GAP = "All ranked picks", "5/6 & 6/6 with a matchup edge", "Pinnacle agrees", "Pinnacle line differs"
 VIEWS = [VIEW_ALL, VIEW_SHARP, VIEW_PIN, VIEW_GAP]
 GAP_MIN_LINE = 0.5            # Pinnacle's line at least this far from DraftKings' counts as a line gap
+BIG_GAP_PP = 3.5              # Pinnacle-vs-DraftKings gaps over this lost money in the graded props: hidden by default in "Pinnacle agrees"
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
 ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE"]
 SHOW_COLS = ["PICK", "GAME", "ODDS", "BLEND_%", "EV_%", "OPP_VS_POS", "SIX", "PIN", "BOTH"]
@@ -180,7 +181,9 @@ def display(ranked: pd.DataFrame, top: int = 25, details: bool = False, extra: S
         "MODEL_%": d["P_MODEL"].round(1), "MARKET_%": d["P_MARKET"].round(1),
         "BLEND_%": pd.to_numeric(d["BLEND_%"], errors="coerce").round(1) if "BLEND_%" in d else d["P_MODEL"].round(1), "EDGE_PP": d["EDGE_PP"].round(1), "EV_%": d["EV_%"].round(1),
         "OPP_VS_POS": vs, "MODEL": d["MODEL"].round(0), "MATCHUP": d["MATCHUP"].round(0), "SCORE": d["SCORE"].round(1),
-        "BOTH": d["BOTH"].map({True: "✓", False: ""}), "SIX": d["SIX"].map(lambda x: "" if x is None or pd.isna(x) else f"{int(x)}/6"), "PIN": d["PIN"],
+        "BOTH": d["BOTH"].map({True: "✓", False: ""}), "SIX": d["SIX"].map(lambda x: "" if x is None or pd.isna(x) else f"{int(x)}/6"),
+        "PIN": [f"{p} ⚠️ big gap: check news" if pd.notna(gp) and abs(gp) > BIG_GAP_PP else p
+                for p, gp in zip(d["PIN"], pd.to_numeric(d.get("PIN_GAP", pd.Series(np.nan, index=d.index)), errors="coerce"))],
         "PIN_EDGE": pd.to_numeric(d.get("PIN_GAP", pd.Series(np.nan, index=d.index)), errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:+.1f} pts"),
         "PIN_VS_DK": [("" if pd.isna(p) else f"{p:g} vs {l:g}") for p, l in zip(pd.to_numeric(d.get("PIN_LINE", pd.Series(np.nan, index=d.index)), errors="coerce"), d["LINE"])],
         "FAVORS": [(f"{f} ✓" if m else f) for f, m in zip(d.get("GAP_FAVORS", pd.Series("", index=d.index)), d.get("GAP_MATCH", pd.Series(False, index=d.index)))]},
@@ -338,6 +341,10 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     hide_neg = view_name in (VIEW_SHARP, VIEW_PIN) and bool(st.checkbox(
         "Hide negative-EV picks", value=True, key="bp_hide_neg",
         help="Hides props whose price at DraftKings is too short to profit even if the pick is right. They are still saved for grading."))
+    hide_big = view_name == VIEW_PIN and bool(st.checkbox(
+        f"Hide Pinnacle gaps over {BIG_GAP_PP:g} pts", value=True, key="bp_hide_big",
+        help="Gaps that big usually mean news, a stale line or a rough line conversion, and they lost money in your graded props. Hidden picks "
+             "are still saved; Daily results → 'Pinnacle agrees, gap over 3.5' shows how they do."))
     c7, c8 = st.columns(2)
     per_game = int(c7.number_input("Max picks per game (0 = no limit)", min_value=0, max_value=20, value=DEFAULT_PER_GAME, step=1, key="bp_per_game",
                                    help="Props from the same game tend to win or lose together, so a list full of one game is riskier than it looks."))
@@ -383,10 +390,15 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
                 st.caption(f"Couldn't save this list for grading ({str(e)[:80]}).")
         n_hidden = 0
         view_rows = {VIEW_SHARP: sharp, VIEW_PIN: agrees, VIEW_GAP: gaps}.get(view_name)
+        n_big = 0
         if view_rows is not None:
             ev_ok = pd.to_numeric(view_rows["EV_%"], errors="coerce") > 0
             n_hidden = int((~ev_ok).sum()) if hide_neg else 0
             ranked = view_rows[ev_ok].reset_index(drop=True) if hide_neg else view_rows
+            if hide_big:
+                big = pd.to_numeric(ranked["PIN_GAP"], errors="coerce").abs() > BIG_GAP_PP
+                n_big = int(big.sum())
+                ranked = ranked[~big].reset_index(drop=True)
             top = max(len(ranked), 1)
         what = {VIEW_SHARP: "are 5/6 or 6/6 with a top-third matchup", VIEW_PIN: "have Pinnacle agreeing with their side",
                 VIEW_GAP: "have a Pinnacle line half a point or more from DraftKings'"}.get(view_name, "")
@@ -395,13 +407,15 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
             st.caption(f"Edges and EV use the market-blended chance: {cal.weight_note(info)}. BOTH ✓ = still +EV after the blend and a top-third matchup.")
         age = int((time.time() - float(ss.get("bp_time", time.time()))) // 60)
         st.caption(f"Last scan {age} min ago. {ss.get('bp_note', '')} "
-                   + (f"{len(ranked) + n_hidden} of {len(rows)} props {what}"
-                      + (f"; {n_hidden} with negative EV hidden." if n_hidden else ".") if filtered_view
+                   + (f"{len(ranked) + n_hidden + n_big} of {len(rows)} props {what}"
+                      + (f"; {n_hidden} with negative EV hidden" if n_hidden else "")
+                      + (f"; {n_big} with a Pinnacle gap over {BIG_GAP_PP:g} pts hidden" if n_big else "") + "." if filtered_view
                       else f"{len(ranked)} of {len(rows)} props clear the minimum edge."))
         for e in (ss.get("bp_errors") or [])[:5]:
             st.warning(e)
         if ranked.empty:
-            st.info((f"All {n_hidden} props that {what} have negative EV, so they're hidden. Untick Hide negative-EV picks to see them." if n_hidden else
+            st.info((f"All {n_hidden + n_big} props that {what} are hidden (negative EV or a Pinnacle gap over {BIG_GAP_PP:g} pts). Untick the "
+                     "Hide boxes to see them." if n_hidden + n_big else
                      f"No prop {what.replace('are ', 'is ', 1).replace('have ', 'has ', 1)} right now. Scan more stats or games (Pinnacle views need "
                      "Pinnacle's prices, which come with each board), or switch to All ranked picks.")
                     if filtered_view else "No prop clears the minimum edge right now. Lower it to see more.")
