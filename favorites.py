@@ -163,7 +163,8 @@ def tag_best_picks(snaps: Optional[pd.DataFrame], rows: pd.DataFrame) -> pd.Data
     """Save the latest Best Picks list on the props' snapshots: BP_RANK (1 = top; the row's RANK when given), BP_SIDE (the side ranked),
     BP_BOTH ('Y' for ✓), BP_SHARP ('Y' for 5/6 or 6/6 with a top-third matchup), BP_EV (the EV % shown), BP_PIN ('Y' when Pinnacle
     agrees with the side) and BP_GAPSIDE (the side Pinnacle's different line favors at DraftKings, '' when the lines match).
-    Tags on other pending props are cleared, so pending tags always describe the latest list; graded props keep theirs."""
+    Tags are replaced only on the game day(s) this list covers (the dates of the props it matched), so scanning tomorrow's slate never
+    wipes tonight's list; on those days, pending props left off the new list lose their old tags. Graded props keep theirs."""
     d = _with_fav(snaps)
     if d.empty or "SNAP_ID" not in d.columns:
         return d
@@ -173,11 +174,15 @@ def tag_best_picks(snaps: Optional[pd.DataFrame], rows: pd.DataFrame) -> pd.Data
     for c in ("BP_RANK", "BP_EV"):
         if c not in d.columns:
             d[c] = np.nan
-    pend = d["STATUS"] == "Pending"
-    d.loc[pend, ["BP_SIDE", "BP_BOTH", "BP_SHARP", "BP_PIN", "BP_GAPSIDE"]] = ""
-    d.loc[pend, ["BP_RANK", "BP_EV"]] = np.nan
-    for i, (_, r) in enumerate(rows.iterrows(), start=1):
-        sid = find_id(d, r["PLAYER"], r["STAT"], r["LINE"])
+    ids = [find_id(d, r["PLAYER"], r["STAT"], r["LINE"]) for _, r in rows.iterrows()]
+    found = d["SNAP_ID"].isin({s for s in ids if s})
+    date_col = next((c for c in ("GAME_DATE", "GAMEDAY") if c in d.columns
+                     and (d.loc[found, c].fillna("").astype(str).str.strip().replace("nan", "") != "").all() and found.any()), None)
+    days = set(d.loc[found, date_col].astype(str)) if date_col else set()
+    clear = (d["STATUS"] == "Pending") & (d[date_col].astype(str).isin(days) if date_col else found)
+    d.loc[clear, ["BP_SIDE", "BP_BOTH", "BP_SHARP", "BP_PIN", "BP_GAPSIDE"]] = ""
+    d.loc[clear, ["BP_RANK", "BP_EV"]] = np.nan
+    for i, ((_, r), sid) in enumerate(zip(rows.iterrows(), ids), start=1):
         if sid:
             on = d["SNAP_ID"] == sid
             d.loc[on, ["BP_SIDE", "BP_BOTH", "BP_SHARP", "BP_PIN", "BP_GAPSIDE"]] = [
