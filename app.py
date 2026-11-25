@@ -40,6 +40,8 @@ def _startup_problems() -> List[str]:
                        ("favorites", ("legs", "option_table", "set_flags", "toggle", "find_id", "star_many", "mark_placed", "snap_id_for_leg", "tag_best_picks")),
                        ("best_picks", ("render", "make_row", "rank_picks", "selected_row", "cap_per_game", "sharp_picks")),
                        ("prop_review", ("fit_blend", "blend", "render_blend_banner", "render_calibration", "record_close", "compute_clv", "clv_summary", "render_clv", "render_daily", "day_counts", "graded_days")),
+                       ("shadow_models", ("shrunk_pct", "makes_from_attempts", "summarize", "has_attempts", "has_shots",
+                                          "usage_cv", "simulate_points", "compare", "render")),
                        ("shared_ui", ("render_storage_status", "render_validation", "render_parlay", "render_place_bet", "render_favorites", "render_star_button", "clickable_table", "render_tracked_place_bet"))):
         try:
             m = importlib.import_module(mod)
@@ -78,6 +80,7 @@ import odds_credits
 import pin_check
 import best_picks
 import prop_review
+import shadow_models
 
 DATE_COL_CLV = "GAME_DATE"
 import shared_ui
@@ -505,10 +508,12 @@ def _espn_fetch_logs(pid: str, season: Optional[int] = None) -> pd.DataFrame:
                     pts, reb, ast = parse_val(rec.get("PTS")), parse_val(rec.get("REB")), parse_val(rec.get("AST"))
                     rows.append({
                         "POINTS": pts, "REBOUNDS": reb, "ASSISTS": ast,
-                        "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "PTS + REB + AST": pts + reb + ast,
+                        "3-POINTERS MADE": _split_made(rec.get("3PT", 0)), "3PA": _split_att(rec.get("3PT", 0)),
+                        "PTS + REB + AST": pts + reb + ast,
                         "PTS + AST": pts + ast, "PTS + REB": pts + reb, "REB + AST": reb + ast,
                         "STEALS": parse_val(rec.get("STL")), "BLOCKS": parse_val(rec.get("BLK")),
                         "FGA": _split_att(rec.get("FG", 0)), "FTA": _split_att(rec.get("FT", 0)), "TOV": parse_val(rec.get("TO")),
+                        "FGM": _split_made(rec.get("FG", 0)), "FTM": _split_made(rec.get("FT", 0)),
                         "MINUTES": parse_val(rec.get("MIN")),
                         "OPPONENT": f"{sep} {opp}",
                         "DATE": (lambda d: d.isoformat() if d else str(info.get("gameDate", ""))[:10])(_to_et_date(info.get("gameDate", ""))),
@@ -531,10 +536,10 @@ def _nba_api_fetch_logs(raw_input: str, season: str) -> pd.DataFrame:
         return pd.DataFrame()
     num = lambda c: pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return pd.DataFrame({
-        "POINTS": num("PTS"), "REBOUNDS": num("REB"), "ASSISTS": num("AST"), "3-POINTERS MADE": num("FG3M"),
+        "POINTS": num("PTS"), "REBOUNDS": num("REB"), "ASSISTS": num("AST"), "3-POINTERS MADE": num("FG3M"), "3PA": num("FG3A"),
         "PTS + REB + AST": num("PTS") + num("REB") + num("AST"), "STEALS": num("STL"), "BLOCKS": num("BLK"),
         "PTS + AST": num("PTS") + num("AST"), "PTS + REB": num("PTS") + num("REB"), "REB + AST": num("REB") + num("AST"),
-        "FGA": num("FGA"), "FTA": num("FTA"), "TOV": num("TOV"),
+        "FGA": num("FGA"), "FTA": num("FTA"), "TOV": num("TOV"), "FGM": num("FGM"), "FTM": num("FTM"),
         "MINUTES": num("MIN"), "OPPONENT": df["MATCHUP"].astype(str),
         "DATE": pd.to_datetime(df["GAME_DATE"], errors="coerce").dt.strftime("%Y-%m-%d"),
     })
@@ -1688,6 +1693,53 @@ def simulate_with_minutes(mu: float, proj_min: float, min_sd: float, cv_rate: fl
     return np.maximum(np.rint(rng.normal(mean, sd)), 0.0), mins
 
 
+def _shot_mean(col: str, cur: pd.DataFrame, pri: pd.DataFrame, proj: Projection, pw: Tuple[float, float], mult: float,
+               inj_out: Mapping[str, Any]) -> float:
+    """Projected attempts of one shot type at the main model's projected minutes (same weights, multipliers, injury shift)."""
+    a = build_projection(cur[col].to_numpy(float), cur["MINUTES"].to_numpy(float), pri[col].to_numpy(float),
+                         pri["MINUTES"].to_numpy(float), mult, *pw,
+                         extra_min=inj_out.get("minutes_extra", 0.0), usage_mult=inj_out.get("usage_mult", 1.0))
+    return float(a.mu * proj.minutes / max(a.minutes, 1e-6))
+
+
+def _shot_pct(played: pd.DataFrame, pri: pd.DataFrame, made: str, att: str, shot: str,
+              sub: Optional[Tuple[str, str]] = None) -> Tuple[float, float]:
+    """Shrunk make % for one shot type; `sub` = (made, att) columns to subtract (twos = field goals minus threes)."""
+    season = played[played["SEASON"] == "current"]
+    tot = lambda d, c: float(d[c].sum()) - (float(d[sub[0] if c == made else sub[1]].sum()) if sub else 0.0)
+    return shadow_models.shrunk_pct(tot(season, made), tot(season, att), tot(pri, made), tot(pri, att), shot)
+
+
+def shadow_projection(stat_col: str, played: pd.DataFrame, cur: pd.DataFrame, pri: pd.DataFrame, proj: Projection,
+                      pw: Tuple[float, float], mult: float, inj_out: Mapping[str, Any], line: float, m_sd: float,
+                      est: float) -> Optional[Dict[str, float]]:
+    """
+    Shot-based shadow projection for Points or 3-Pointers Made (see shadow_models.py), on the main model's minutes,
+    multipliers, injury shift and last-season weights. None for other stats or when the logs lack shot columns."""
+    if stat_col == shadow_models.THREES and shadow_models.has_attempts(cur, pri):
+        mu_a = _shot_mean("3PA", cur, pri, proj, pw, mult, inj_out)
+        cv_a = rate_cv(cur["3PA"].to_numpy(float), cur["MINUTES"].to_numpy(float), pri["3PA"].to_numpy(float),
+                       pri["MINUTES"].to_numpy(float), pw[0])
+        att, _ = simulate_with_minutes(mu_a, proj.minutes, m_sd, cv_a, est, True)
+        p, n_eff = _shot_pct(played, pri, "3-POINTERS MADE", "3PA", "3")
+        return shadow_models.summarize(shadow_models.makes_from_attempts(att, p, n_eff), float(line), attempts=float(np.mean(att)),
+                                       pct=p * 100.0)
+    if stat_col == shadow_models.POINTS and shadow_models.has_shots(cur, pri):
+        mu = {c: _shot_mean(c, cur, pri, proj, pw, mult, inj_out) for c in ("FGA", "3PA", "FTA")}
+        cv_f = rate_cv(cur["FGA"].to_numpy(float), cur["MINUTES"].to_numpy(float), pri["FGA"].to_numpy(float),
+                       pri["MINUTES"].to_numpy(float), pw[0])
+        _, mins = simulate_with_minutes(mu["FGA"], proj.minutes, m_sd, cv_f, est, True)     # same minutes draws as the main model
+        pct = {"3": _shot_pct(played, pri, "3-POINTERS MADE", "3PA", "3"),
+               "2": _shot_pct(played, pri, "FGM", "FGA", "2", sub=("3-POINTERS MADE", "3PA")),
+               "FT": _shot_pct(played, pri, "FTM", "FTA", "FT")}
+        sim = shadow_models.simulate_points(mins, proj.minutes, mu["FGA"], mu["3PA"], mu["FTA"],
+                                            shadow_models.usage_cv(cv_f * est, mu["FGA"]), pct)
+        return shadow_models.summarize(sim["points"], float(line), fga=float(np.mean(sim["fga"])),
+                                       three_share=float(mu["3PA"] / max(mu["FGA"], 1e-6) * 100.0),
+                                       sd=float(np.std(sim["points"])))
+    return None
+
+
 def implied_prob(odds: float) -> float:
     o = float(odds)
     return -o / (-o + 100.0) if o < 0 else 100.0 / (o + 100.0)
@@ -1836,6 +1888,16 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             sims, minutes_range = simulate(proj.mu, proj.sigma, count_stat), None
         p_over, p_under = float(np.mean(sims > line)), float(np.mean(sims < line))
         decided = max(p_over + p_under, 1e-9)
+        shadow = None
+        if stat_col in (shadow_models.THREES, shadow_models.POINTS):     # shadow test only: never changes the pick
+            try:
+                s_sd = minutes_range["sd"] if minutes_range else minutes_sd(cur["MINUTES"].to_numpy(float), pri["MINUTES"].to_numpy(float),
+                                                                            proj.minutes, inj_out["minutes_extra"], False)
+                s_est = float(np.sqrt(1.0 + 1.0 / max(proj.n_current + (pw[0] if proj.n_prior else 0.0), 1.0)))
+                shadow = shadow_projection(stat_col, played, cur, pri, proj, pw, opp_mult * b2b_mult * own_mult, inj_out,
+                                           float(line), s_sd, s_est)
+            except Exception:
+                shadow = None
         dv_over, dv_under = devig(over_odds, under_odds)
         ev_over = p_over * payout(over_odds) - p_under
         ev_under = p_under * payout(under_odds) - p_over
@@ -1898,6 +1960,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
             "context_checks": context_checks, "this_season": this_season, "six_point": six,
             "role_shift": {"auto": shift, "manual": manual_role, "weights": pw} if role_note else None,
+            "shadow": shadow,
             "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
@@ -2714,6 +2777,7 @@ def render_snapshots() -> None:
         st.dataframe(pins.round(1), use_container_width=True, hide_index=True)
     try:
         prop_review.render_calibration(st, snaps)
+        shadow_models.render(st, snaps)
     except Exception as e:
         st.caption(f"Calibration report unavailable ({str(e)[:80]}).")
     try:
