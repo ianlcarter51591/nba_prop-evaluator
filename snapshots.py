@@ -28,7 +28,8 @@ TEXT_COLS: List[str] = ["SNAP_ID", "TS_ET", "GAME_DATE", "GAME", "PLAYER", "STAT
                         "TIER_SHOWN", "FAILED_OVER", "FAILED_UNDER", "STATUS", "SHOWN_RESULT", "EV_RESULT", "WHY", "OVER_LINK", "UNDER_LINK", "PIN_FLAG", "FAV", "CLOSE_TS", "PLACED_KIND", "PLACED_SIDE", "PLACED_TS", "BP_SIDE", "BP_BOTH", "BP_SHARP", "BP_PIN", "BP_GAPSIDE"]
 NUM_COLS: List[str] = ["SEASON", "WEEK", "LINE", "OVER_ODDS", "UNDER_ODDS", "MU", "PROJ_MEAN", "PROJ_MIN", "RAW_AVG", "OPP_MULT", "VEGAS_TOTAL", "MIN_EXTRA",
                        "P_OVER", "P_UNDER", "PM_OVER", "PM_UNDER", "SIX_OVER", "SIX_UNDER", "ACTUAL", "ACTUAL_MIN", "STAT_ERR", "MIN_ERR", "MIN_ERR_PCT", "PIN_LINE", "PIN_P_SIDE", "DK_P_SIDE", "PIN_EV",
-                       "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER", "CLOSE_MIN", "PLACED_ODDS", "BP_RANK", "BP_EV"]
+                       "CLOSE_LINE", "CLOSE_OVER", "CLOSE_UNDER", "CLOSE_MIN", "PLACED_ODDS", "BP_RANK", "BP_EV",
+                       "SHADOW_MU", "SHADOW_P_OVER", "SHADOW_P_UNDER"]
 COLS: List[str] = TEXT_COLS + NUM_COLS
 
 
@@ -63,6 +64,8 @@ def make_row(res: Mapping[str, Any], ctx: Mapping[str, Any], stat_label: str, li
         "OVER_LINK": links[0], "UNDER_LINK": links[1],
         "PIN_FLAG": (pin or {}).get("FLAG", ""), "PIN_LINE": (pin or {}).get("PIN_LINE"), "PIN_P_SIDE": (pin or {}).get("PIN_P_SIDE"),
         "DK_P_SIDE": (pin or {}).get("DK_P_SIDE"), "PIN_EV": (pin or {}).get("PIN_EV"),
+        "SHADOW_MU": (res.get("shadow") or {}).get("mu"), "SHADOW_P_OVER": (res.get("shadow") or {}).get("p_over"),
+        "SHADOW_P_UNDER": (res.get("shadow") or {}).get("p_under"),
     }
 
 
