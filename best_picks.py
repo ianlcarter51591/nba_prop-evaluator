@@ -47,6 +47,7 @@ SHARP_SIX = 5
 VIEW_ALL, VIEW_SHARP, VIEW_PIN, VIEW_GAP = "All ranked picks", "5/6 & 6/6 with a matchup edge", "Pinnacle agrees", "Pinnacle line differs"
 VIEWS = [VIEW_ALL, VIEW_SHARP, VIEW_PIN, VIEW_GAP]
 GAP_MIN_LINE = 0.5            # Pinnacle's line at least this far from DraftKings' counts as a line gap
+MIN_EDGE_DEFAULT = 2.5         # points over DraftKings' no-vig chance: about what -110 needs to beat the juice (the blend shrinks edges)
 BIG_GAP_PP = 3.5              # Pinnacle-vs-DraftKings gaps over this lost money in the graded props: hidden by default in "Pinnacle agrees"
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
 ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE"]
@@ -329,7 +330,9 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
     use_blend = blend_info is not None and bool(st.checkbox("Respect the market (rank by the market-blended chance)", value=True, key="bp_blend",
                                                              help="Blends your model with DraftKings' no-vig price using the weight fitted from your graded props (Snapshots tab)."))
     info = blend_info() if use_blend else None
-    min_edge = float(c4.number_input("Minimum edge (points)", value=0.5, step=0.5, key="bp_min_edge"))
+    min_edge = float(c4.number_input("Minimum edge (points)", value=MIN_EDGE_DEFAULT, step=0.5, key="bp_min_edge",
+                                       help="Your chance (market-blended when Respect the market is on) minus DraftKings' no-vig chance. About 2.5 "
+                                            "points is what a side needs to beat the juice at -110; still check EV_% is positive."))
     top = int(c5.number_input("Show top", min_value=5, max_value=200, value=25, step=5, key="bp_top"))
     timer_label = c6.selectbox("Auto-refresh", list(TIMER_CHOICES), key="bp_timer")
     view_name = st.radio("Show", VIEWS, horizontal=True, key="bp_view",
