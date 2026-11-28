@@ -20,7 +20,9 @@ Side: when the six-point checklist rates a side 5/6 or 6/6, that side is used (t
 otherwise the side with the higher model EV.
 "All ranked picks" view (default): rows are sorted by SCORE, then EV_%.
 "Pinnacle agrees": every prop whose side Pinnacle rates at least 1 point more likely than DraftKings (no-vig, same line or
-    converted to DraftKings' line), sorted by that gap (PIN_GAP, points).
+    converted to DraftKings' line), sorted by PIN_EV = 100 * (Pinnacle's no-vig chance * decimal(DraftKings price) - 1), what the
+    DraftKings bet is worth if Pinnacle is right; then by the gap (PIN_GAP, points). "Hide negative-EV picks" uses PIN_EV here
+    (the blended EV sits near DraftKings' own price, so it is almost always negative and would hide everything).
 "Pinnacle line differs": every prop where Pinnacle's line is GAP_MIN_LINE+ away from DraftKings':
     LINE_GAP = Pinnacle line - DraftKings line;  > 0 favors the Over at DraftKings, < 0 the Under (Pinnacle expects more / less).
     Sorted by |LINE_GAP|; FAVORS shows that side and ✓ when it is also the side ranked. Props whose EDGE_PP is below the minimum edge are dropped, and at most `per_game` picks
@@ -50,7 +52,7 @@ GAP_MIN_LINE = 0.5            # Pinnacle's line at least this far from DraftKing
 MIN_EDGE_DEFAULT = 2.5         # points over DraftKings' no-vig chance: about what -110 needs to beat the juice (the blend shrinks edges)
 BIG_GAP_PP = 3.5              # Pinnacle-vs-DraftKings gaps over this lost money in the graded props: hidden by default in "Pinnacle agrees"
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
-ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE", "RANK_NOTE"]
+ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE", "RANK_NOTE", "PIN_EV"]
 SHOW_COLS = ["PICK", "GAME", "ODDS", "BLEND_%", "EV_%", "OPP_VS_POS", "SIX", "PIN", "BOTH"]
 DETAIL_COLS = ["POS", "MODEL_%", "MARKET_%", "EDGE_PP", "MODEL", "MATCHUP", "SCORE"]
 
@@ -143,12 +145,22 @@ def sharp_picks(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIG
 
 
 def pinnacle_agrees(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGHT, w_blend: Optional[float] = None) -> pd.DataFrame:
-    """Every prop Pinnacle flags 'Agrees' for its side (no minimum edge), biggest Pinnacle-vs-DraftKings gap first."""
+    """Every prop Pinnacle flags 'Agrees' for its side (no minimum edge): best Pinnacle EV at DraftKings' price first, then gap."""
     r = rank_picks(rows, w_model, -1e9, w_blend)
     if r.empty:
         return r
-    r = r[r["PIN_AGREE"]].assign(_G=lambda x: pd.to_numeric(x["PIN_GAP"], errors="coerce"))
-    return r.sort_values(["_G", "SCORE"], ascending=[False, False]).drop(columns="_G").reset_index(drop=True)
+    r = r[r["PIN_AGREE"]].assign(_E=lambda x: pd.to_numeric(x["PIN_EV"], errors="coerce"),
+                                 _G=lambda x: pd.to_numeric(x["PIN_GAP"], errors="coerce"))
+    return r.sort_values(["_E", "_G", "SCORE"], ascending=[False, False, False], na_position="last").drop(columns=["_E", "_G"]).reset_index(drop=True)
+
+
+def view_ev(view_rows: pd.DataFrame, view_name: str) -> pd.Series:
+    """The EV that 'Hide negative-EV picks' tests: Pinnacle's EV at DraftKings' price in the Pinnacle view (the blended EV when a
+    row has no Pinnacle EV, e.g. an older app.py), the market-blended EV elsewhere."""
+    blended = pd.to_numeric(view_rows["EV_%"], errors="coerce")
+    if view_name != VIEW_PIN or "PIN_EV" not in view_rows:
+        return blended
+    return pd.to_numeric(view_rows["PIN_EV"], errors="coerce").fillna(blended)
 
 
 def line_differs(rows: Sequence[Mapping[str, Any]], w_model: float = DEFAULT_WEIGHT, w_blend: Optional[float] = None) -> pd.DataFrame:
@@ -188,6 +200,7 @@ def display(ranked: pd.DataFrame, top: int = 25, details: bool = False, extra: S
         "PIN": [f"{p} ⚠️ big gap: check news" if pd.notna(gp) and abs(gp) > BIG_GAP_PP else p
                 for p, gp in zip(d["PIN"], pd.to_numeric(d.get("PIN_GAP", pd.Series(np.nan, index=d.index)), errors="coerce"))],
         "PIN_EDGE": pd.to_numeric(d.get("PIN_GAP", pd.Series(np.nan, index=d.index)), errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:+.1f} pts"),
+        "PIN_EV": pd.to_numeric(d.get("PIN_EV", pd.Series(np.nan, index=d.index)), errors="coerce").map(lambda x: "" if pd.isna(x) else f"{x:+.1f}%"),
         "PIN_VS_DK": [("" if pd.isna(p) else f"{p:g} vs {l:g}") for p, l in zip(pd.to_numeric(d.get("PIN_LINE", pd.Series(np.nan, index=d.index)), errors="coerce"), d["LINE"])],
         "FAVORS": [(f"{f} ✓" if m else f) for f, m in zip(d.get("GAP_FAVORS", pd.Series("", index=d.index)), d.get("GAP_MATCH", pd.Series(False, index=d.index)))]},
         columns=cols).reset_index(drop=True)
@@ -344,8 +357,10 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
                               "per-game limits only apply to All ranked picks.")
     filtered_view = view_name != VIEW_ALL
     hide_neg = view_name in (VIEW_SHARP, VIEW_PIN) and bool(st.checkbox(
-        "Hide negative-EV picks", value=True, key="bp_hide_neg",
-        help="Hides props whose price at DraftKings is too short to profit even if the pick is right. They are still saved for grading."))
+        "Hide negative-EV picks" + (" (by Pinnacle's EV at DraftKings' price)" if view_name == VIEW_PIN else ""), value=True, key="bp_hide_neg",
+        help=("Hides props that lose money at DraftKings' price even if Pinnacle is right (PIN_EV at or below 0). They are still saved for grading."
+              if view_name == VIEW_PIN else
+              "Hides props whose price at DraftKings is too short to profit even if the pick is right. They are still saved for grading.")))
     hide_big = view_name == VIEW_PIN and bool(st.checkbox(
         f"Hide Pinnacle gaps over {BIG_GAP_PP:g} pts", value=True, key="bp_hide_big",
         help="Gaps that big usually mean news, a stale line or a rough line conversion, and they lost money in your graded props. Hidden picks "
@@ -397,7 +412,7 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
         view_rows = {VIEW_SHARP: sharp, VIEW_PIN: agrees, VIEW_GAP: gaps}.get(view_name)
         n_big = 0
         if view_rows is not None:
-            ev_ok = pd.to_numeric(view_rows["EV_%"], errors="coerce") > 0
+            ev_ok = view_ev(view_rows, view_name) > 0
             n_hidden = int((~ev_ok).sum()) if hide_neg else 0
             ranked = view_rows[ev_ok].reset_index(drop=True) if hide_neg else view_rows
             if hide_big:
@@ -425,7 +440,7 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
                      "Pinnacle's prices, which come with each board), or switch to All ranked picks.")
                     if filtered_view else "No prop clears the minimum edge right now. Lower it to see more.")
         else:
-            extra = {VIEW_PIN: ("PIN_EDGE",), VIEW_GAP: ("PIN_VS_DK", "FAVORS")}.get(view_name, ())
+            extra = {VIEW_PIN: ("PIN_EDGE", "PIN_EV"), VIEW_GAP: ("PIN_VS_DK", "FAVORS")}.get(view_name, ())
             shown = display(ranked, top, details, extra)
             if open_pick is None:
                 st.dataframe(shown.set_index("PICK"), use_container_width=True)
@@ -434,8 +449,9 @@ def render(st: Any, *, stats: Sequence[str], default_stats: Sequence[str], list_
             st.caption("BLEND_% = your model's chance blended with the market; EV_% = what a bet at DraftKings' price is worth at that chance. "
                        "OPP_VS_POS: opponent and its rank vs this position for this stat (#1 = allows the most). PIN = Pinnacle cross-check for that side."
                        + {VIEW_SHARP: " Showing every 5/6 and 6/6 prop with a top-third matchup" + (" and positive EV." if hide_neg else "."),
-                          VIEW_PIN: " PIN_EDGE = how many points more likely Pinnacle rates this side than DraftKings does (no-vig)."
-                                    + (" Positive-EV picks only." if hide_neg else ""),
+                          VIEW_PIN: " PIN_EDGE = how many points more likely Pinnacle rates this side than DraftKings does (no-vig). "
+                                    "PIN_EV = what the DraftKings bet is worth if Pinnacle is right (sorted by this)."
+                                    + (" Only picks with positive PIN_EV." if hide_neg else ""),
                           VIEW_GAP: " PIN_VS_DK = Pinnacle's line vs DraftKings'. FAVORS = the side Pinnacle's line favors at DraftKings "
                                     "(a higher Pinnacle line favors the Over); ✓ = it's also the side ranked. PICK and EV_% are for the ranked side."
                           }.get(view_name, f" At most {per_game} pick(s) per game." if per_game else ""))
