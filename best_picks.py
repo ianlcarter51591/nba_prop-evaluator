@@ -50,13 +50,13 @@ GAP_MIN_LINE = 0.5            # Pinnacle's line at least this far from DraftKing
 MIN_EDGE_DEFAULT = 2.5         # points over DraftKings' no-vig chance: about what -110 needs to beat the juice (the blend shrinks edges)
 BIG_GAP_PP = 3.5              # Pinnacle-vs-DraftKings gaps over this lost money in the graded props: hidden by default in "Pinnacle agrees"
 TIMER_CHOICES: Dict[str, int] = {"Off (manual only)": 0, "Every 15 min": 15, "Every 30 min": 30, "Every 60 min": 60}
-ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE"]
+ROW_COLS = ["PLAYER", "POS", "STAT", "SIDE", "LINE", "ODDS", "GAME", "P_MODEL", "P_MARKET", "EDGE_PP", "EV_%", "SIX", "OPP", "OPP_RANK", "N_TEAMS", "PIN", "EVENT_ID", "PIN_GAP", "PIN_LINE", "RANK_NOTE"]
 SHOW_COLS = ["PICK", "GAME", "ODDS", "BLEND_%", "EV_%", "OPP_VS_POS", "SIX", "PIN", "BOTH"]
 DETAIL_COLS = ["POS", "MODEL_%", "MARKET_%", "EDGE_PP", "MODEL", "MATCHUP", "SCORE"]
 
 
 def make_row(res: Mapping[str, Any], stat: str, line: float, game: str, pos: Optional[str], opp: Optional[str],
-             rank: Optional[float], n_teams: Optional[float], pin: str = "") -> Optional[Dict[str, Any]]:
+             rank: Optional[float], n_teams: Optional[float], pin: str = "", rank_note: str = "") -> Optional[Dict[str, Any]]:
     """One candidate row from an evaluation result: the six-point side when it scores 5/6 or 6/6, otherwise the side with the
     higher model EV. None when the result has no sides."""
     sides = res.get("sides") or {}
@@ -73,7 +73,7 @@ def make_row(res: Mapping[str, Any], stat: str, line: float, game: str, pos: Opt
     return {"PLAYER": str(res.get("player_name", "")), "POS": pos or "", "STAT": str(stat), "SIDE": side, "LINE": float(line), "ODDS": float(s.get("odds", np.nan)),
             "GAME": str(game or ""), "P_MODEL": float(s.get("p_model", np.nan)), "P_MARKET": float(s.get("p_market", np.nan)),
             "EDGE_PP": float(s.get("edge_pp", np.nan)), "EV_%": float(s.get("ev_pct", np.nan)), "SIX": six.get("score"), "OPP": opp or "",
-            "OPP_RANK": rank, "N_TEAMS": n_teams, "PIN": pin or ""}
+            "OPP_RANK": rank, "N_TEAMS": n_teams, "PIN": pin or "", "RANK_NOTE": "" if rank is not None else str(rank_note or "")}
 
 
 def matchup_score(side: pd.Series, rank: pd.Series, n_teams: pd.Series) -> pd.Series:
@@ -175,7 +175,9 @@ def display(ranked: pd.DataFrame, top: int = 25, details: bool = False, extra: S
     if d.empty:
         return pd.DataFrame(columns=cols)
     rk, n = pd.to_numeric(d["OPP_RANK"], errors="coerce"), pd.to_numeric(d["N_TEAMS"], errors="coerce")
-    vs = np.where(rk.notna(), d["OPP"].astype(str) + " #" + rk.fillna(0).astype(int).astype(str) + " of " + n.fillna(0).astype(int).astype(str), "no rank")
+    note = d["RANK_NOTE"].fillna("").astype(str) if "RANK_NOTE" in d else pd.Series("", index=d.index)
+    vs = np.where(rk.notna(), d["OPP"].astype(str) + " #" + rk.fillna(0).astype(int).astype(str) + " of " + n.fillna(0).astype(int).astype(str),
+                  np.where(note.str.len() > 0, "no rank: " + note, "no rank"))
     return pd.DataFrame({
         "PICK": d["PLAYER"].astype(str) + " " + d["SIDE"].astype(str) + " " + d["LINE"].map(lambda x: f"{x:g}") + " " + d["STAT"].astype(str),
         "POS": d["POS"], "GAME": d["GAME"], "ODDS": d["ODDS"].map(lambda x: "" if pd.isna(x) else f"{int(x):+d}"),
