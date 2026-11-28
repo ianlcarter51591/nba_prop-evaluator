@@ -3193,7 +3193,7 @@ def _bp_evaluate(game: Any, stat: str, name: str, line: float, over: float, unde
                               pos.get("rank"), pos.get("n_teams"), rank_note=str(res.get("rank_note") or ""))
     if row:
         a = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"], stat=stat)
-        row.update(PIN=a["FLAG"], PIN_GAP=a.get("GAP_PP"), PIN_LINE=a.get("PIN_LINE"))
+        row.update(PIN=a["FLAG"], PIN_GAP=a.get("GAP_PP"), PIN_LINE=a.get("PIN_LINE"), PIN_EV=a.get("PIN_EV"))
     return row
 
 
