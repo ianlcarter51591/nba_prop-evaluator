@@ -1823,6 +1823,8 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             except Exception as e:
                 opp_note = f"Opponent data unavailable ({e}); no adjustment applied."
         opp_detail: Optional[Dict[str, Any]] = None
+        rank_note = ("no opponent" if not opponent else
+                     "matchup setting off (Model settings: stat-specific opponent factors)" if not cfg["opp_stat"] else "no opponent data")
         if opponent and cfg["opp_stat"]:
             try:
                 try:
@@ -1835,9 +1837,9 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
                     opp_mult = float(np.clip(opp_mult ** (1.0 - OPP_BLEND) * opp_detail["mult"] ** OPP_BLEND, 0.88, 1.12))
                     opp_detail["mult_final"] = opp_mult
                     try:
-                        opp_detail["pos"] = opp_position_detail(opp_detail["abbr"], player_name, stat_col)
+                        opp_detail["pos"], rank_note = position_rank_status(opp_detail["abbr"], player_name, stat_col)
                     except Exception:
-                        opp_detail["pos"] = None      # position ranks are display context; never break the evaluation
+                        opp_detail["pos"], rank_note = None, RANK_FAILED   # display context only: never break the evaluation
             except Exception as e:
                 opp_note = f"{opp_note or ''} Stat-specific matchup data unavailable ({e}).".strip()
         b2b_state, b2b_mult, b2b_note = "unknown", 1.0, None
@@ -1946,6 +1948,9 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             warnings.insert(0, role)
         if role_note:
             warnings.insert(0, role_note)
+        if rank_note == RANK_FAILED:
+            warnings.append("Opponent-vs-position rank unavailable: the league data didn't load. The projection is unaffected; "
+                            "refresh or re-evaluate to retry.")
         if b2b_note:
             warnings.append(b2b_note)
         days_rest: Optional[int] = (game_day - prev_date).days if prev_date else None
@@ -1960,7 +1965,7 @@ def evaluate_nba_prop(player_name: str, stat_category: str, line: float, over_od
             "days_rest": days_rest, "warnings": warnings, "mu": proj.mu, "sides": sides,
             "context_checks": context_checks, "this_season": this_season, "six_point": six,
             "role_shift": {"auto": shift, "manual": manual_role, "weights": pw} if role_note else None,
-            "shadow": shadow,
+            "shadow": shadow, "rank_note": rank_note,
             "prior_share": {"rate": proj.share_rate, "minutes": proj.share_min},
             "own_b2b": {"status": own_state, "mult": own_mult, "calibrated": bool(b2b_effects)},
             "b2b_calibrated": bool(b2b_effects),
@@ -2661,6 +2666,32 @@ def load_position_ranks() -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["OPP", "GROUP", "STAT", "I_POS", "N", "RANK"])
 
 
+RANK_FAILED = "league data didn't load: refresh to retry"
+RANK_RETRY_AFTER_S = 300.0       # after a failed load, skip the league table for 5 min so one scan doesn't retry it for every prop
+_RANK_FAIL: Dict[str, float] = {}
+
+
+def position_rank_status(opp_abbr: str, player_name: str, stat_col: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    (opponent-vs-position detail or None, reason when None). The league table is retried once, since one failed pull of a
+    few hundred ESPN logs is the usual cause of every prop showing 'no rank'; a failure is not cached, so the next scan retries."""
+    import nba_matchups as nm
+    abbr = position_of(player_name)
+    if not abbr or not nm.position_group(abbr):
+        return None, "position unknown"
+    if time.time() - _RANK_FAIL.get("at", -1e18) < RANK_RETRY_AFTER_S:
+        return None, RANK_FAILED
+    for _ in range(2):
+        try:
+            detail = opp_position_detail(opp_abbr, player_name, stat_col)
+            _RANK_FAIL.pop("at", None)
+            return detail, ("" if detail else "opponent not in the position table yet")
+        except Exception:
+            continue
+    _RANK_FAIL["at"] = time.time()
+    return None, RANK_FAILED
+
+
 def opp_position_detail(opp_abbr: str, player_name: str, stat_col: str) -> Optional[Dict[str, Any]]:
     """The opponent's rank against the player's own position group for this stat (and against the other groups), or None."""
     import nba_matchups as nm
@@ -2871,6 +2902,7 @@ def render_backtest() -> None:
             by_stat = {str(r.STAT): float(r.N0_BEST) for r in rate_rows.itertuples()}
             if st.button(f"✅ Apply: each stat's own weight, minutes {min_pick} pseudo-games", key="apply_pw"):
                 ss["pw_pending"] = (rate_pick, min_pick)
+                ss["n0_applied"] = (rate_pick, min_pick)
                 ss["n0_by_stat"] = by_stat
                 save_prior_file({"rate": rate_pick, "minutes": min_pick, "by_stat": by_stat})
                 st.rerun()
@@ -3158,7 +3190,7 @@ def _bp_evaluate(game: Any, stat: str, name: str, line: float, over: float, unde
     od = res.get("opp_detail") or {}
     pos = od.get("pos") or {}
     row = best_picks.make_row(res, stat, line, " @ ".join(ss["board_teams"]), position_of(name) or "", od.get("abbr") or str(ctx["opponent"]),
-                              pos.get("rank"), pos.get("n_teams"))
+                              pos.get("rank"), pos.get("n_teams"), rank_note=str(res.get("rank_note") or ""))
     if row:
         a = pin_check.for_player(ss.get("pin_summary"), name, line, over, under, row["SIDE"], stat=stat)
         row.update(PIN=a["FLAG"], PIN_GAP=a.get("GAP_PP"), PIN_LINE=a.get("PIN_LINE"))
@@ -3177,6 +3209,45 @@ def _queue_open(player: str, stat: str, line: Any, over: Any, under: Any, oppone
                                         "opponent": str(opponent) if opponent and str(opponent) not in ("nan", "None") else None,
                                         "game_date": str(game_date or "")}
     return f"Loaded {player} {label} {float(nums[0]):g} into the ⚡ Evaluate tab."
+
+
+# Recommended model settings: applied at the start of every session, and restorable with one tap if a slider or box was
+# changed by accident (easy on a phone while scrolling).
+RECOMMENDED_SETTINGS: Dict[str, Any] = {
+    "adj_inj": True, "adj_opp": True, "adj_vegas": True, "adj_absorb": 1.0, "adj_per_stat": True, "adj_role_auto": True,
+    "n0_rate": int(N_PRIOR_RATE), "n0_min": int(N_PRIOR_MIN),
+}
+SETTING_LABELS: Dict[str, str] = {
+    "adj_inj": "Injured / returning teammates", "adj_opp": "Stat-specific opponent factors (also gives the position ranks)",
+    "adj_vegas": "Vegas total and spread", "adj_absorb": "Usage absorption strength", "adj_per_stat": "Per-stat calibrated weights",
+    "adj_role_auto": "Detect role changes", "n0_rate": "Per-minute rate weight", "n0_min": "Minutes weight",
+}
+
+
+def recommended(ss: Mapping[str, Any]) -> Dict[str, Any]:
+    """RECOMMENDED_SETTINGS, with the last-season weights you applied from the calibration this session (if any)."""
+    rec = dict(RECOMMENDED_SETTINGS)
+    if ss.get("n0_applied"):
+        rec["n0_rate"], rec["n0_min"] = (int(x) for x in ss["n0_applied"])
+    return rec
+
+
+def restore_settings() -> None:
+    """Put every model setting back to the recommended values (a button callback: runs before the widgets are drawn)."""
+    ss = st.session_state
+    ss.update(recommended(ss))
+    if not ss.get("n0_applied"):
+        ss.pop("n0_by_stat", None)
+
+
+def settings_off(ss: Mapping[str, Any]) -> List[str]:
+    """Plain-English list of settings that differ from the recommended ones."""
+    def fmt(v: Any) -> str:
+        return ("on" if v else "off") if isinstance(v, bool) else f"{v:g}" if isinstance(v, (int, float)) else str(v)
+    def same(a: Any, b: Any) -> bool:
+        return a == b if isinstance(b, bool) else abs(float(a or 0) - float(b)) < 1e-9
+    return [f"{SETTING_LABELS[k]}: {fmt(ss.get(k))} (recommended {fmt(v)})" for k, v in recommended(ss).items()
+            if k in ss and not same(ss.get(k), v)]
 
 
 def _apply_open_request() -> None:
@@ -3312,10 +3383,9 @@ def main() -> None:
     _apply_open_request()
     if "b2b_effects" not in ss:
         ss["b2b_effects"] = load_effects_file()
-    if "n0_rate" not in ss:
-        saved = load_prior_file() or {}
-        ss["n0_rate"], ss["n0_min"] = int(saved.get("rate", N_PRIOR_RATE)), int(saved.get("minutes", N_PRIOR_MIN))
-        ss["n0_by_stat"] = saved.get("by_stat") or None
+    if not ss.get("settings_ready"):                 # new session: every model setting starts at the recommended value
+        restore_settings()
+        ss["settings_ready"] = True
     if ss.get("pw_pending"):                       # applied from the backtest tab; must be set before the sliders exist
         ss["n0_rate"], ss["n0_min"] = ss.pop("pw_pending")
     if "bet_log" not in ss:
@@ -3327,6 +3397,10 @@ def main() -> None:
     with tab_best:
         render_best_picks()
     with tab_eval:
+        off = settings_off(ss)
+        if off:
+            st.warning("⚠️ Model settings differ from the recommended ones: " + "; ".join(off) + ".")
+            st.button("↩️ Restore recommended settings", key="restore_settings", on_click=restore_settings)
         with st.expander("📡 Fetch Live DraftKings Lines (The Odds API)", expanded=True):
             if not api_key:
                 st.warning("Please configure `ODDS_API_KEY` in Streamlit Secrets.")
